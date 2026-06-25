@@ -630,7 +630,7 @@ case class GpuOrcMultiFilePartitionReaderFactory(
       ignoreCorruptFiles, queryUsesInputFile, keepReadsInOrder, combineConf)
     // NOTE: Initialize must happen after the initialization of the reader, to ensure everything
     // inside the reader being fully initialized.
-    if (conf.getBoolean("rapids.sql.scan.prefetch", false)) {
+    if (conf.getBoolean(ScanPrefetchSettings.ENABLED_KEY, false)) {
       reader.eagerPrefetchInit()
     }
     reader

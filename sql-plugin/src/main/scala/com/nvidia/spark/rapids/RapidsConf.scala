@@ -319,6 +319,11 @@ object RapidsReaderType extends Enumeration {
   val AUTO, COALESCING, MULTITHREADED, PERFILE = Value
 }
 
+object ScanPrefetchMode extends Enumeration {
+  type ScanPrefetchMode = Value
+  val OFF, AUTO, ALL = Value
+}
+
 object RapidsConf extends Logging {
   val MULTITHREAD_READ_NUM_THREADS_DEFAULT = 20
 
@@ -1824,6 +1829,33 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .integerConf
       .checkValue(v => v > 0, "The maximum number of files must be greater than 0.")
       .createWithDefault(Integer.MAX_VALUE)
+
+  val SCAN_PREFETCH_ENABLED =
+    conf("spark.rapids.sql.scan.prefetch.enabled")
+      .doc("Controls eager I/O prefetch for GPU multi-file scans. OFF preserves the current " +
+        "lazy behavior unless another compatibility rule enables prefetch. AUTO reserves the " +
+        "setting for plan-shape driven scan prefetch. ALL eagerly prefetches eligible " +
+        "multi-file scans.")
+      .stringConf
+      .transform(_.toUpperCase(java.util.Locale.ROOT))
+      .checkValues(ScanPrefetchMode.values.map(_.toString))
+      .createWithDefault(ScanPrefetchMode.OFF.toString)
+
+  val SCAN_PREFETCH_MAX_PARALLELISM =
+    conf("spark.rapids.sql.scan.prefetch.maxParallelism")
+      .doc("Hard cap for eager scan prefetch parallelism. The effective prefetch window never " +
+        "exceeds the format-specific multiThreadedRead.maxNumFilesParallel setting.")
+      .integerConf
+      .checkValue(v => v > 0, "The scan prefetch maximum parallelism must be greater than 0.")
+      .createWithDefault(Integer.MAX_VALUE)
+
+  val SCAN_PREFETCH_MIN_SCAN_FILES =
+    conf("spark.rapids.sql.scan.prefetch.minScanFiles")
+      .doc("Minimum scan file count required before the general eager scan prefetch policy " +
+        "marks a scan for prefetch.")
+      .integerConf
+      .checkValue(v => v > 0, "The scan prefetch minimum file count must be greater than 0.")
+      .createWithDefault(2)
 
   val ENABLE_DELTA_WRITE = conf("spark.rapids.sql.format.delta.write.enabled")
       .doc("When set to false disables Delta Lake output acceleration.")
@@ -3789,6 +3821,13 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
     RapidsReaderType.withName(get(AVRO_READER_TYPE)) == RapidsReaderType.MULTITHREADED
 
   lazy val maxNumAvroFilesParallel: Int = get(AVRO_MULTITHREAD_READ_MAX_NUM_FILES_PARALLEL)
+
+  lazy val scanPrefetchMode: ScanPrefetchMode.Value =
+    ScanPrefetchMode.withName(get(SCAN_PREFETCH_ENABLED))
+
+  lazy val scanPrefetchMaxParallelism: Int = get(SCAN_PREFETCH_MAX_PARALLELISM)
+
+  lazy val scanPrefetchMinScanFiles: Int = get(SCAN_PREFETCH_MIN_SCAN_FILES)
 
   lazy val isDeltaWriteEnabled: Boolean = get(ENABLE_DELTA_WRITE)
 

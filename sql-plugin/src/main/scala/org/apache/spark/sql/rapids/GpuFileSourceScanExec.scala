@@ -110,8 +110,39 @@ case class GpuFileSourceScanExec(
   private lazy val driverMetrics: HashMap[String, Long] = HashMap.empty
 
   private var prefetchEagerly = false
+  private var prefetchWindow: Option[Int] = None
 
-  def applyEagerPrefetch(): Unit = prefetchEagerly = true
+  def applyEagerPrefetch(): Unit = applyEagerPrefetch(None)
+
+  def applyEagerPrefetch(prefetchWindow: Option[Int]): Unit = {
+    prefetchEagerly = true
+    this.prefetchWindow = prefetchWindow.orElse(this.prefetchWindow)
+  }
+
+  private lazy val selectedScanFileCount: Int =
+    dynamicallySelectedPartitions.map(_.files.length).sum
+
+  private def shouldApplyGeneralPrefetch: Boolean =
+    rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL &&
+      selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles
+
+  private def shouldPrefetchEagerly: Boolean =
+    prefetchEagerly || shouldApplyGeneralPrefetch
+
+  private def prefetchPolicyMarksScan: Boolean =
+    prefetchEagerly || rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL
+
+  private def effectivePrefetchWindow: Option[Int] = {
+    val configuredWindow =
+      prefetchWindow.orElse {
+        if (rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL) {
+          Some(rapidsConf.scanPrefetchMaxParallelism)
+        } else {
+          None
+        }
+      }
+    configuredWindow.map(window => math.min(window, rapidsConf.scanPrefetchMaxParallelism))
+  }
 
   /**
    * Send the driver-side metrics. Before calling this function, selectedPartitions has
@@ -276,7 +307,8 @@ case class GpuFileSourceScanExec(
         "PushedFilters" -> seqToString(pushedDownFilters),
         "DataFilters" -> seqToString(dataFilters),
         "Location" -> locationDesc,
-        "Eager_IO_Prefetch" -> prefetchEagerly.toString)
+        "Eager_IO_Prefetch" -> prefetchPolicyMarksScan.toString,
+        "Eager_IO_Prefetch_Window" -> effectivePrefetchWindow.map(_.toString).getOrElse("default"))
 
     relation.bucketSpec.map { spec =>
       val bucketedKey = "Bucketed"
@@ -621,8 +653,11 @@ case class GpuFileSourceScanExec(
     // here we are making an optimization to read more then 1 file at a time on the CPU side
     // if they are small files before sending it down to the GPU
     val hadoopConf = relation.sparkSession.sessionState.newHadoopConfWithOptions(relation.options)
-    if (prefetchEagerly) {
-      hadoopConf.setBoolean("rapids.sql.scan.prefetch", prefetchEagerly)
+    if (shouldPrefetchEagerly) {
+      hadoopConf.setBoolean(ScanPrefetchSettings.ENABLED_KEY, true)
+      effectivePrefetchWindow.foreach { window =>
+        hadoopConf.setInt(ScanPrefetchSettings.WINDOW_KEY, window)
+      }
     }
     val broadcastedHadoopConf =
       relation.sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))

@@ -53,6 +53,18 @@ import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector => SparkVector}
 import org.apache.spark.util.SerializableConfiguration
 
+object ScanPrefetchSettings {
+  val ENABLED_KEY = "rapids.sql.scan.prefetch"
+  val WINDOW_KEY = "rapids.sql.scan.prefetch.window"
+
+  def initialFanout(conf: Configuration, maxNumFileProcessed: Int, inputFileCount: Int): Int = {
+    val requestedWindow = conf.getInt(WINDOW_KEY, maxNumFileProcessed)
+    val prefetchWindow =
+      if (requestedWindow > 0) requestedWindow else maxNumFileProcessed
+    Seq(maxNumFileProcessed, inputFileCount, prefetchWindow).min
+  }
+}
+
 /**
  * This contains a single HostMemoryBuffer along with other metadata needed
  * for combining the buffers before sending to GPU.
@@ -560,7 +572,7 @@ abstract class MultiFileCloudPartitionReaderBase(
     metrics.get("numPartedFiles").foreach(_ += inputFiles.length)
 
     // limit the number we submit at once according to the config if set
-    val limit = math.min(maxNumFileProcessed, inputFiles.length)
+    val limit = ScanPrefetchSettings.initialFanout(conf, maxNumFileProcessed, inputFiles.length)
     val tc = TaskContext.get
     if (!keepReadsInOrder) {
       logDebug("Not keeping reads in order")
