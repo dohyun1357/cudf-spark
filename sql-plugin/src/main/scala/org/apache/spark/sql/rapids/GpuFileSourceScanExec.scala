@@ -111,11 +111,15 @@ case class GpuFileSourceScanExec(
 
   private var prefetchEagerly = false
   private var prefetchWindow: Option[Int] = None
+  private var prefetchRequiresMinScanFiles = false
 
   def applyEagerPrefetch(): Unit = applyEagerPrefetch(None)
 
-  def applyEagerPrefetch(prefetchWindow: Option[Int]): Unit = {
+  def applyEagerPrefetch(
+      prefetchWindow: Option[Int],
+      requireMinScanFiles: Boolean = false): Unit = {
     prefetchEagerly = true
+    prefetchRequiresMinScanFiles = prefetchRequiresMinScanFiles || requireMinScanFiles
     this.prefetchWindow = prefetchWindow.orElse(this.prefetchWindow)
   }
 
@@ -127,7 +131,8 @@ case class GpuFileSourceScanExec(
       selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles
 
   private def shouldPrefetchEagerly: Boolean =
-    prefetchEagerly || shouldApplyGeneralPrefetch
+    (prefetchEagerly && (!prefetchRequiresMinScanFiles ||
+      selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles)) || shouldApplyGeneralPrefetch
 
   private def prefetchPolicyMarksScan: Boolean =
     prefetchEagerly || rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL
