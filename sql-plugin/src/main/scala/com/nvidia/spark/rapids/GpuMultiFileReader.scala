@@ -65,6 +65,101 @@ object ScanPrefetchSettings {
   }
 }
 
+case class ScanReadWindowSettings(
+    enabled: Boolean,
+    initialWindow: Int,
+    maxWindow: Int,
+    maxReadyBytes: Long)
+
+object ScanReadWindowSettings {
+  val ENABLED_KEY = "rapids.sql.autotune.scan.readWindow.enabled"
+  val INITIAL_WINDOW_KEY = "rapids.sql.autotune.scan.readWindow.initial"
+  val MAX_WINDOW_KEY = "rapids.sql.autotune.scan.readWindow.max"
+  val MAX_READY_BYTES_KEY = "rapids.sql.autotune.scan.maxReadyBytes"
+
+  val MIN_WINDOW = 1
+
+  private def positiveOrElse(value: Int, fallback: Int): Int =
+    if (value > 0) value else fallback
+
+  private def positiveLongOrElse(value: Long, fallback: Long): Long =
+    if (value > 0) value else fallback
+
+  def fromConf(
+      conf: Configuration,
+      maxNumFileProcessed: Int,
+      inputFileCount: Int): ScanReadWindowSettings = {
+    val existingInitialFanout =
+      ScanPrefetchSettings.initialFanout(conf, maxNumFileProcessed, inputFileCount)
+    if (!conf.getBoolean(ENABLED_KEY, false)) {
+      ScanReadWindowSettings(
+        enabled = false,
+        initialWindow = existingInitialFanout,
+        maxWindow = existingInitialFanout,
+        maxReadyBytes = Long.MaxValue)
+    } else {
+      val configuredMaxWindow =
+        positiveOrElse(conf.getInt(MAX_WINDOW_KEY, maxNumFileProcessed), maxNumFileProcessed)
+      val maxWindow = Seq(maxNumFileProcessed, inputFileCount, configuredMaxWindow).min
+      val configuredInitial =
+        positiveOrElse(conf.getInt(INITIAL_WINDOW_KEY, MIN_WINDOW), MIN_WINDOW)
+      val initialWindow =
+        if (maxWindow > 0) math.min(math.max(configuredInitial, MIN_WINDOW), maxWindow) else 0
+      val maxReadyBytes =
+        positiveLongOrElse(conf.getLong(MAX_READY_BYTES_KEY, Long.MaxValue), Long.MaxValue)
+      ScanReadWindowSettings(
+        enabled = true,
+        initialWindow = initialWindow,
+        maxWindow = maxWindow,
+        maxReadyBytes = maxReadyBytes)
+    }
+  }
+}
+
+class ScanReadWindowController(settings: ScanReadWindowSettings) extends Logging {
+  private val MIN_WAIT_NS_FOR_INCREASE = TimeUnit.MILLISECONDS.toNanos(1)
+
+  private var readWindow = settings.initialWindow
+  private var increaseCooldownReads = 0
+
+  def enabled: Boolean = settings.enabled
+
+  def initialReadWindow: Int = readWindow
+
+  def currentReadWindow: Int = readWindow
+
+  def observeReadWait(
+      bufferWaitNs: Long,
+      bufferGpuIdleNs: Long,
+      scheduleWaitNs: Long,
+      hostBytesAllocated: Long): Unit = {
+    if (!settings.enabled || settings.maxWindow <= 0) {
+      return
+    }
+
+    val memoryPressureHigh = hostBytesAllocated > settings.maxReadyBytes
+    val scheduleWaitHigh = scheduleWaitNs > bufferWaitNs && scheduleWaitNs > 0
+    if (memoryPressureHigh || scheduleWaitHigh) {
+      val nextWindow = math.max(ScanReadWindowSettings.MIN_WINDOW, math.max(readWindow / 2, 1))
+      if (nextWindow < readWindow) {
+        logDebug(s"decrease scan read window from $readWindow to $nextWindow " +
+          s"(hostBytes=$hostBytesAllocated, maxReadyBytes=${settings.maxReadyBytes}, " +
+          s"bufferWaitNs=$bufferWaitNs, scheduleWaitNs=$scheduleWaitNs)")
+        readWindow = nextWindow
+        increaseCooldownReads = 1
+      }
+    } else if (increaseCooldownReads > 0) {
+      increaseCooldownReads -= 1
+    } else if (readWindow < settings.maxWindow &&
+        (bufferWaitNs >= MIN_WAIT_NS_FOR_INCREASE || bufferGpuIdleNs > 0)) {
+      val nextWindow = readWindow + 1
+      logDebug(s"increase scan read window from $readWindow to $nextWindow " +
+        s"(bufferWaitNs=$bufferWaitNs, bufferGpuIdleNs=$bufferGpuIdleNs)")
+      readWindow = nextWindow
+    }
+  }
+}
+
 /**
  * This contains a single HostMemoryBuffer along with other metadata needed
  * for combining the buffers before sending to GPU.
@@ -547,6 +642,8 @@ abstract class MultiFileCloudPartitionReaderBase(
   private val isInit: AtomicBoolean = new AtomicBoolean(false)
   private val tasks = new ConcurrentLinkedQueue[Future[RunnerResult]]()
   private val tasksToRun = new Queue[AsyncRunner[BufferInfo]]()
+  private val readWindowController = new ScanReadWindowController(
+    ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, inputFiles.length))
   private[this] val inputMetrics = Option(TaskContext.get).map(_.taskMetrics().inputMetrics)
     .getOrElse(TrampolineUtil.newInputMetrics())
   // this is used when the read order doesn't matter and in that case, the tasks queue
@@ -571,8 +668,8 @@ abstract class MultiFileCloudPartitionReaderBase(
     }
     metrics.get("numPartedFiles").foreach(_ += inputFiles.length)
 
-    // limit the number we submit at once according to the config if set
-    val limit = ScanPrefetchSettings.initialFanout(conf, maxNumFileProcessed, inputFiles.length)
+    // limit the number we submit at once according to the config/controller if set
+    val limit = readWindowController.initialReadWindow
     val tc = TaskContext.get
     if (!keepReadsInOrder) {
       logDebug("Not keeping reads in order")
@@ -615,15 +712,7 @@ abstract class MultiFileCloudPartitionReaderBase(
     for (i <- 0 until limit) {
       val file = inputFiles(i)
       logDebug(s"MultiFile reader using file $file")
-      if (!keepReadsInOrder) {
-        val futureRunner = fcs.submit(newTaskRunner(file))
-        tasks.add(futureRunner)
-      } else {
-        // Add these in the order as we got them so that we can make sure
-        // we process them in the same order as CPU would.
-        val threadPool = MultiFileReaderThreadPool.getOrCreateThreadPool(poolConf)
-        tasks.add(threadPool.submit(newTaskRunner(file)))
-      }
+      submitReadTask(newTaskRunner(file))
     }
     // queue up any left to add once others finish
     for (i <- limit until inputFiles.length) {
@@ -690,7 +779,7 @@ abstract class MultiFileCloudPartitionReaderBase(
       } else {
         fileHostBuffers.close()
       }
-      if (addTaskIfNeeded) addNextTaskIfNeeded()
+      if (addTaskIfNeeded) refillReadWindowIfNeeded()
     } else {
       val file = fileHostBuffers.partitionedFile.filePath
       batchIter = try {
@@ -701,7 +790,7 @@ abstract class MultiFileCloudPartitionReaderBase(
           EmptyGpuColumnarBatchIterator
       }
       // the data is copied to GPU so submit another task if we were limited
-      if (addTaskIfNeeded) addNextTaskIfNeeded()
+      if (addTaskIfNeeded) refillReadWindowIfNeeded()
     }
   }
 
@@ -915,6 +1004,10 @@ abstract class MultiFileCloudPartitionReaderBase(
                 filterGpuIdleTime += (gpuIdleTimeInc.value * filterPct).toLong
                 bufGpuIdleTime += (gpuIdleTimeInc.value * bufferPct).toLong
                 scheduleGpuIdleTime += (gpuIdleTimeInc.value * schedulePct).toLong
+                observeReadWait(
+                  (wallClockInc.value * bufferPct).toLong,
+                  (gpuIdleTimeInc.value * bufferPct).toLong,
+                  (wallClockInc.value * schedulePct).toLong)
                 ret
               } else {
                 // Collect wall clock time only
@@ -924,6 +1017,10 @@ abstract class MultiFileCloudPartitionReaderBase(
                 filterTime += (blockedTime * ret.getFilterTimePct).toLong
                 bufTime += (blockedTime * ret.getBufferTimePct).toLong
                 scheduleTime += (blockedTime * ret.getScheduleTimePct).toLong
+                observeReadWait(
+                  (blockedTime * ret.getBufferTimePct).toLong,
+                  0L,
+                  (blockedTime * ret.getScheduleTimePct).toLong)
                 ret
               }
             }
@@ -962,13 +1059,41 @@ abstract class MultiFileCloudPartitionReaderBase(
   private def addNextTaskIfNeeded(): Unit = {
     if (tasksToRun.nonEmpty && !isDone) {
       val runner = tasksToRun.dequeue()
-      if (!keepReadsInOrder) {
-        val futureRunner = fcs.submit(runner)
-        tasks.add(futureRunner)
-      } else {
-        val threadPool = MultiFileReaderThreadPool.getOrCreateThreadPool(poolConf)
-        tasks.add(threadPool.submit(runner))
+      submitReadTask(runner)
+    }
+  }
+
+  private def submitReadTask(runner: AsyncRunner[BufferInfo]): Unit = {
+    if (!keepReadsInOrder) {
+      val futureRunner = fcs.submit(runner)
+      tasks.add(futureRunner)
+    } else {
+      val threadPool = MultiFileReaderThreadPool.getOrCreateThreadPool(poolConf)
+      tasks.add(threadPool.submit(runner))
+    }
+  }
+
+  private def refillReadWindowIfNeeded(): Unit = {
+    if (!readWindowController.enabled) {
+      addNextTaskIfNeeded()
+    } else {
+      while (tasksToRun.nonEmpty && !isDone &&
+          tasks.size() < readWindowController.currentReadWindow) {
+        addNextTaskIfNeeded()
       }
+    }
+  }
+
+  private def observeReadWait(
+      bufferWaitNs: Long,
+      bufferGpuIdleNs: Long,
+      scheduleWaitNs: Long): Unit = {
+    if (readWindowController.enabled) {
+      readWindowController.observeReadWait(
+        bufferWaitNs,
+        bufferGpuIdleNs,
+        scheduleWaitNs,
+        GpuTaskMetrics.get.getHostBytesAllocated)
     }
   }
 

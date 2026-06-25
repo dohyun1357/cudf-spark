@@ -324,6 +324,11 @@ object ScanPrefetchMode extends Enumeration {
   val OFF, AUTO, ALL = Value
 }
 
+object AutotuneGraphMode extends Enumeration {
+  type AutotuneGraphMode = Value
+  val OBSERVE, LOCAL, GRAPH = Value
+}
+
 object RapidsConf extends Logging {
   val MULTITHREAD_READ_NUM_THREADS_DEFAULT = 20
 
@@ -1856,6 +1861,47 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .integerConf
       .checkValue(v => v > 0, "The scan prefetch minimum file count must be greater than 0.")
       .createWithDefault(2)
+
+  val AUTOTUNE_GRAPH_ENABLED =
+    conf("spark.rapids.sql.autotune.graph.enabled")
+      .doc("Enable the graph-wide autotuning framework. The default keeps all autotune " +
+        "controllers disabled and preserves existing behavior.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val AUTOTUNE_GRAPH_MODE =
+    conf("spark.rapids.sql.autotune.graph.mode")
+      .doc("Autotuning mode. OBSERVE records recommendations without changing behavior, " +
+        "LOCAL enables executor-local controllers under static caps, and GRAPH is reserved " +
+        "for driver graph hints.")
+      .stringConf
+      .transform(_.toUpperCase(java.util.Locale.ROOT))
+      .checkValues(AutotuneGraphMode.values.map(_.toString))
+      .createWithDefault(AutotuneGraphMode.OBSERVE.toString)
+
+  val AUTOTUNE_SCAN_MAX_READ_WINDOW =
+    conf("spark.rapids.sql.autotune.scan.maxReadWindow")
+      .doc("Hard cap for the executor-local autotune scan read window. The effective read " +
+        "window never exceeds the format-specific multiThreadedRead.maxNumFilesParallel " +
+        "setting.")
+      .integerConf
+      .checkValue(v => v > 0, "The autotune scan max read window must be greater than 0.")
+      .createWithDefault(Integer.MAX_VALUE)
+
+  val AUTOTUNE_SCAN_MAX_READY_BYTES =
+    conf("spark.rapids.sql.autotune.scan.maxReadyBytes")
+      .doc("Host-memory pressure threshold for the executor-local autotune scan read window. " +
+        "If current task host allocation exceeds this threshold, the local controller " +
+        "reduces the read window.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v > 0, "The autotune scan max ready bytes must be greater than 0.")
+      .createWithDefault(Long.MaxValue)
+
+  val AUTOTUNE_FAIL_OPEN =
+    conf("spark.rapids.sql.autotune.failOpen")
+      .doc("When true, autotune controller failures fall back to existing RAPIDS behavior.")
+      .booleanConf
+      .createWithDefault(true)
 
   val ENABLE_DELTA_WRITE = conf("spark.rapids.sql.format.delta.write.enabled")
       .doc("When set to false disables Delta Lake output acceleration.")
@@ -3828,6 +3874,20 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val scanPrefetchMaxParallelism: Int = get(SCAN_PREFETCH_MAX_PARALLELISM)
 
   lazy val scanPrefetchMinScanFiles: Int = get(SCAN_PREFETCH_MIN_SCAN_FILES)
+
+  lazy val autotuneGraphEnabled: Boolean = get(AUTOTUNE_GRAPH_ENABLED)
+
+  lazy val autotuneGraphMode: AutotuneGraphMode.Value =
+    AutotuneGraphMode.withName(get(AUTOTUNE_GRAPH_MODE))
+
+  lazy val isAutotuneLocalMode: Boolean =
+    autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.LOCAL
+
+  lazy val autotuneScanMaxReadWindow: Int = get(AUTOTUNE_SCAN_MAX_READ_WINDOW)
+
+  lazy val autotuneScanMaxReadyBytes: Long = get(AUTOTUNE_SCAN_MAX_READY_BYTES)
+
+  lazy val autotuneFailOpen: Boolean = get(AUTOTUNE_FAIL_OPEN)
 
   lazy val isDeltaWriteEnabled: Boolean = get(ENABLE_DELTA_WRITE)
 

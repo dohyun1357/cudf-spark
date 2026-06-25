@@ -130,15 +130,31 @@ case class GpuFileSourceScanExec(
     rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL &&
       selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles
 
+  private def shouldApplyLocalScanReadWindow: Boolean =
+    rapidsConf.isAutotuneLocalMode &&
+      !isPerFileReadEnabled &&
+      relation.fileFormat.isInstanceOf[GpuReadParquetFileFormat] &&
+      selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles
+
   private def shouldPrefetchEagerly: Boolean =
     (prefetchEagerly && (!prefetchRequiresMinScanFiles ||
-      selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles)) || shouldApplyGeneralPrefetch
+      selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles)) ||
+      shouldApplyGeneralPrefetch ||
+      shouldApplyLocalScanReadWindow
 
   private def prefetchPolicyMarksScan: Boolean =
-    prefetchEagerly || rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL
+    prefetchEagerly || rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL ||
+      shouldApplyLocalScanReadWindow
+
+  private def localScanInitialReadWindow: Int = 1
+
+  private def localScanMaxReadWindow: Int =
+    math.min(rapidsConf.autotuneScanMaxReadWindow, rapidsConf.scanPrefetchMaxParallelism)
 
   private def effectivePrefetchWindow: Option[Int] = {
-    val configuredWindow =
+    val configuredWindow = if (shouldApplyLocalScanReadWindow) {
+      Some(localScanInitialReadWindow)
+    } else {
       prefetchWindow.orElse {
         if (rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL) {
           Some(rapidsConf.scanPrefetchMaxParallelism)
@@ -146,6 +162,7 @@ case class GpuFileSourceScanExec(
           None
         }
       }
+    }
     configuredWindow.map(window => math.min(window, rapidsConf.scanPrefetchMaxParallelism))
   }
 
@@ -313,7 +330,10 @@ case class GpuFileSourceScanExec(
         "DataFilters" -> seqToString(dataFilters),
         "Location" -> locationDesc,
         "Eager_IO_Prefetch" -> prefetchPolicyMarksScan.toString,
-        "Eager_IO_Prefetch_Window" -> effectivePrefetchWindow.map(_.toString).getOrElse("default"))
+        "Eager_IO_Prefetch_Window" -> effectivePrefetchWindow.map(_.toString).getOrElse("default"),
+        "Local_Scan_Read_Window" -> shouldApplyLocalScanReadWindow.toString,
+        "Local_Scan_Read_Window_Max" ->
+          (if (shouldApplyLocalScanReadWindow) localScanMaxReadWindow.toString else "default"))
 
     relation.bucketSpec.map { spec =>
       val bucketedKey = "Bucketed"
@@ -663,6 +683,13 @@ case class GpuFileSourceScanExec(
       effectivePrefetchWindow.foreach { window =>
         hadoopConf.setInt(ScanPrefetchSettings.WINDOW_KEY, window)
       }
+    }
+    if (shouldApplyLocalScanReadWindow) {
+      hadoopConf.setBoolean(ScanReadWindowSettings.ENABLED_KEY, true)
+      hadoopConf.setInt(ScanReadWindowSettings.INITIAL_WINDOW_KEY, localScanInitialReadWindow)
+      hadoopConf.setInt(ScanReadWindowSettings.MAX_WINDOW_KEY, localScanMaxReadWindow)
+      hadoopConf.setLong(ScanReadWindowSettings.MAX_READY_BYTES_KEY,
+        rapidsConf.autotuneScanMaxReadyBytes)
     }
     val broadcastedHadoopConf =
       relation.sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
