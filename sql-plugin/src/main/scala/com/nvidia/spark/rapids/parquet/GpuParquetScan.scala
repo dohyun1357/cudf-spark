@@ -1179,6 +1179,28 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
         deprecatedVal
       }.getOrElse(rapidsConf.getMultithreadedReaderKeepOrder)
   protected val compressCfg = CpuCompressionConfig.forParquet(rapidsConf)
+  protected val graphScanHintsEnabled =
+    rapidsConf.autotuneGraphEnabled && rapidsConf.autotuneGraphMode == AutotuneGraphMode.GRAPH
+  protected val graphScanMaxReadWindow = rapidsConf.autotuneScanMaxReadWindow
+  protected val graphScanPrefetchMaxParallelism = rapidsConf.scanPrefetchMaxParallelism
+
+  protected def currentGraphScanHint: Option[ScanRuntimeHint] = {
+    if (graphScanHintsEnabled) {
+      RapidsAutotuneTaskHints.currentScanHint
+    } else {
+      None
+    }
+  }
+
+  protected def scanReadWindowSettingsFromHint(
+      hint: ScanRuntimeHint,
+      inputFileCount: Int): Option[ScanReadWindowSettings] = {
+    val maxReadWindowCap = Seq(
+      maxNumFileProcessed,
+      graphScanMaxReadWindow,
+      graphScanPrefetchMaxParallelism).min
+    ScanReadWindowSettings.fromHint(hint, maxReadWindowCap, inputFileCount)
+  }
 
   // We can't use the coalescing files reader when InputFileName, InputFileBlockStart,
   // or InputFileBlockLength because we are combining all the files into a single buffer
@@ -1212,7 +1234,8 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
       useFieldId: Boolean,
       queryUsesInputFile: Boolean,
       keepReadsInOrder: Boolean,
-      combineConf: CombineConf
+      combineConf: CombineConf,
+      readWindowSettings: ScanReadWindowSettings
   ): AbstractMultiFileCloudParquetPartitionReader
 
   /**
@@ -1233,6 +1256,10 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
     }
     val combineConf = CombineConf(combineThresholdSize, combineWaitTime)
     val poolConf = poolConfBuilder.build()
+    val graphHint = currentGraphScanHint
+    val graphReadWindowSettings = graphHint.flatMap(scanReadWindowSettingsFromHint(_, files.length))
+    val readWindowSettings = graphReadWindowSettings.getOrElse(
+      ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, files.length))
     val reader = createBaseMultiFileCloudReader(fileIO, conf, files, filterFunc,
       isCaseSensitive,
       debugDumpPrefix, debugDumpAlways, maxReadBatchSizeRows, maxReadBatchSizeBytes,
@@ -1242,10 +1269,11 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
       poolConf,
       maxNumFileProcessed, ignoreMissingFiles,
       ignoreCorruptFiles, readUseFieldId, queryUsesInputFile, keepReadsInOrderFromConf,
-      combineConf)
+      combineConf, readWindowSettings)
     // NOTE: Initialize must happen after the initialization of the reader, to ensure everything
     // inside the reader being fully initialized.
-    if (conf.getBoolean(ScanPrefetchSettings.ENABLED_KEY, false)) {
+    if (conf.getBoolean(ScanPrefetchSettings.ENABLED_KEY, false) ||
+        graphReadWindowSettings.isDefined && graphHint.exists(_.eagerPrefetch)) {
       reader.eagerPrefetchInit()
     }
     reader
@@ -1350,6 +1378,10 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
   override def buildBaseColumnarReaderForCoalescing(
       files: Array[PartitionedFile],
       conf: Configuration): PartitionReader[ColumnarBatch] = {
+    val readWindowSettings = currentGraphScanHint
+      .flatMap(scanReadWindowSettingsFromHint(_, files.length))
+      .getOrElse(ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, files.length))
+
     val poolConf = poolConfBuilder.build()
     val clippedBlocks = ArrayBuffer[ParquetSingleDataBlockMeta]()
 
@@ -1378,7 +1410,7 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
       useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, compressCfg,
       metrics, partitionSchema, poolConf, ignoreMissingFiles, ignoreCorruptFiles,
       readUseFieldId,
-      Some(ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, files.length)))
+      Some(readWindowSettings))
   }
 
   /**
@@ -1430,7 +1462,8 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       useFieldId: Boolean,
       queryUsesInputFile: Boolean,
       keepReadsInOrder: Boolean,
-      combineConf: CombineConf
+      combineConf: CombineConf,
+      readWindowSettings: ScanReadWindowSettings
   ): AbstractMultiFileCloudParquetPartitionReader = {
     new MultiFileCloudParquetPartitionReader(
       fileIO,
@@ -1456,7 +1489,8 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       useFieldId,
       queryUsesInputFile,
       keepReadsInOrder,
-      combineConf)
+      combineConf,
+      Some(readWindowSettings))
   }
 }
 
@@ -2660,11 +2694,12 @@ abstract class AbstractMultiFileCloudParquetPartitionReader(
     useFieldId: Boolean,
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
-    combineConf: CombineConf)
+    combineConf: CombineConf,
+    readWindowSettings: Option[ScanReadWindowSettings] = None)
   extends MultiFileCloudPartitionReaderBase(conf,
     files, poolConf, maxNumFileProcessed, null,
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
-    keepReadsInOrder, combineConf)
+    keepReadsInOrder, combineConf, readWindowSettings)
   with ParquetPartitionReaderBase {
 
   // TODO: replace the config maxNumFileProcessed with the dynamic resource bounded controller,
@@ -3158,13 +3193,14 @@ class MultiFileCloudParquetPartitionReader(
     useFieldId: Boolean,
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
-    combineConf: CombineConf)
+    combineConf: CombineConf,
+    readWindowSettings: Option[ScanReadWindowSettings] = None)
   extends AbstractMultiFileCloudParquetPartitionReader(fileIO, conf, files, filterFunc,
     isSchemaCaseSensitive, debugDumpPrefix, debugDumpAlways, maxReadBatchSizeRows,
     maxReadBatchSizeBytes, targetBatchSizeBytes, maxGpuColumnSizeBytes, useChunkedReader,
     maxChunkedReaderMemoryUsageSizeBytes, compressCfg, execMetrics, partitionSchema,
     poolConf, maxNumFileProcessed, ignoreMissingFiles, ignoreCorruptFiles, useFieldId,
-    queryUsesInputFile, keepReadsInOrder, combineConf) {
+    queryUsesInputFile, keepReadsInOrder, combineConf, readWindowSettings) {
 
   override protected def readBufferToBatches(buffer: HostMemoryBuffersWithMetaData)
   : Iterator[ColumnarBatch] = {

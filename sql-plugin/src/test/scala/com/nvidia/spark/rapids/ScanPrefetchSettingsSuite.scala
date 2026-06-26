@@ -114,6 +114,29 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
     assert(settings.maxReadyBytes == 1024L)
   }
 
+  test("scan read window settings honor graph scan hint caps") {
+    val hint = ScanRuntimeHint(
+      eagerPrefetch = true,
+      minReadWindow = 2,
+      maxReadWindow = 8,
+      maxReadyBytes = 1024L)
+    val settings = ScanReadWindowSettings.fromHint(
+      hint, maxReadWindowCap = 4, inputFileCount = 3)
+
+    assert(settings.contains(ScanReadWindowSettings(
+      enabled = true,
+      initialWindow = 2,
+      maxWindow = 3,
+      maxReadyBytes = 1024L)))
+
+    assert(ScanReadWindowSettings.fromHint(
+      hint.copy(maxReadWindow = 0), maxReadWindowCap = 4, inputFileCount = 3).isEmpty)
+    assert(ScanReadWindowSettings.fromHint(
+      hint, maxReadWindowCap = 0, inputFileCount = 3).isEmpty)
+    assert(ScanReadWindowSettings.fromHint(
+      hint, maxReadWindowCap = 4, inputFileCount = 0).isEmpty)
+  }
+
   test("scan read window controller increases on consumer read wait") {
     val settings = ScanReadWindowSettings(
       enabled = true,

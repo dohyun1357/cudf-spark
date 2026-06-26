@@ -99,6 +99,17 @@ case class RapidsAutotuneHintAppliedMsg(
     hasHint: Boolean,
     scan: ScanRuntimeHint)
 
+object RapidsAutotuneTaskHints {
+  private val currentHint = new ThreadLocal[AutotuneCachedHint]()
+
+  def setCurrentHint(hint: AutotuneCachedHint): Unit = currentHint.set(hint)
+
+  def clearCurrentHint(): Unit = currentHint.remove()
+
+  def currentScanHint: Option[ScanRuntimeHint] =
+    Option(currentHint.get()).filter(_.hasHint).map(_.hint.scan)
+}
+
 case class AutotuneStageShape(
     hasGpuScan: Boolean,
     hasGpuPrefetchConsumer: Boolean,

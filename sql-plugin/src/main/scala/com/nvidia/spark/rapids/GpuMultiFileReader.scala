@@ -114,6 +114,28 @@ object ScanReadWindowSettings {
         maxReadyBytes = maxReadyBytes)
     }
   }
+
+  def fromHint(
+      hint: ScanRuntimeHint,
+      maxReadWindowCap: Int,
+      inputFileCount: Int): Option[ScanReadWindowSettings] = {
+    if (hint.maxReadWindow <= 0 || maxReadWindowCap <= 0 || inputFileCount <= 0) {
+      None
+    } else {
+      val maxWindow = Seq(maxReadWindowCap, inputFileCount, hint.maxReadWindow).min
+      val configuredInitial =
+        positiveOrElse(hint.minReadWindow, MIN_WINDOW)
+      val initialWindow =
+        math.min(math.max(configuredInitial, MIN_WINDOW), maxWindow)
+      val maxReadyBytes =
+        positiveLongOrElse(hint.maxReadyBytes, Long.MaxValue)
+      Some(ScanReadWindowSettings(
+        enabled = true,
+        initialWindow = initialWindow,
+        maxWindow = maxWindow,
+        maxReadyBytes = maxReadyBytes))
+    }
+  }
 }
 
 class ScanReadWindowController(
@@ -710,7 +732,8 @@ abstract class MultiFileCloudPartitionReaderBase(
     maxReadBatchSizeBytes: Long,
     ignoreCorruptFiles: Boolean = false,
     keepReadsInOrder: Boolean = true,
-    combineConf: CombineConf = CombineConf(-1, -1))
+    combineConf: CombineConf = CombineConf(-1, -1),
+    readWindowSettings: Option[ScanReadWindowSettings] = None)
   extends FilePartitionReaderBase(conf, execMetrics) {
 
   protected type BufferInfo = HostMemoryBuffersWithMetaDataBase
@@ -723,7 +746,8 @@ abstract class MultiFileCloudPartitionReaderBase(
   private val tasks = new ConcurrentLinkedQueue[Future[RunnerResult]]()
   private val tasksToRun = new Queue[AsyncRunner[BufferInfo]]()
   private val readWindowController = new ScanReadWindowController(
-    ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, inputFiles.length),
+    readWindowSettings.getOrElse(
+      ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, inputFiles.length)),
     execMetrics)
   private[this] val inputMetrics = Option(TaskContext.get).map(_.taskMetrics().inputMetrics)
     .getOrElse(TrampolineUtil.newInputMetrics())

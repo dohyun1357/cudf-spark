@@ -104,6 +104,33 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     endpoint.recordAppliedHint(key, taskAttemptId = 22L, partitionId = 1, hint)
   }
 
+  test("task hint state exposes only applied hints") {
+    val scanHint = ScanRuntimeHint(
+      eagerPrefetch = true,
+      minReadWindow = 1,
+      maxReadWindow = 4,
+      maxReadyBytes = 1024L)
+    val hint = AutotuneCachedHint(StageRuntimeHint(
+      executionId = key.executionId,
+      stageId = key.stageId,
+      stageAttemptId = key.stageAttemptId,
+      version = 1L,
+      scan = scanHint,
+      expiresAtNanos = Long.MaxValue), hasHint = true)
+
+    try {
+      RapidsAutotuneTaskHints.clearCurrentHint()
+      assert(RapidsAutotuneTaskHints.currentScanHint.isEmpty)
+      RapidsAutotuneTaskHints.setCurrentHint(AutotuneCachedHint.empty(key))
+      assert(RapidsAutotuneTaskHints.currentScanHint.isEmpty)
+      RapidsAutotuneTaskHints.setCurrentHint(hint)
+      assert(RapidsAutotuneTaskHints.currentScanHint.contains(scanHint))
+    } finally {
+      RapidsAutotuneTaskHints.clearCurrentHint()
+    }
+    assert(RapidsAutotuneTaskHints.currentScanHint.isEmpty)
+  }
+
   test("stage shape detects gpu scan prefetch candidates from RDD scopes") {
     val candidate = AutotuneStageShape.fromRddScopeNames(
       Seq("GpuScan parquet ", "GpuFilter", "GpuHashAggregate", "GpuColumnarExchange"),

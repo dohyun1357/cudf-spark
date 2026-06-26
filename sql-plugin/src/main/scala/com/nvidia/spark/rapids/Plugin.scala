@@ -871,12 +871,14 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
 
   override def onTaskStart(): Unit = {
     val tc = TaskContext.get
+    RapidsAutotuneTaskHints.clearCurrentHint()
     startTaskNvtx(tc)
     recordAutotuneHintForTask(tc)
     // Set the priority for the task as soon as it is launched
     TaskPriority.getTaskPriority(tc.taskAttemptId())
-    onTaskCompletion(tc, tc => {
-      TaskPriority.taskDone(tc.taskAttemptId())
+    onTaskCompletion(tc, taskContext => {
+      TaskPriority.taskDone(taskContext.taskAttemptId())
+      RapidsAutotuneTaskHints.clearCurrentHint()
     })
     extraExecutorPlugins.foreach(_.onTaskStart())
     ProfilerOnExecutor.onTaskStart()
@@ -916,6 +918,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
         stageId = taskCtx.stageId(),
         stageAttemptId = taskCtx.stageAttemptNumber())
       val hint = endpoint.hintFor(key)
+      RapidsAutotuneTaskHints.setCurrentHint(hint)
       endpoint.recordAppliedHint(key, taskCtx.taskAttemptId(), taskCtx.partitionId(), hint)
     }
   }

@@ -575,7 +575,8 @@ case class GpuDeltaParquetFileFormatNativeDV(
         useFieldId: Boolean,
         queryUsesInputFile: Boolean,
         keepReadsInOrder: Boolean,
-        combineConf: CombineConf
+        combineConf: CombineConf,
+        readWindowSettings: ScanReadWindowSettings
     ): AbstractMultiFileCloudParquetPartitionReader = {
       new MultiFileCloudDeltaParquetPartitionReader(
         fileIO,
@@ -602,6 +603,7 @@ case class GpuDeltaParquetFileFormatNativeDV(
         queryUsesInputFile,
         keepReadsInOrder,
         combineConf,
+        Some(readWindowSettings),
         deletionVectorReadInfo,
         tablePathOpt
       )
@@ -610,6 +612,10 @@ case class GpuDeltaParquetFileFormatNativeDV(
     override def buildBaseColumnarReaderForCoalescing(
         files: Array[PartitionedFile],
         conf: Configuration): PartitionReader[ColumnarBatch] = {
+      val readWindowSettings = currentGraphScanHint
+        .flatMap(scanReadWindowSettingsFromHint(_, files.length))
+        .getOrElse(ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, files.length))
+
       val poolConf = poolConfBuilder.build()
       val clippedBlocks = ArrayBuffer[ParquetSingleDataBlockMeta]()
 
@@ -660,7 +666,7 @@ case class GpuDeltaParquetFileFormatNativeDV(
         maxReadBatchSizeRows, maxReadBatchSizeBytes, targetBatchSizeBytes,
         maxGpuColumnSizeBytes, useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes,
         compressCfg, metrics, partitionSchema, poolConf, ignoreMissingFiles,
-        ignoreCorruptFiles, readUseFieldId, tablePathOpt)
+        ignoreCorruptFiles, readUseFieldId, tablePathOpt, Some(readWindowSettings))
     }
   }
 
@@ -689,6 +695,7 @@ case class GpuDeltaParquetFileFormatNativeDV(
       queryUsesInputFile: Boolean,
       keepReadsInOrder: Boolean,
       combineConf: CombineConf,
+      readWindowSettings: Option[ScanReadWindowSettings],
       deletionVectorReadInfo: Option[RapidsDeletionVectorReadInfo],
       tablePathOpt: Option[String])
     extends AbstractMultiFileCloudParquetPartitionReader(fileIO, conf, files, filterFunc,
@@ -696,7 +703,7 @@ case class GpuDeltaParquetFileFormatNativeDV(
       maxReadBatchSizeBytes, targetBatchSizeBytes, maxGpuColumnSizeBytes, useChunkedReader,
       maxChunkedReaderMemoryUsageSizeBytes, compressCfg, execMetrics, partitionSchema,
       poolConf, maxNumFileProcessed, ignoreMissingFiles, ignoreCorruptFiles, useFieldId,
-      queryUsesInputFile, keepReadsInOrder, combineConf) {
+      queryUsesInputFile, keepReadsInOrder, combineConf, readWindowSettings) {
 
     override def readBatches(
         fileBufsAndMeta: HostMemoryBuffersWithMetaDataBase): Iterator[ColumnarBatch] = {
@@ -1191,11 +1198,12 @@ case class GpuDeltaParquetFileFormatNativeDV(
       ignoreMissingFiles: Boolean,
       ignoreCorruptFiles: Boolean,
       useFieldId: Boolean,
-      tablePathOpt: Option[String])
+      tablePathOpt: Option[String],
+      readWindowSettings: Option[ScanReadWindowSettings])
     extends MultiFileCoalescingParquetPartitionReaderBase(fileIO, conf, clippedBlocks,
       isSchemaCaseSensitive, maxReadBatchSizeRows, maxReadBatchSizeBytes, targetBatchSizeBytes,
       maxGpuColumnSizeBytes, compressCfg, execMetrics, partitionSchema, poolConf,
-      ignoreMissingFiles, ignoreCorruptFiles) {
+      ignoreMissingFiles, ignoreCorruptFiles, readWindowSettings) {
 
     override protected def augmentChunkMeta(meta: CurrentChunkMeta): CurrentChunkMeta = {
       if (meta.currentChunk.isEmpty) return meta

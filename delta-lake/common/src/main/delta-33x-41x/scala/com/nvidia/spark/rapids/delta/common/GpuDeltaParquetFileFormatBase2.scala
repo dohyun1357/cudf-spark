@@ -531,7 +531,8 @@ class GpuDeltaParquetFileFormatBase2(
         useFieldId: Boolean,
         queryUsesInputFile: Boolean,
         keepReadsInOrder: Boolean,
-        combineConf: CombineConf
+        combineConf: CombineConf,
+        readWindowSettings: ScanReadWindowSettings
     ): AbstractMultiFileCloudParquetPartitionReader = {
       new MultiFileCloudDeltaParquetPartitionReader(
         fileIO,
@@ -557,13 +558,18 @@ class GpuDeltaParquetFileFormatBase2(
         useFieldId,
         queryUsesInputFile,
         keepReadsInOrder,
-        combineConf
+        combineConf,
+        Some(readWindowSettings)
       )
     }
 
     override def buildBaseColumnarReaderForCoalescing(
         files: Array[PartitionedFile],
         conf: Configuration): PartitionReader[ColumnarBatch] = {
+      val readWindowSettings = currentGraphScanHint
+        .flatMap(scanReadWindowSettingsFromHint(_, files.length))
+        .getOrElse(ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, files.length))
+
       val poolConf = poolConfBuilder.build()
       val clippedBlocks = ArrayBuffer[ParquetSingleDataBlockMeta]()
 
@@ -607,7 +613,7 @@ class GpuDeltaParquetFileFormatBase2(
         maxReadBatchSizeRows, maxReadBatchSizeBytes, targetBatchSizeBytes,
         maxGpuColumnSizeBytes, useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes,
         compressCfg, metrics, partitionSchema, poolConf, ignoreMissingFiles,
-        ignoreCorruptFiles, readUseFieldId, tablePath)
+        ignoreCorruptFiles, readUseFieldId, tablePath, Some(readWindowSettings))
     }
   }
 
@@ -635,13 +641,14 @@ class GpuDeltaParquetFileFormatBase2(
       useFieldId: Boolean,
       queryUsesInputFile: Boolean,
       keepReadsInOrder: Boolean,
-      combineConf: CombineConf)
+      combineConf: CombineConf,
+      readWindowSettings: Option[ScanReadWindowSettings])
     extends AbstractMultiFileCloudParquetPartitionReader(fileIO, conf, files, filterFunc,
       isSchemaCaseSensitive, debugDumpPrefix, debugDumpAlways, maxReadBatchSizeRows,
       maxReadBatchSizeBytes, targetBatchSizeBytes, maxGpuColumnSizeBytes, useChunkedReader,
       maxChunkedReaderMemoryUsageSizeBytes, compressCfg, execMetrics, partitionSchema,
       poolConf, maxNumFileProcessed, ignoreMissingFiles, ignoreCorruptFiles, useFieldId,
-      queryUsesInputFile, keepReadsInOrder, combineConf) {
+      queryUsesInputFile, keepReadsInOrder, combineConf, readWindowSettings) {
 
     override protected def readBufferToBatches(
         buffer: HostMemoryBuffersWithMetaData): Iterator[ColumnarBatch] = {
@@ -1081,11 +1088,12 @@ class GpuDeltaParquetFileFormatBase2(
       ignoreMissingFiles: Boolean,
       ignoreCorruptFiles: Boolean,
       useFieldId: Boolean,
-      tablePathOpt: Option[String])
+      tablePathOpt: Option[String],
+      readWindowSettings: Option[ScanReadWindowSettings])
     extends MultiFileCoalescingParquetPartitionReaderBase(fileIO, conf, clippedBlocks,
       isSchemaCaseSensitive, maxReadBatchSizeRows, maxReadBatchSizeBytes, targetBatchSizeBytes,
       maxGpuColumnSizeBytes, compressCfg, execMetrics, partitionSchema, poolConf,
-      ignoreMissingFiles, ignoreCorruptFiles) {
+      ignoreMissingFiles, ignoreCorruptFiles, readWindowSettings) {
 
     /**
      * Builds per-file DV entries from the assembled file-major chunk, preserving the same file
