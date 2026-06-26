@@ -22,11 +22,11 @@ import java.util.{Collections, Map => JMap}
 import scala.collection.mutable
 
 import com.codahale.metrics.MetricRegistry
+import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.spark.SparkConf
 import org.apache.spark.api.plugin.PluginContext
 import org.apache.spark.resource.ResourceInformation
-import org.scalatest.funsuite.AnyFunSuite
 
 class GraphAutotuneRuntimeSuite extends AnyFunSuite {
   private val key = AutotuneStageKey(executionId = 11L, stageId = 3, stageAttemptId = 1)
@@ -45,6 +45,24 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     override def send(message: Any): Unit = throw new IOException("send failed")
 
     override def ask(message: Any): AnyRef = throw new IOException("ask failed")
+  }
+
+  private class CapturingPluginContext extends PluginContext {
+    var lastSent: Any = _
+
+    override def metricRegistry(): MetricRegistry = new MetricRegistry()
+
+    override def conf(): SparkConf = new SparkConf(false)
+
+    override def executorID(): String = "exec-7"
+
+    override def hostname(): String = "localhost"
+
+    override def resources(): JMap[String, ResourceInformation] = Collections.emptyMap()
+
+    override def send(message: Any): Unit = lastSent = message
+
+    override def ask(message: Any): AnyRef = RapidsAutotuneHintResponseMsg(key, None)
   }
 
   test("stage runtime hint preserves cache key and expiration") {
@@ -311,6 +329,79 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(response.hint.contains(hint))
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
+    }
+  }
+
+  test("GPU admission controller no-ops on unknown-key completion and clears on reset") {
+    val appliedLimits = mutable.ArrayBuffer.empty[Int]
+    val controller = new RapidsAutotuneGpuAdmissionController(limit => {
+      appliedLimits += limit
+      limit
+    })
+
+    // Completing a key that never started is a no-op: returns the current limit, applies nothing.
+    assert(controller.taskCompleted(key) == 0)
+    // A task with no positive GPU cap does not register and applies nothing.
+    val noCap = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(version = 1L), hasHint = true)
+    assert(controller.taskStarted(key, noCap) == 0)
+    assert(appliedLimits.isEmpty)
+
+    // Reset while a positive-cap task is active drops the runtime cap back to 0, and the now
+    // forgotten task's completion is a no-op.
+    val capped = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
+      version = 2L, gpu = GpuRuntimeHint(maxConcurrentTasks = 3)), hasHint = true)
+    assert(controller.taskStarted(key, capped) == 3)
+    assert(controller.reset() == 0)
+    assert(controller.taskCompleted(key) == 0)
+
+    assert(appliedLimits == Seq(3, 0))
+  }
+
+  test("hint cache put overrides fetch and refreshes once the pushed hint expires") {
+    var fetches = 0
+    val cache = new AutotuneHintCache(stageKey => {
+      fetches += 1
+      AutotuneCachedHint.empty(stageKey)
+    })
+
+    cache.put(StageRuntimeHint.empty(key).copy(version = 5L, expiresAtNanos = Long.MaxValue))
+    val got = cache.get(key)
+    assert(got.hasHint)
+    assert(got.version == 5L)
+    assert(fetches == 0)
+
+    // An already-expired pushed hint forces a refetch on the next get.
+    cache.put(StageRuntimeHint.empty(key).copy(version = 6L, expiresAtNanos = 0L))
+    val refreshed = cache.get(key)
+    assert(fetches == 1)
+    assert(!refreshed.hasHint)
+  }
+
+  test("executor endpoint reports the applied-hint payload to the driver") {
+    val ctx = new CapturingPluginContext
+    val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_FAIL_OPEN.key -> "true"))
+    val endpoint = new RapidsAutotuneExecutorEndpoint(ctx, conf)
+    val scanHint = ScanRuntimeHint(
+      eagerPrefetch = true, minReadWindow = 1, maxReadWindow = 4, maxReadyBytes = 2048L)
+    val gpuHint = GpuRuntimeHint(maxConcurrentTasks = 3)
+    val cached = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
+      version = 9L, scan = scanHint, gpu = gpuHint), hasHint = true)
+
+    endpoint.recordAppliedHint(
+      key, taskAttemptId = 42L, partitionId = 5, cached, gpuAppliedMaxConcurrentTasks = 2)
+
+    ctx.lastSent match {
+      case msg: RapidsAutotuneHintAppliedMsg =>
+        assert(msg.executorId == "exec-7")
+        assert(msg.key == key)
+        assert(msg.taskAttemptId == 42L)
+        assert(msg.partitionId == 5)
+        assert(msg.hintVersion == 9L)
+        assert(msg.hasHint)
+        assert(msg.scan == scanHint)
+        assert(msg.gpu == gpuHint)
+        assert(msg.gpuAppliedMaxConcurrentTasks == 2)
+      case other => fail(s"unexpected message sent to driver: $other")
     }
   }
 }

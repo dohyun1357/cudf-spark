@@ -234,4 +234,53 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
       assert(metrics(key).value == 0)
     }
   }
+
+  test("disabled read window controller reports the legacy static fanout as its window") {
+    val conf = new Configuration(false)
+    // Feature off and no prefetch window set: the controller must reproduce the pre-autotune
+    // initial fanout of min(maxNumFileProcessed, inputFileCount) and stay inert.
+    val settings = ScanReadWindowSettings.fromConf(
+      conf, maxNumFileProcessed = 4, inputFileCount = 10)
+    assert(!settings.enabled)
+    val controller = new ScanReadWindowController(settings)
+    assert(!controller.enabled)
+    assert(controller.initialReadWindow == 4)
+    assert(controller.currentReadWindow == 4)
+
+    val fewerFiles = ScanReadWindowSettings.fromConf(
+      conf, maxNumFileProcessed = 4, inputFileCount = 3)
+    assert(new ScanReadWindowController(fewerFiles).initialReadWindow == 3)
+  }
+
+  test("scan read window controller cools down after a decrease before re-increasing") {
+    val settings = ScanReadWindowSettings(
+      enabled = true,
+      initialWindow = 4,
+      maxWindow = 8,
+      maxReadyBytes = 100L)
+    val controller = new ScanReadWindowController(settings)
+
+    // Memory pressure halves the window and arms a one-read cooldown.
+    controller.observeReadWait(0L, 0L, 0L, 101L)
+    assert(controller.currentReadWindow == 2)
+    // The next observation is an increase signal but is swallowed by the cooldown.
+    controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
+    assert(controller.currentReadWindow == 2)
+    // Cooldown elapsed: the window can grow again.
+    controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
+    assert(controller.currentReadWindow == 3)
+  }
+
+  test("scan read window controller increases on GPU-idle wait without buffer wait") {
+    val settings = ScanReadWindowSettings(
+      enabled = true,
+      initialWindow = 1,
+      maxWindow = 3,
+      maxReadyBytes = Long.MaxValue)
+    val controller = new ScanReadWindowController(settings)
+
+    controller.observeReadWait(bufferWaitNs = 0L, bufferGpuIdleNs = 5L, scheduleWaitNs = 0L,
+      hostBytesAllocated = 0L)
+    assert(controller.currentReadWindow == 2)
+  }
 }
