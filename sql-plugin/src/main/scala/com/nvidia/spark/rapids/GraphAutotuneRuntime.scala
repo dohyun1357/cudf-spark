@@ -17,12 +17,16 @@
 package com.nvidia.spark.rapids
 
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
+import scala.util.Try
 import scala.util.control.NonFatal
 
 import org.apache.spark.SparkContext
 import org.apache.spark.api.plugin.PluginContext
 import org.apache.spark.internal.Logging
+import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
+import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 
 case class AutotuneStageKey(
@@ -127,6 +131,7 @@ class AutotuneHintCache(fetchHint: AutotuneStageKey => AutotuneCachedHint) {
 
 object RapidsAutotuneDriverEndpoint extends Logging {
   private val hints = new ConcurrentHashMap[AutotuneStageKey, StageRuntimeHint]()
+  private val nextHintVersion = new AtomicLong(1L)
 
   @volatile private var sparkContext: SparkContext = _
   @volatile private var enabled = false
@@ -135,6 +140,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     enabled = conf.autotuneGraphEnabled
     sparkContext = if (enabled) sc else null
     hints.clear()
+    nextHintVersion.set(1L)
     if (enabled) {
       logInfo(s"Initialized RAPIDS graph autotune driver endpoint in " +
         s"${conf.autotuneGraphMode} mode")
@@ -145,11 +151,32 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     enabled = false
     sparkContext = null
     hints.clear()
+    nextHintVersion.set(1L)
   }
 
   def publishHint(hint: StageRuntimeHint): Unit = {
     if (enabled) {
       hints.put(hint.key, hint)
+    }
+  }
+
+  def publishDefaultNoopHint(key: AutotuneStageKey): StageRuntimeHint = synchronized {
+    if (!enabled) {
+      StageRuntimeHint.empty(key)
+    } else {
+      Option(hints.get(key))
+        .filterNot(_.isExpired(System.nanoTime()))
+        .getOrElse {
+          val hint = StageRuntimeHint(
+            executionId = key.executionId,
+            stageId = key.stageId,
+            stageAttemptId = key.stageAttemptId,
+            version = nextHintVersion.getAndIncrement(),
+            scan = ScanRuntimeHint.empty,
+            expiresAtNanos = Long.MaxValue)
+          hints.put(key, hint)
+          hint
+        }
     }
   }
 
@@ -175,6 +202,36 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       partitionId = msg.partitionId,
       hintVersion = msg.hintVersion,
       hasHint = msg.hasHint))
+  }
+}
+
+class RapidsAutotuneStageHintListener extends SparkListener with Logging {
+  override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+    val executionId = Option(jobStart.properties)
+      .flatMap(p => Option(p.getProperty(SQLExecution.EXECUTION_ID_KEY)))
+      .flatMap(v => Try(v.toLong).toOption)
+
+    executionId.foreach { execId =>
+      jobStart.stageInfos.foreach { stageInfo =>
+        publishDefaultHint(execId, stageInfo.stageId, stageInfo.attemptNumber())
+      }
+    }
+  }
+
+  private[rapids] def publishDefaultHint(
+      executionId: Long,
+      stageId: Int,
+      stageAttemptId: Int): StageRuntimeHint = {
+    val key = AutotuneStageKey(
+      executionId = executionId,
+      stageId = stageId,
+      stageAttemptId = stageAttemptId)
+    val hint = RapidsAutotuneDriverEndpoint.publishDefaultNoopHint(key)
+    if (hint.version > 0) {
+      logDebug(s"Published default RAPIDS graph autotune hint version ${hint.version} " +
+        s"for execution $executionId, stage ${key.stageId}.${key.stageAttemptId}")
+    }
+    hint
   }
 }
 

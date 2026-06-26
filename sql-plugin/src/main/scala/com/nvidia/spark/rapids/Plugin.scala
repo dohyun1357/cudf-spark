@@ -444,6 +444,7 @@ object RapidsPluginUtils extends Logging {
 class RapidsDriverPlugin extends DriverPlugin with Logging {
   var rapidsShuffleHeartbeatManager: RapidsShuffleHeartbeatManager = null
   var shuffleCleanupListener: ShuffleCleanupListener = null
+  var autotuneStageHintListener: RapidsAutotuneStageHintListener = null
   private lazy val extraDriverPlugins =
     RapidsPluginUtils.extraPlugins.map(_.driverPlugin()).filterNot(_ == null)
 
@@ -499,6 +500,12 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
     GpuCoreDumpHandler.driverInit(sc, conf)
     ProfilerOnDriver.init(sc, conf)
     RapidsAutotuneDriverEndpoint.init(sc, conf)
+    if (conf.autotuneGraphEnabled) {
+      autotuneStageHintListener = new RapidsAutotuneStageHintListener()
+      sc.addSparkListener(autotuneStageHintListener)
+      logInfo(s"RAPIDS graph autotune stage hint listener initialized in " +
+        s"${conf.autotuneGraphMode} mode")
+    }
 
     // Initialize ShuffleCleanupManager and listener for MULTITHREADED mode when:
     // 1. skipMerge is enabled
@@ -558,6 +565,7 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
     extraDriverPlugins.foreach(_.shutdown())
     FileCacheLocalityManager.shutdown()
     RapidsAutotuneDriverEndpoint.shutdown()
+    autotuneStageHintListener = null
     // Shutdown listener first to trigger cleanup for any remaining jobs
     Option(shuffleCleanupListener).foreach(_.shutdown())
     ShuffleCleanupManager.shutdown()

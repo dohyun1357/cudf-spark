@@ -103,4 +103,49 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(hint.version == 0L)
     endpoint.recordAppliedHint(key, taskAttemptId = 22L, partitionId = 1, hint)
   }
+
+  test("driver endpoint publishes stable positive default no-op hints") {
+    val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
+    RapidsAutotuneDriverEndpoint.init(null, conf)
+    try {
+      val first = RapidsAutotuneDriverEndpoint.publishDefaultNoopHint(key)
+      val again = RapidsAutotuneDriverEndpoint.publishDefaultNoopHint(key)
+      val secondKey = key.copy(stageId = 4)
+      val second = RapidsAutotuneDriverEndpoint.publishDefaultNoopHint(secondKey)
+
+      assert(first.version == 1L)
+      assert(first == again)
+      assert(second.version == 2L)
+      assert(!first.scan.eagerPrefetch)
+      assert(first.scan.maxReadWindow == 0)
+
+      val response = RapidsAutotuneDriverEndpoint.handleHintRequest(
+        RapidsAutotuneHintRequestMsg("exec-1", key))
+      assert(response.hint.contains(first))
+    } finally {
+      RapidsAutotuneDriverEndpoint.shutdown()
+    }
+  }
+
+  test("stage hint listener publishes default hints for stage keys") {
+    val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
+    RapidsAutotuneDriverEndpoint.init(null, conf)
+    try {
+      val listener = new RapidsAutotuneStageHintListener()
+      listener.publishDefaultHint(key.executionId, key.stageId, key.stageAttemptId)
+      listener.publishDefaultHint(key.executionId, 4, 0)
+
+      val first = RapidsAutotuneDriverEndpoint.handleHintRequest(
+        RapidsAutotuneHintRequestMsg("exec-1", key)).hint
+      val second = RapidsAutotuneDriverEndpoint.handleHintRequest(
+        RapidsAutotuneHintRequestMsg("exec-1", key.copy(stageId = 4, stageAttemptId = 0))).hint
+
+      assert(first.exists(_.version == 1L))
+      assert(second.exists(_.version == 2L))
+      assert(first.exists(_.scan == ScanRuntimeHint.empty))
+      assert(second.exists(_.scan == ScanRuntimeHint.empty))
+    } finally {
+      RapidsAutotuneDriverEndpoint.shutdown()
+    }
+  }
 }
