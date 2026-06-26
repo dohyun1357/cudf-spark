@@ -3973,6 +3973,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val autotuneShuffleEnabled: Boolean = get(AUTOTUNE_SHUFFLE_ENABLED)
 
+  /** True when the executor should consume graph-mode shuffle hints (mirrors the driver policy). */
+  lazy val isAutotuneGraphShuffleEnabled: Boolean =
+    autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.GRAPH && autotuneShuffleEnabled
+
   lazy val autotuneShuffleMaxPrefetchWindow: Int = get(AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW)
 
   lazy val autotuneShuffleMaxReadyBytes: Long = get(AUTOTUNE_SHUFFLE_MAX_READY_BYTES)

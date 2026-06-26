@@ -151,6 +151,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       maxReadWindow = 4,
       maxReadyBytes = 1024L)
     val gpuHint = GpuRuntimeHint(maxConcurrentTasks = 2)
+    val shuffleHint = ShuffleRuntimeHint(
+      prefetchWindow = 2, maxReadyBytes = 4096L, coalesceTargetBytes = 1024L)
     val hint = AutotuneCachedHint(StageRuntimeHint(
       executionId = key.executionId,
       stageId = key.stageId,
@@ -158,23 +160,54 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       version = 1L,
       scan = scanHint,
       gpu = gpuHint,
+      shuffle = shuffleHint,
       expiresAtNanos = Long.MaxValue), hasHint = true)
 
     try {
       RapidsAutotuneTaskHints.clearCurrentHint()
       assert(RapidsAutotuneTaskHints.currentScanHint.isEmpty)
       assert(RapidsAutotuneTaskHints.currentGpuHint.isEmpty)
+      assert(RapidsAutotuneTaskHints.currentShuffleHint.isEmpty)
       RapidsAutotuneTaskHints.setCurrentHint(AutotuneCachedHint.empty(key))
       assert(RapidsAutotuneTaskHints.currentScanHint.isEmpty)
       assert(RapidsAutotuneTaskHints.currentGpuHint.isEmpty)
+      assert(RapidsAutotuneTaskHints.currentShuffleHint.isEmpty)
       RapidsAutotuneTaskHints.setCurrentHint(hint)
       assert(RapidsAutotuneTaskHints.currentScanHint.contains(scanHint))
       assert(RapidsAutotuneTaskHints.currentGpuHint.contains(gpuHint))
+      assert(RapidsAutotuneTaskHints.currentShuffleHint.contains(shuffleHint))
     } finally {
       RapidsAutotuneTaskHints.clearCurrentHint()
     }
     assert(RapidsAutotuneTaskHints.currentScanHint.isEmpty)
     assert(RapidsAutotuneTaskHints.currentGpuHint.isEmpty)
+    assert(RapidsAutotuneTaskHints.currentShuffleHint.isEmpty)
+  }
+
+  test("shuffle read actuator only tightens the static bytes-in-flight cap") {
+    val staticCap = 128L * 1024 * 1024
+    def hint(b: Long): Option[ShuffleRuntimeHint] =
+      Some(ShuffleRuntimeHint(prefetchWindow = 0, maxReadyBytes = b, coalesceTargetBytes = 0L))
+
+    // Disabled -> static unchanged, even with a tightening hint present.
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(staticCap, hint(64L), enabled = false) ==
+      staticCap)
+    // Enabled, no hint -> static (fail-open).
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(staticCap, None, enabled = true) == staticCap)
+    // Enabled, hint below static -> tightened to the hint bound.
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(
+      staticCap, hint(64L * 1024 * 1024), enabled = true) == 64L * 1024 * 1024)
+    // Enabled, hint above static -> never loosens past the static cap.
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(
+      staticCap, hint(staticCap * 4), enabled = true) == staticCap)
+    // Enabled, empty/no-op hint (Long.MaxValue sentinel) -> static.
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(
+      staticCap, Some(ShuffleRuntimeHint.empty), enabled = true) == staticCap)
+    // Enabled, zero/negative hint -> static (never a 0 or negative cap).
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(staticCap, hint(0L), enabled = true) ==
+      staticCap)
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(staticCap, hint(-5L), enabled = true) ==
+      staticCap)
   }
 
   test("stage shape detects gpu scan prefetch candidates from RDD scopes") {

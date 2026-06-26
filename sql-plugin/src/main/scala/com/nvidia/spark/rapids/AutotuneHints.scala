@@ -61,4 +61,35 @@ object RapidsAutotuneTaskHints {
 
   def currentGpuHint: Option[GpuRuntimeHint] =
     Option(currentHint.get()).filter(_.hasHint).map(_.hint.gpu)
+
+  def currentShuffleHint: Option[ShuffleRuntimeHint] =
+    Option(currentHint.get()).filter(_.hasHint).map(_.hint.shuffle)
+}
+
+/**
+ * Executor-side resolution of the graph autotune shuffle-read hint.
+ *
+ * The multithreaded shuffle reader sizes its per-reader `BytesInFlightLimiter` at construction, on
+ * the task thread where [[RapidsAutotuneTaskHints]] is live. This turns the task-local
+ * [[ShuffleRuntimeHint]] into an effective limiter bound that can only ever *tighten* the static
+ * `spark.rapids.shuffle.multiThreaded.maxBytesInFlight` cap, never loosen it. Fail-open: when
+ * disabled or with no hint the static cap is returned unchanged. A non-positive `maxReadyBytes`
+ * is ignored (static cap); the empty-hint sentinel (`Long.MaxValue`) is kept but `min` with the
+ * static cap leaves it unchanged -- so by default behavior matches current RAPIDS. Tightening only
+ * happens when a hint carries a positive `maxReadyBytes` below the static cap.
+ */
+object ShuffleReadHints {
+  def effectiveMaxBytesInFlight(
+      staticMaxBytesInFlight: Long,
+      hint: Option[ShuffleRuntimeHint],
+      enabled: Boolean): Long = {
+    if (!enabled) {
+      staticMaxBytesInFlight
+    } else {
+      hint.map(_.maxReadyBytes).filter(_ > 0L) match {
+        case Some(hintBound) => math.max(1L, math.min(staticMaxBytesInFlight, hintBound))
+        case None => staticMaxBytesInFlight
+      }
+    }
+  }
 }
