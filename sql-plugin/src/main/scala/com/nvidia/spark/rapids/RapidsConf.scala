@@ -1917,6 +1917,64 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(true)
 
+  val AUTOTUNE_SHUFFLE_ENABLED =
+    conf("spark.rapids.sql.autotune.shuffle.enabled")
+      .doc("Enable graph autotune shuffle hints. When false (default), the driver publishes " +
+        "only empty (no-op) shuffle hints. Shuffle hints are currently observe-only: they are " +
+        "recorded in the eventlog but no reader/coalesce actuator consumes them yet.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW =
+    conf("spark.rapids.sql.autotune.shuffle.maxPrefetchWindow")
+      .doc("Hard cap for the graph autotune shuffle prefetch window hint.")
+      .integerConf
+      .checkValue(v => v > 0, "The autotune shuffle max prefetch window must be greater than 0.")
+      .createWithDefault(Integer.MAX_VALUE)
+
+  val AUTOTUNE_SHUFFLE_MAX_READY_BYTES =
+    conf("spark.rapids.sql.autotune.shuffle.maxReadyBytes")
+      .doc("Host-memory pressure threshold for the graph autotune shuffle read-ahead hint.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v > 0, "The autotune shuffle max ready bytes must be greater than 0.")
+      .createWithDefault(Long.MaxValue)
+
+  val AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES =
+    conf("spark.rapids.sql.autotune.shuffle.coalesceTargetBytes")
+      .doc("Graph autotune shuffle coalesce target-bytes hint. 0 (default) means no hint.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v >= 0, "The autotune shuffle coalesce target bytes must be non-negative.")
+      .createWithDefault(0L)
+
+  val AUTOTUNE_BATCH_ENABLED =
+    conf("spark.rapids.sql.autotune.batch.enabled")
+      .doc("Enable graph autotune batch-sizing hints. When false (default), the driver publishes " +
+        "only empty (no-op) batch hints. Batch hints are currently observe-only: they are " +
+        "recorded in the eventlog but no coalesce/batch actuator consumes them yet.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val AUTOTUNE_BATCH_TARGET_BYTES =
+    conf("spark.rapids.sql.autotune.batch.targetBytes")
+      .doc("Graph autotune target batch-bytes hint. 0 (default) means no hint.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v >= 0, "The autotune batch target bytes must be non-negative.")
+      .createWithDefault(0L)
+
+  val AUTOTUNE_BATCH_MAX_BYTES =
+    conf("spark.rapids.sql.autotune.batch.maxBytes")
+      .doc("Hard cap for the graph autotune max batch-bytes hint.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v > 0, "The autotune batch max bytes must be greater than 0.")
+      .createWithDefault(Long.MaxValue)
+
+  val AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE =
+    conf("spark.rapids.sql.autotune.batch.splitUntilSize")
+      .doc("Graph autotune split-until-size batch hint. 0 (default) means no hint.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v >= 0, "The autotune batch split-until size must be non-negative.")
+      .createWithDefault(0L)
+
   val ENABLE_DELTA_WRITE = conf("spark.rapids.sql.format.delta.write.enabled")
       .doc("When set to false disables Delta Lake output acceleration.")
       .booleanConf
@@ -3912,6 +3970,22 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val autotuneGpuMaxConcurrentTasks: Int = get(AUTOTUNE_GPU_MAX_CONCURRENT_TASKS)
 
   lazy val autotuneFailOpen: Boolean = get(AUTOTUNE_FAIL_OPEN)
+
+  lazy val autotuneShuffleEnabled: Boolean = get(AUTOTUNE_SHUFFLE_ENABLED)
+
+  lazy val autotuneShuffleMaxPrefetchWindow: Int = get(AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW)
+
+  lazy val autotuneShuffleMaxReadyBytes: Long = get(AUTOTUNE_SHUFFLE_MAX_READY_BYTES)
+
+  lazy val autotuneShuffleCoalesceTargetBytes: Long = get(AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES)
+
+  lazy val autotuneBatchEnabled: Boolean = get(AUTOTUNE_BATCH_ENABLED)
+
+  lazy val autotuneBatchTargetBytes: Long = get(AUTOTUNE_BATCH_TARGET_BYTES)
+
+  lazy val autotuneBatchMaxBytes: Long = get(AUTOTUNE_BATCH_MAX_BYTES)
+
+  lazy val autotuneBatchSplitUntilSize: Long = get(AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE)
 
   lazy val isDeltaWriteEnabled: Boolean = get(ENABLE_DELTA_WRITE)
 

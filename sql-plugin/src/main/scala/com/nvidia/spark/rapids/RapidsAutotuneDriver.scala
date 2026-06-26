@@ -73,7 +73,9 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   def publishStageHint(
       key: AutotuneStageKey,
       scanHint: ScanRuntimeHint,
-      gpuHint: GpuRuntimeHint = GpuRuntimeHint.empty): StageRuntimeHint = synchronized {
+      gpuHint: GpuRuntimeHint = GpuRuntimeHint.empty,
+      shuffleHint: ShuffleRuntimeHint = ShuffleRuntimeHint.empty,
+      batchHint: BatchRuntimeHint = BatchRuntimeHint.empty): StageRuntimeHint = synchronized {
     if (!enabled) {
       StageRuntimeHint.empty(key)
     } else {
@@ -87,6 +89,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
             version = nextHintVersion.getAndIncrement(),
             scan = scanHint,
             gpu = gpuHint,
+            shuffle = shuffleHint,
+            batch = batchHint,
             expiresAtNanos = Long.MaxValue)
           hints.put(key, hint)
           hint
@@ -107,7 +111,16 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     if (!enabled || sparkContext == null) {
       return
     }
-    TrampolineUtil.postEvent(sparkContext, SparkRapidsAutotuneHintAppliedEvent(
+    TrampolineUtil.postEvent(sparkContext, toAppliedEvent(msg))
+  }
+
+  /**
+   * Flatten an applied-hint report into its eventlog record. Pure (no SparkContext / endpoint
+   * state required) so the per-field mapping can be unit-tested directly.
+   */
+  private[rapids] def toAppliedEvent(
+      msg: RapidsAutotuneHintAppliedMsg): SparkRapidsAutotuneHintAppliedEvent =
+    SparkRapidsAutotuneHintAppliedEvent(
       executorId = msg.executorId,
       executionId = msg.key.executionId,
       stageId = msg.key.stageId,
@@ -121,8 +134,13 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       scanMaxReadWindow = msg.scan.maxReadWindow,
       scanMaxReadyBytes = msg.scan.maxReadyBytes,
       gpuMaxConcurrentTasks = msg.gpu.maxConcurrentTasks,
-      gpuAppliedMaxConcurrentTasks = msg.gpuAppliedMaxConcurrentTasks))
-  }
+      gpuAppliedMaxConcurrentTasks = msg.gpuAppliedMaxConcurrentTasks,
+      shufflePrefetchWindow = msg.shuffle.prefetchWindow,
+      shuffleMaxReadyBytes = msg.shuffle.maxReadyBytes,
+      shuffleCoalesceTargetBytes = msg.shuffle.coalesceTargetBytes,
+      batchTargetBatchBytes = msg.batch.targetBatchBytes,
+      batchMaxBatchBytes = msg.batch.maxBatchBytes,
+      batchSplitUntilSize = msg.batch.splitUntilSize)
 }
 
 /**
@@ -133,6 +151,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
 class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener with Logging {
   private val scanHintPolicy = GraphScanHintPolicy.fromConf(conf)
   private val gpuHintPolicy = GraphGpuHintPolicy.fromConf(conf)
+  private val shuffleHintPolicy = GraphShuffleHintPolicy.fromConf(conf)
+  private val batchHintPolicy = GraphBatchHintPolicy.fromConf(conf)
 
   override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
     val executionId = Option(jobStart.properties)
@@ -173,11 +193,14 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
     val hint = RapidsAutotuneDriverEndpoint.publishStageHint(
       key,
       scanHintPolicy.scanHintFor(stageShape),
-      gpuHintPolicy.gpuHintFor(stageShape))
+      gpuHintPolicy.gpuHintFor(stageShape),
+      shuffleHintPolicy.shuffleHintFor(stageShape),
+      batchHintPolicy.batchHintFor(stageShape))
     if (hint.version > 0) {
       logDebug(s"Published RAPIDS graph autotune hint version ${hint.version} " +
         s"for execution $executionId, stage ${key.stageId}.${key.stageAttemptId}, " +
-        s"scan hint ${hint.scan}, GPU hint ${hint.gpu}")
+        s"scan hint ${hint.scan}, GPU hint ${hint.gpu}, shuffle hint ${hint.shuffle}, " +
+        s"batch hint ${hint.batch}")
     }
     hint
   }
@@ -235,5 +258,72 @@ object GraphGpuHintPolicy {
     GraphGpuHintPolicy(
       enabled = conf.autotuneGraphEnabled && conf.autotuneGraphMode == AutotuneGraphMode.GRAPH,
       maxConcurrentTasks = conf.autotuneGpuMaxConcurrentTasks)
+  }
+}
+
+/**
+ * Driver policy that emits a shuffle read/coalesce hint for shuffle-bearing stages, only in GRAPH
+ * mode and only when explicitly enabled. The hint is currently observe-only: it is published and
+ * recorded in the eventlog but no shuffle reader/coalesce actuator consumes it yet, so it never
+ * changes execution. Default-off (the enable flag) keeps the published hint empty.
+ */
+case class GraphShuffleHintPolicy(
+    enabled: Boolean,
+    maxPrefetchWindow: Int,
+    maxReadyBytes: Long,
+    coalesceTargetBytes: Long) {
+  def shuffleHintFor(stageShape: AutotuneStageShape): ShuffleRuntimeHint = {
+    if (enabled && stageShape.isShuffleStage) {
+      ShuffleRuntimeHint(
+        prefetchWindow = maxPrefetchWindow,
+        maxReadyBytes = maxReadyBytes,
+        coalesceTargetBytes = coalesceTargetBytes)
+    } else {
+      ShuffleRuntimeHint.empty
+    }
+  }
+}
+
+object GraphShuffleHintPolicy {
+  def fromConf(conf: RapidsConf): GraphShuffleHintPolicy = {
+    GraphShuffleHintPolicy(
+      enabled = conf.autotuneGraphEnabled && conf.autotuneGraphMode == AutotuneGraphMode.GRAPH &&
+        conf.autotuneShuffleEnabled,
+      maxPrefetchWindow = conf.autotuneShuffleMaxPrefetchWindow,
+      maxReadyBytes = conf.autotuneShuffleMaxReadyBytes,
+      coalesceTargetBytes = conf.autotuneShuffleCoalesceTargetBytes)
+  }
+}
+
+/**
+ * Driver policy that emits a batch-sizing hint for stages doing GPU work, only in GRAPH mode and
+ * only when explicitly enabled. Observe-only like [[GraphShuffleHintPolicy]]: no coalesce/batch
+ * actuator consumes it yet, so it never changes execution. Default-off keeps the hint empty.
+ */
+case class GraphBatchHintPolicy(
+    enabled: Boolean,
+    targetBatchBytes: Long,
+    maxBatchBytes: Long,
+    splitUntilSize: Long) {
+  def batchHintFor(stageShape: AutotuneStageShape): BatchRuntimeHint = {
+    if (enabled && stageShape.hasGpuWork) {
+      BatchRuntimeHint(
+        targetBatchBytes = targetBatchBytes,
+        maxBatchBytes = maxBatchBytes,
+        splitUntilSize = splitUntilSize)
+    } else {
+      BatchRuntimeHint.empty
+    }
+  }
+}
+
+object GraphBatchHintPolicy {
+  def fromConf(conf: RapidsConf): GraphBatchHintPolicy = {
+    GraphBatchHintPolicy(
+      enabled = conf.autotuneGraphEnabled && conf.autotuneGraphMode == AutotuneGraphMode.GRAPH &&
+        conf.autotuneBatchEnabled,
+      targetBatchBytes = conf.autotuneBatchTargetBytes,
+      maxBatchBytes = conf.autotuneBatchMaxBytes,
+      splitUntilSize = conf.autotuneBatchSplitUntilSize)
   }
 }

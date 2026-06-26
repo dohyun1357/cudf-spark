@@ -59,6 +59,30 @@ object GpuRuntimeHint {
   val empty: GpuRuntimeHint = GpuRuntimeHint(maxConcurrentTasks = 0)
 }
 
+case class ShuffleRuntimeHint(
+    prefetchWindow: Int,
+    maxReadyBytes: Long,
+    coalesceTargetBytes: Long)
+
+object ShuffleRuntimeHint {
+  val empty: ShuffleRuntimeHint = ShuffleRuntimeHint(
+    prefetchWindow = 0,
+    maxReadyBytes = Long.MaxValue,
+    coalesceTargetBytes = 0L)
+}
+
+case class BatchRuntimeHint(
+    targetBatchBytes: Long,
+    maxBatchBytes: Long,
+    splitUntilSize: Long)
+
+object BatchRuntimeHint {
+  val empty: BatchRuntimeHint = BatchRuntimeHint(
+    targetBatchBytes = 0L,
+    maxBatchBytes = Long.MaxValue,
+    splitUntilSize = 0L)
+}
+
 case class StageRuntimeHint(
     executionId: Long,
     stageId: Int,
@@ -66,6 +90,8 @@ case class StageRuntimeHint(
     version: Long,
     scan: ScanRuntimeHint,
     gpu: GpuRuntimeHint,
+    shuffle: ShuffleRuntimeHint = ShuffleRuntimeHint.empty,
+    batch: BatchRuntimeHint = BatchRuntimeHint.empty,
     expiresAtNanos: Long) {
   def key: AutotuneStageKey = AutotuneStageKey(executionId, stageId, stageAttemptId)
 
@@ -80,6 +106,8 @@ object StageRuntimeHint {
     version = 0L,
     scan = ScanRuntimeHint.empty,
     gpu = GpuRuntimeHint.empty,
+    shuffle = ShuffleRuntimeHint.empty,
+    batch = BatchRuntimeHint.empty,
     expiresAtNanos = Long.MaxValue)
 }
 
@@ -100,4 +128,6 @@ case class RapidsAutotuneHintAppliedMsg(
     hasHint: Boolean,
     scan: ScanRuntimeHint,
     gpu: GpuRuntimeHint,
+    shuffle: ShuffleRuntimeHint,
+    batch: BatchRuntimeHint,
     gpuAppliedMaxConcurrentTasks: Int)

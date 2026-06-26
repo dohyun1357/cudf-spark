@@ -81,6 +81,19 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(hint.isExpired(10L))
   }
 
+  test("shuffle and batch runtime hints default to empty no-op") {
+    assert(ShuffleRuntimeHint.empty.prefetchWindow == 0)
+    assert(ShuffleRuntimeHint.empty.maxReadyBytes == Long.MaxValue)
+    assert(ShuffleRuntimeHint.empty.coalesceTargetBytes == 0L)
+    assert(BatchRuntimeHint.empty.targetBatchBytes == 0L)
+    assert(BatchRuntimeHint.empty.maxBatchBytes == Long.MaxValue)
+    assert(BatchRuntimeHint.empty.splitUntilSize == 0L)
+
+    val empty = StageRuntimeHint.empty(key)
+    assert(empty.shuffle == ShuffleRuntimeHint.empty)
+    assert(empty.batch == BatchRuntimeHint.empty)
+  }
+
   test("hint cache memoizes no-hint responses by stage key") {
     var fetches = 0
     val cache = new AutotuneHintCache(stageKey => {
@@ -180,6 +193,23 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(!consumerOnly.isScanPrefetchCandidate)
   }
 
+  test("stage shape detects shuffle-bearing stages from RDD scopes") {
+    val exchange = AutotuneStageShape.fromRddScopeNames(
+      Seq("GpuScan parquet ", "GpuFilter", "GpuColumnarExchange"), numTasks = 50)
+    val coalesce = AutotuneStageShape.fromRddScopeNames(
+      Seq("GpuShuffleCoalesce", "GpuHashAggregate"), numTasks = 50)
+    val scanOnly = AutotuneStageShape.fromRddScopeNames(
+      Seq("GpuScan parquet ", "GpuFilter"), numTasks = 50)
+    val noTasks = AutotuneStageShape.fromRddScopeNames(
+      Seq("GpuColumnarExchange"), numTasks = 0)
+
+    assert(exchange.hasShuffle && exchange.isShuffleStage && exchange.hasGpuWork)
+    assert(coalesce.hasShuffle && coalesce.isShuffleStage)
+    assert(!scanOnly.hasShuffle && !scanOnly.isShuffleStage)
+    assert(scanOnly.hasGpuWork)
+    assert(noTasks.hasShuffle && !noTasks.isShuffleStage && !noTasks.hasGpuWork)
+  }
+
   test("graph scan hint policy emits bounded scan hints only in graph mode") {
     val graphConf = new RapidsConf(Map(
       RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
@@ -227,6 +257,65 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       GpuRuntimeHint.empty)
   }
 
+  test("graph shuffle hint policy emits bounded shuffle hints only when enabled in graph mode") {
+    val graphConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW.key -> "6",
+      RapidsConf.AUTOTUNE_SHUFFLE_MAX_READY_BYTES.key -> "2048",
+      RapidsConf.AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES.key -> "1024"))
+    val disabledConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW.key -> "6"))
+    val localConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.LOCAL.toString,
+      RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true"))
+    val shuffleStage = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50, hasShuffle = true)
+    val nonShuffleStage =
+      AutotuneStageShape(hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50)
+
+    assert(GraphShuffleHintPolicy.fromConf(graphConf).shuffleHintFor(shuffleStage) ==
+      ShuffleRuntimeHint(prefetchWindow = 6, maxReadyBytes = 2048L, coalesceTargetBytes = 1024L))
+    // A non-shuffle stage gets an empty hint even when the policy is enabled.
+    assert(GraphShuffleHintPolicy.fromConf(graphConf).shuffleHintFor(nonShuffleStage) ==
+      ShuffleRuntimeHint.empty)
+    // Default-off enable flag and non-GRAPH mode both keep the hint empty.
+    assert(GraphShuffleHintPolicy.fromConf(disabledConf).shuffleHintFor(shuffleStage) ==
+      ShuffleRuntimeHint.empty)
+    assert(GraphShuffleHintPolicy.fromConf(localConf).shuffleHintFor(shuffleStage) ==
+      ShuffleRuntimeHint.empty)
+  }
+
+  test("graph batch hint policy emits bounded batch hints only when enabled in graph mode") {
+    val graphConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_BATCH_TARGET_BYTES.key -> "4096",
+      RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "8192",
+      RapidsConf.AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE.key -> "512"))
+    val disabledConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_BATCH_TARGET_BYTES.key -> "4096"))
+    val gpuStage =
+      AutotuneStageShape(hasGpuScan = true, hasGpuPrefetchConsumer = false, numTasks = 50)
+    val noGpuStage =
+      AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
+
+    assert(GraphBatchHintPolicy.fromConf(graphConf).batchHintFor(gpuStage) ==
+      BatchRuntimeHint(targetBatchBytes = 4096L, maxBatchBytes = 8192L, splitUntilSize = 512L))
+    // A stage doing no GPU work gets an empty hint even when enabled.
+    assert(GraphBatchHintPolicy.fromConf(graphConf).batchHintFor(noGpuStage) ==
+      BatchRuntimeHint.empty)
+    assert(GraphBatchHintPolicy.fromConf(disabledConf).batchHintFor(gpuStage) ==
+      BatchRuntimeHint.empty)
+  }
+
   test("GPU admission controller applies the minimum active positive stage cap") {
     val appliedLimits = mutable.ArrayBuffer.empty[Int]
     val controller = new RapidsAutotuneGpuAdmissionController(limit => {
@@ -267,6 +356,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(!first.scan.eagerPrefetch)
       assert(first.scan.maxReadWindow == 0)
       assert(first.gpu == GpuRuntimeHint.empty)
+      assert(first.shuffle == ShuffleRuntimeHint.empty)
+      assert(first.batch == BatchRuntimeHint.empty)
 
       val response = RapidsAutotuneDriverEndpoint.handleHintRequest(
         RapidsAutotuneHintRequestMsg("exec-1", key))
@@ -295,6 +386,10 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(second.exists(_.scan == ScanRuntimeHint.empty))
       assert(first.exists(_.gpu == GpuRuntimeHint.empty))
       assert(second.exists(_.gpu == GpuRuntimeHint.empty))
+      assert(first.exists(_.shuffle == ShuffleRuntimeHint.empty))
+      assert(second.exists(_.shuffle == ShuffleRuntimeHint.empty))
+      assert(first.exists(_.batch == BatchRuntimeHint.empty))
+      assert(second.exists(_.batch == BatchRuntimeHint.empty))
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
@@ -384,8 +479,13 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val scanHint = ScanRuntimeHint(
       eagerPrefetch = true, minReadWindow = 1, maxReadWindow = 4, maxReadyBytes = 2048L)
     val gpuHint = GpuRuntimeHint(maxConcurrentTasks = 3)
+    val shuffleHint = ShuffleRuntimeHint(
+      prefetchWindow = 6, maxReadyBytes = 4096L, coalesceTargetBytes = 1024L)
+    val batchHint = BatchRuntimeHint(
+      targetBatchBytes = 4096L, maxBatchBytes = 8192L, splitUntilSize = 512L)
     val cached = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
-      version = 9L, scan = scanHint, gpu = gpuHint), hasHint = true)
+      version = 9L, scan = scanHint, gpu = gpuHint, shuffle = shuffleHint, batch = batchHint),
+      hasHint = true)
 
     endpoint.recordAppliedHint(
       key, taskAttemptId = 42L, partitionId = 5, cached, gpuAppliedMaxConcurrentTasks = 2)
@@ -400,8 +500,88 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
         assert(msg.hasHint)
         assert(msg.scan == scanHint)
         assert(msg.gpu == gpuHint)
+        assert(msg.shuffle == shuffleHint)
+        assert(msg.batch == batchHint)
         assert(msg.gpuAppliedMaxConcurrentTasks == 2)
       case other => fail(s"unexpected message sent to driver: $other")
+    }
+  }
+
+  test("driver flattens an applied-hint report into the eventlog record") {
+    // Distinct, non-symmetric values per field so a swapped/omitted mapping cannot pass.
+    val msg = RapidsAutotuneHintAppliedMsg(
+      executorId = "exec-9",
+      key = key,
+      taskAttemptId = 42L,
+      partitionId = 5,
+      hintVersion = 9L,
+      hasHint = true,
+      scan = ScanRuntimeHint(
+        eagerPrefetch = true, minReadWindow = 1, maxReadWindow = 4, maxReadyBytes = 2048L),
+      gpu = GpuRuntimeHint(maxConcurrentTasks = 3),
+      shuffle = ShuffleRuntimeHint(
+        prefetchWindow = 6, maxReadyBytes = 4096L, coalesceTargetBytes = 1024L),
+      batch = BatchRuntimeHint(
+        targetBatchBytes = 7000L, maxBatchBytes = 8192L, splitUntilSize = 512L),
+      gpuAppliedMaxConcurrentTasks = 2)
+
+    val event = RapidsAutotuneDriverEndpoint.toAppliedEvent(msg)
+
+    assert(event.executorId == "exec-9")
+    assert(event.executionId == key.executionId)
+    assert(event.stageId == key.stageId)
+    assert(event.stageAttemptId == key.stageAttemptId)
+    assert(event.taskAttemptId == 42L)
+    assert(event.partitionId == 5)
+    assert(event.hintVersion == 9L)
+    assert(event.hasHint)
+    assert(event.scanEagerPrefetch)
+    assert(event.scanMinReadWindow == 1)
+    assert(event.scanMaxReadWindow == 4)
+    assert(event.scanMaxReadyBytes == 2048L)
+    assert(event.gpuMaxConcurrentTasks == 3)
+    assert(event.gpuAppliedMaxConcurrentTasks == 2)
+    assert(event.shufflePrefetchWindow == 6)
+    assert(event.shuffleMaxReadyBytes == 4096L)
+    assert(event.shuffleCoalesceTargetBytes == 1024L)
+    assert(event.batchTargetBatchBytes == 7000L)
+    assert(event.batchMaxBatchBytes == 8192L)
+    assert(event.batchSplitUntilSize == 512L)
+  }
+
+  test("stage hint listener publishes bounded shuffle and batch hints for shuffle stages") {
+    val conf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW.key -> "6",
+      RapidsConf.AUTOTUNE_SHUFFLE_MAX_READY_BYTES.key -> "2048",
+      RapidsConf.AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES.key -> "1024",
+      RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_BATCH_TARGET_BYTES.key -> "4096",
+      RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "8192",
+      RapidsConf.AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE.key -> "512"))
+    RapidsAutotuneDriverEndpoint.init(null, conf)
+    try {
+      val listener = new RapidsAutotuneStageHintListener(conf)
+      val shuffleStage = AutotuneStageShape(
+        hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50, hasShuffle = true)
+      val hint = listener.publishHintForStage(
+        key.executionId, key.stageId, key.stageAttemptId, shuffleStage)
+
+      assert(hint.version == 1L)
+      assert(hint.shuffle ==
+        ShuffleRuntimeHint(prefetchWindow = 6, maxReadyBytes = 2048L, coalesceTargetBytes = 1024L))
+      assert(hint.batch ==
+        BatchRuntimeHint(targetBatchBytes = 4096L, maxBatchBytes = 8192L, splitUntilSize = 512L))
+      // A shuffle-only stage is not a scan-prefetch candidate, so the scan slot stays empty.
+      assert(hint.scan == ScanRuntimeHint.empty)
+
+      val response = RapidsAutotuneDriverEndpoint.handleHintRequest(
+        RapidsAutotuneHintRequestMsg("exec-1", key))
+      assert(response.hint.contains(hint))
+    } finally {
+      RapidsAutotuneDriverEndpoint.shutdown()
     }
   }
 }

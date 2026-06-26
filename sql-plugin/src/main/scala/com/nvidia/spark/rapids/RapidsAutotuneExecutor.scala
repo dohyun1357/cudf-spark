@@ -98,6 +98,8 @@ class RapidsAutotuneExecutorEndpoint(
         hasHint = cachedHint.hasHint,
         scan = cachedHint.hint.scan,
         gpu = cachedHint.hint.gpu,
+        shuffle = cachedHint.hint.shuffle,
+        batch = cachedHint.hint.batch,
         gpuAppliedMaxConcurrentTasks = gpuAppliedMaxConcurrentTasks))
     } catch {
       case NonFatal(e) if failOpen =>

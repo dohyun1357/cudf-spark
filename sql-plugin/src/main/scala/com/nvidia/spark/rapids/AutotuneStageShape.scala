@@ -26,9 +26,17 @@ import org.apache.spark.storage.RDDInfo
 case class AutotuneStageShape(
     hasGpuScan: Boolean,
     hasGpuPrefetchConsumer: Boolean,
-    numTasks: Int) {
+    numTasks: Int,
+    hasShuffle: Boolean = false) {
   def isScanPrefetchCandidate: Boolean =
     hasGpuScan && hasGpuPrefetchConsumer && numTasks > 0
+
+  /** True for an executed stage that reads/writes/coalesces a GPU shuffle exchange. */
+  def isShuffleStage: Boolean = hasShuffle && numTasks > 0
+
+  /** True for an executed stage that performs any GPU work the autotuner can hint. */
+  def hasGpuWork: Boolean =
+    (hasGpuScan || hasGpuPrefetchConsumer || hasShuffle) && numTasks > 0
 }
 
 object AutotuneStageShape {
@@ -47,6 +55,14 @@ object AutotuneStageShape {
     "GpuShuffled",
     "GpuHashJoin")
 
+  // Scopes that mark a stage as shuffle-bearing: a shuffled join or a shuffle-read coalesce on the
+  // read side, or a columnar exchange on the write side. Used to pick stages for (observe-only)
+  // shuffle/batch hints; "GpuShuffled" overlaps with GpuConsumerPrefixes by design.
+  private val GpuShufflePrefixes = Seq(
+    "GpuShuffled",
+    "GpuShuffleCoalesce",
+    "GpuColumnarExchange")
+
   def fromStageInfo(stageInfo: StageInfo): AutotuneStageShape = {
     fromRddScopeNames(stageInfo.rddInfos.flatMap(scopeName), stageInfo.numTasks)
   }
@@ -57,7 +73,10 @@ object AutotuneStageShape {
       hasGpuPrefetchConsumer = scopeNames.exists { name =>
         GpuConsumerPrefixes.exists(name.startsWith)
       },
-      numTasks = numTasks)
+      numTasks = numTasks,
+      hasShuffle = scopeNames.exists { name =>
+        GpuShufflePrefixes.exists(name.startsWith)
+      })
   }
 
   private def scopeName(info: RDDInfo): Option[String] =
