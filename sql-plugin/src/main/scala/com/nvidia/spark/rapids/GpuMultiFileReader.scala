@@ -53,215 +53,6 @@ import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector => SparkVector}
 import org.apache.spark.util.SerializableConfiguration
 
-object ScanPrefetchSettings {
-  val ENABLED_KEY = "rapids.sql.scan.prefetch"
-  val WINDOW_KEY = "rapids.sql.scan.prefetch.window"
-
-  def initialFanout(conf: Configuration, maxNumFileProcessed: Int, inputFileCount: Int): Int = {
-    val requestedWindow = conf.getInt(WINDOW_KEY, maxNumFileProcessed)
-    val prefetchWindow =
-      if (requestedWindow > 0) requestedWindow else maxNumFileProcessed
-    Seq(maxNumFileProcessed, inputFileCount, prefetchWindow).min
-  }
-}
-
-case class ScanReadWindowSettings(
-    enabled: Boolean,
-    initialWindow: Int,
-    maxWindow: Int,
-    maxReadyBytes: Long)
-
-object ScanReadWindowSettings {
-  val ENABLED_KEY = "rapids.sql.autotune.scan.readWindow.enabled"
-  val INITIAL_WINDOW_KEY = "rapids.sql.autotune.scan.readWindow.initial"
-  val MAX_WINDOW_KEY = "rapids.sql.autotune.scan.readWindow.max"
-  val MAX_READY_BYTES_KEY = "rapids.sql.autotune.scan.maxReadyBytes"
-
-  val MIN_WINDOW = 1
-
-  private def positiveOrElse(value: Int, fallback: Int): Int =
-    if (value > 0) value else fallback
-
-  private def positiveLongOrElse(value: Long, fallback: Long): Long =
-    if (value > 0) value else fallback
-
-  def fromConf(
-      conf: Configuration,
-      maxNumFileProcessed: Int,
-      inputFileCount: Int): ScanReadWindowSettings = {
-    val existingInitialFanout =
-      ScanPrefetchSettings.initialFanout(conf, maxNumFileProcessed, inputFileCount)
-    if (!conf.getBoolean(ENABLED_KEY, false)) {
-      ScanReadWindowSettings(
-        enabled = false,
-        initialWindow = existingInitialFanout,
-        maxWindow = existingInitialFanout,
-        maxReadyBytes = Long.MaxValue)
-    } else {
-      val configuredMaxWindow =
-        positiveOrElse(conf.getInt(MAX_WINDOW_KEY, maxNumFileProcessed), maxNumFileProcessed)
-      val maxWindow = Seq(maxNumFileProcessed, inputFileCount, configuredMaxWindow).min
-      val configuredInitial =
-        positiveOrElse(conf.getInt(INITIAL_WINDOW_KEY, MIN_WINDOW), MIN_WINDOW)
-      val initialWindow =
-        if (maxWindow > 0) math.min(math.max(configuredInitial, MIN_WINDOW), maxWindow) else 0
-      val maxReadyBytes =
-        positiveLongOrElse(conf.getLong(MAX_READY_BYTES_KEY, Long.MaxValue), Long.MaxValue)
-      ScanReadWindowSettings(
-        enabled = true,
-        initialWindow = initialWindow,
-        maxWindow = maxWindow,
-        maxReadyBytes = maxReadyBytes)
-    }
-  }
-
-  def fromHint(
-      hint: ScanRuntimeHint,
-      maxReadWindowCap: Int,
-      inputFileCount: Int): Option[ScanReadWindowSettings] = {
-    if (hint.maxReadWindow <= 0 || maxReadWindowCap <= 0 || inputFileCount <= 0) {
-      None
-    } else {
-      val maxWindow = Seq(maxReadWindowCap, inputFileCount, hint.maxReadWindow).min
-      val configuredInitial =
-        positiveOrElse(hint.minReadWindow, MIN_WINDOW)
-      val initialWindow =
-        math.min(math.max(configuredInitial, MIN_WINDOW), maxWindow)
-      val maxReadyBytes =
-        positiveLongOrElse(hint.maxReadyBytes, Long.MaxValue)
-      Some(ScanReadWindowSettings(
-        enabled = true,
-        initialWindow = initialWindow,
-        maxWindow = maxWindow,
-        maxReadyBytes = maxReadyBytes))
-    }
-  }
-}
-
-class ScanReadWindowController(
-    settings: ScanReadWindowSettings,
-    metrics: Map[String, GpuMetric] = Map.empty) extends Logging {
-  private val MIN_WAIT_NS_FOR_INCREASE = TimeUnit.MILLISECONDS.toNanos(1)
-
-  private var readWindow = settings.initialWindow
-  private var increaseCooldownReads = 0
-  private var maxObservedReadWindow = 0
-  private var maxObservedInFlightReads = 0
-  private var maxObservedReadyReads = 0
-  private var maxObservedBacklogReads = 0
-
-  private val readWindowInitialMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_INITIAL, NoopMetric)
-  private val readWindowCurrentMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_CURRENT, NoopMetric)
-  private val readWindowMaxMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_MAX, NoopMetric)
-  private val inFlightReadMaxMetric =
-    metrics.getOrElse(SCAN_READ_IN_FLIGHT_MAX, NoopMetric)
-  private val readyReadMaxMetric =
-    metrics.getOrElse(SCAN_READ_READY_MAX, NoopMetric)
-  private val backlogReadMaxMetric =
-    metrics.getOrElse(SCAN_READ_BACKLOG_MAX, NoopMetric)
-  private val readWindowIncreaseMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_INCREASES, NoopMetric)
-  private val readWindowDecreaseMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_DECREASES, NoopMetric)
-  private val readWindowMemoryDecreaseMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_MEMORY_DECREASES, NoopMetric)
-  private val readWindowScheduleDecreaseMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_SCHEDULE_DECREASES, NoopMetric)
-
-  if (settings.enabled) {
-    updateMetricValue(readWindowInitialMetric, readWindow)
-    recordCurrentReadWindow()
-  }
-
-  def enabled: Boolean = settings.enabled
-
-  def initialReadWindow: Int = readWindow
-
-  def currentReadWindow: Int = readWindow
-
-  def observeReadQueue(
-      inFlightReadTasks: Int,
-      readyReadTasks: Int,
-      backlogReadTasks: Int): Unit = {
-    if (!settings.enabled) {
-      return
-    }
-    maxObservedInFlightReads = setMaxMetric(
-      inFlightReadMaxMetric, maxObservedInFlightReads, inFlightReadTasks)
-    maxObservedReadyReads = setMaxMetric(
-      readyReadMaxMetric, maxObservedReadyReads, readyReadTasks)
-    maxObservedBacklogReads = setMaxMetric(
-      backlogReadMaxMetric, maxObservedBacklogReads, backlogReadTasks)
-  }
-
-  def observeReadWait(
-      bufferWaitNs: Long,
-      bufferGpuIdleNs: Long,
-      scheduleWaitNs: Long,
-      hostBytesAllocated: Long): Unit = {
-    if (!settings.enabled || settings.maxWindow <= 0) {
-      return
-    }
-
-    val memoryPressureHigh = hostBytesAllocated > settings.maxReadyBytes
-    val scheduleWaitHigh = scheduleWaitNs > bufferWaitNs && scheduleWaitNs > 0
-    if (memoryPressureHigh || scheduleWaitHigh) {
-      val nextWindow = math.max(ScanReadWindowSettings.MIN_WINDOW, math.max(readWindow / 2, 1))
-      if (nextWindow < readWindow) {
-        logDebug(s"decrease scan read window from $readWindow to $nextWindow " +
-          s"(hostBytes=$hostBytesAllocated, maxReadyBytes=${settings.maxReadyBytes}, " +
-          s"bufferWaitNs=$bufferWaitNs, scheduleWaitNs=$scheduleWaitNs)")
-        readWindow = nextWindow
-        readWindowDecreaseMetric += 1
-        if (memoryPressureHigh) {
-          readWindowMemoryDecreaseMetric += 1
-        }
-        if (scheduleWaitHigh) {
-          readWindowScheduleDecreaseMetric += 1
-        }
-        recordCurrentReadWindow()
-        increaseCooldownReads = 1
-      }
-    } else if (increaseCooldownReads > 0) {
-      increaseCooldownReads -= 1
-    } else if (readWindow < settings.maxWindow &&
-        (bufferWaitNs >= MIN_WAIT_NS_FOR_INCREASE || bufferGpuIdleNs > 0)) {
-      val nextWindow = readWindow + 1
-      logDebug(s"increase scan read window from $readWindow to $nextWindow " +
-        s"(bufferWaitNs=$bufferWaitNs, bufferGpuIdleNs=$bufferGpuIdleNs)")
-      readWindow = nextWindow
-      readWindowIncreaseMetric += 1
-      recordCurrentReadWindow()
-    }
-  }
-
-  private def recordCurrentReadWindow(): Unit = {
-    updateMetricValue(readWindowCurrentMetric, readWindow)
-    maxObservedReadWindow = setMaxMetric(
-      readWindowMaxMetric, maxObservedReadWindow, readWindow)
-  }
-
-  private def setMaxMetric(metric: GpuMetric, currentMax: Int, observed: Int): Int = {
-    val sanitized = math.max(observed, 0)
-    if (sanitized > currentMax) {
-      updateMetricValue(metric, sanitized)
-      sanitized
-    } else {
-      currentMax
-    }
-  }
-
-  private def updateMetricValue(metric: GpuMetric, value: Long): Unit = {
-    val delta = value - metric.value
-    if (delta != 0) {
-      metric += delta
-    }
-  }
-}
-
 /**
  * This contains a single HostMemoryBuffer along with other metadata needed
  * for combining the buffers before sending to GPU.
@@ -1198,10 +989,15 @@ abstract class MultiFileCloudPartitionReaderBase(
   }
 
   private def recordReadQueueDepths(): Unit = {
-    readWindowController.observeReadQueue(
-      inFlightReadTasks = tasks.size(),
-      readyReadTasks = tasks.iterator().asScala.count(_.isDone),
-      backlogReadTasks = tasksToRun.size)
+    // Gate on the controller being enabled so the default/disabled read path skips the
+    // ConcurrentLinkedQueue scan and iterator allocation entirely (observeReadQueue itself no-ops
+    // when disabled). Mirrors the observeReadWait wrapper below.
+    if (readWindowController.enabled) {
+      readWindowController.observeReadQueue(
+        inFlightReadTasks = tasks.size(),
+        readyReadTasks = tasks.iterator().asScala.count(_.isDone),
+        backlogReadTasks = tasksToRun.size)
+    }
   }
 
   private def observeReadWait(
@@ -1345,11 +1141,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
     clippedBlocks.iterator.buffered
   private[this] val inputMetrics = TaskContext.get.taskMetrics().inputMetrics
   private val readWindowController = new ScanReadWindowController(
-    readWindowSettings.getOrElse(ScanReadWindowSettings(
-      enabled = false,
-      initialWindow = 0,
-      maxWindow = 0,
-      maxReadyBytes = Long.MaxValue)),
+    readWindowSettings.getOrElse(ScanReadWindowSettings.disabled),
     execMetrics)
 
   /**

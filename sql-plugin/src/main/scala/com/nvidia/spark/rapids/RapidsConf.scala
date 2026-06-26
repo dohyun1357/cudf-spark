@@ -326,6 +326,8 @@ object ScanPrefetchMode extends Enumeration {
 
 object AutotuneGraphMode extends Enumeration {
   type AutotuneGraphMode = Value
+  // OBSERVE is intentionally inert (telemetry only) and is the documented default; the feature is
+  // turned off entirely via autotune.graph.enabled=false. LOCAL/GRAPH activate the controllers.
   val OBSERVE, LOCAL, GRAPH = Value
 }
 
@@ -1871,9 +1873,10 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val AUTOTUNE_GRAPH_MODE =
     conf("spark.rapids.sql.autotune.graph.mode")
-      .doc("Autotuning mode. OBSERVE records recommendations without changing behavior, " +
-        "LOCAL enables executor-local controllers under static caps, and GRAPH is reserved " +
-        "for driver graph hints.")
+      .doc("Autotuning mode. OBSERVE is the default no-op/telemetry mode: it emits applied-hint " +
+        "eventlog records and publishes only empty (no-op) stage hints, leaving execution " +
+        "unchanged. LOCAL enables executor-local controllers under static caps. GRAPH enables " +
+        "driver-published graph hints (scan prefetch and GPU admission).")
       .stringConf
       .transform(_.toUpperCase(java.util.Locale.ROOT))
       .checkValues(AutotuneGraphMode.values.map(_.toString))
@@ -3895,6 +3898,14 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
     autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.LOCAL
 
   lazy val autotuneScanMaxReadWindow: Int = get(AUTOTUNE_SCAN_MAX_READ_WINDOW)
+
+  /**
+   * Effective hard cap on the autotune scan read window: the tighter of the autotune read-window
+   * cap and the general scan-prefetch parallelism cap. The per-task reader additionally bounds this
+   * by the format's multiThreadedRead.maxNumFilesParallel and the input file count.
+   */
+  lazy val autotuneScanReadWindowCap: Int =
+    math.min(autotuneScanMaxReadWindow, scanPrefetchMaxParallelism)
 
   lazy val autotuneScanMaxReadyBytes: Long = get(AUTOTUNE_SCAN_MAX_READY_BYTES)
 
