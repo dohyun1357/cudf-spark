@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -249,6 +249,15 @@ object GpuSemaphore {
   def releaseIfNecessary(context: TaskContext): Unit = {
     if (context != null) {
       getInstance.releaseIfNecessary(context)
+    }
+  }
+
+  def setRuntimeMaxConcurrentGpuTasksLimit(maxTasks: Int): Int = {
+    val current = instance
+    if (current == null) {
+      0
+    } else {
+      current.setRuntimeMaxConcurrentGpuTasksLimit(maxTasks)
     }
   }
 
@@ -607,6 +616,10 @@ private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int) extends Lo
         taskInfo.releaseSemaphore(semaphore)
       }
     }
+  }
+
+  def setRuntimeMaxConcurrentGpuTasksLimit(maxTasks: Int): Int = {
+    semaphore.setRuntimeMaxConcurrentGpuTasksLimit(maxTasks)
   }
 
   def completeTask(context: TaskContext): Unit = {

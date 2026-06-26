@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
   private val lock = new ReentrantLock()
   private var occupiedSlots: Long = 0
   private var currentConcurrentGpuTasksNum: Long = 0
+  private var runtimeMaxConcurrentGpuTasksLimit: Int = 0
 
   private case class ThreadInfo(priority: T,
                                 condition: Condition,
@@ -121,31 +122,66 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
     try {
       occupiedSlots -= numPermits
       currentConcurrentGpuTasksNum -= 1
-      // acquire and wakeup for all threads that now have enough permits
-      var done = false
-      while (!done && waitingQueue.size() > 0) {
-        val nextThread = waitingQueue.peek()
-        val threadPermits = nextThread.computeNumPermits()
-        if (canAcquire(threadPermits)) {
-          val popped = waitingQueue.poll()
-          assert(popped eq nextThread)
-          commitAcquire(threadPermits)
-          nextThread.signaled = true
-          nextThread.permitsUsed = threadPermits
-          nextThread.condition.signal()
-        } else {
-          done = true
-        }
-      }
+      wakeEligibleWaiters()
     } finally {
       lock.unlock()
     }
   }
 
+  def setRuntimeMaxConcurrentGpuTasksLimit(maxTasks: Int): Int = {
+    lock.lock()
+    try {
+      runtimeMaxConcurrentGpuTasksLimit = math.max(0, maxTasks)
+      wakeEligibleWaiters()
+      effectiveMaxConcurrentGpuTasksLimit
+    } finally {
+      lock.unlock()
+    }
+  }
+
+  def getEffectiveMaxConcurrentGpuTasksLimit: Int = {
+    lock.lock()
+    try {
+      effectiveMaxConcurrentGpuTasksLimit
+    } finally {
+      lock.unlock()
+    }
+  }
+
+  private def wakeEligibleWaiters(): Unit = {
+    // acquire and wakeup for all threads that now have enough permits
+    var done = false
+    while (!done && waitingQueue.size() > 0) {
+      val nextThread = waitingQueue.peek()
+      val threadPermits = nextThread.computeNumPermits()
+      if (canAcquire(threadPermits)) {
+        val popped = waitingQueue.poll()
+        assert(popped eq nextThread)
+        commitAcquire(threadPermits)
+        nextThread.signaled = true
+        nextThread.permitsUsed = threadPermits
+        nextThread.condition.signal()
+      } else {
+        done = true
+      }
+    }
+  }
+
+  private def effectiveMaxConcurrentGpuTasksLimit: Int = {
+    if (runtimeMaxConcurrentGpuTasksLimit <= 0) {
+      maxConcurrentGpuTasksLimit
+    } else if (maxConcurrentGpuTasksLimit <= 0) {
+      runtimeMaxConcurrentGpuTasksLimit
+    } else {
+      math.min(maxConcurrentGpuTasksLimit, runtimeMaxConcurrentGpuTasksLimit)
+    }
+  }
+
   private def canAcquire(numPermits: Long): Boolean = {
     val hasPermits = occupiedSlots + numPermits <= maxPermits
-    val withinTaskLimit = maxConcurrentGpuTasksLimit <= 0 ||
-      currentConcurrentGpuTasksNum < maxConcurrentGpuTasksLimit
+    val effectiveTaskLimit = effectiveMaxConcurrentGpuTasksLimit
+    val withinTaskLimit = effectiveTaskLimit <= 0 ||
+      currentConcurrentGpuTasksNum < effectiveTaskLimit
     hasPermits && withinTaskLimit
   }
 }

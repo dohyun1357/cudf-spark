@@ -58,5 +58,7 @@ case class SparkRapidsAutotuneHintAppliedEvent(
   scanEagerPrefetch: Boolean,
   scanMinReadWindow: Int,
   scanMaxReadWindow: Int,
-  scanMaxReadyBytes: Long
+  scanMaxReadyBytes: Long,
+  gpuMaxConcurrentTasks: Int,
+  gpuAppliedMaxConcurrentTasks: Int
 ) extends SparkListenerEvent

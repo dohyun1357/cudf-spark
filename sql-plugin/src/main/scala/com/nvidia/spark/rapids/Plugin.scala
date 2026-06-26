@@ -826,6 +826,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
 
   override def shutdown(): Unit = {
     GpuTimeZoneDB.shutdown()
+    RapidsAutotuneGpuAdmission.reset()
     GpuSemaphore.shutdown()
     PythonWorkerSemaphore.shutdown()
     GpuDeviceManager.shutdown()
@@ -919,7 +920,14 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
         stageAttemptId = taskCtx.stageAttemptNumber())
       val hint = endpoint.hintFor(key)
       RapidsAutotuneTaskHints.setCurrentHint(hint)
-      endpoint.recordAppliedHint(key, taskCtx.taskAttemptId(), taskCtx.partitionId(), hint)
+      val gpuAppliedMaxConcurrentTasks = endpoint.taskStarted(key, hint)
+      onTaskCompletion(taskCtx, _ => endpoint.taskCompleted(key))
+      endpoint.recordAppliedHint(
+        key,
+        taskCtx.taskAttemptId(),
+        taskCtx.partitionId(),
+        hint,
+        gpuAppliedMaxConcurrentTasks)
     }
   }
 

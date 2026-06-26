@@ -19,6 +19,8 @@ package com.nvidia.spark.rapids
 import java.io.IOException
 import java.util.{Collections, Map => JMap}
 
+import scala.collection.mutable
+
 import com.codahale.metrics.MetricRegistry
 
 import org.apache.spark.SparkConf
@@ -53,6 +55,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       version = 7L,
       scan = ScanRuntimeHint(eagerPrefetch = true, minReadWindow = 1,
         maxReadWindow = 4, maxReadyBytes = 1024L),
+      gpu = GpuRuntimeHint(maxConcurrentTasks = 2),
       expiresAtNanos = 10L)
 
     assert(hint.key == key)
@@ -87,6 +90,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
         stageAttemptId = stageKey.stageAttemptId,
         version = version,
         scan = ScanRuntimeHint.empty,
+        gpu = GpuRuntimeHint.empty,
         expiresAtNanos = 0L), hasHint = true)
     })
 
@@ -101,7 +105,12 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val hint = endpoint.hintFor(key)
     assert(!hint.hasHint)
     assert(hint.version == 0L)
-    endpoint.recordAppliedHint(key, taskAttemptId = 22L, partitionId = 1, hint)
+    endpoint.recordAppliedHint(
+      key,
+      taskAttemptId = 22L,
+      partitionId = 1,
+      hint,
+      gpuAppliedMaxConcurrentTasks = 0)
   }
 
   test("task hint state exposes only applied hints") {
@@ -110,25 +119,31 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       minReadWindow = 1,
       maxReadWindow = 4,
       maxReadyBytes = 1024L)
+    val gpuHint = GpuRuntimeHint(maxConcurrentTasks = 2)
     val hint = AutotuneCachedHint(StageRuntimeHint(
       executionId = key.executionId,
       stageId = key.stageId,
       stageAttemptId = key.stageAttemptId,
       version = 1L,
       scan = scanHint,
+      gpu = gpuHint,
       expiresAtNanos = Long.MaxValue), hasHint = true)
 
     try {
       RapidsAutotuneTaskHints.clearCurrentHint()
       assert(RapidsAutotuneTaskHints.currentScanHint.isEmpty)
+      assert(RapidsAutotuneTaskHints.currentGpuHint.isEmpty)
       RapidsAutotuneTaskHints.setCurrentHint(AutotuneCachedHint.empty(key))
       assert(RapidsAutotuneTaskHints.currentScanHint.isEmpty)
+      assert(RapidsAutotuneTaskHints.currentGpuHint.isEmpty)
       RapidsAutotuneTaskHints.setCurrentHint(hint)
       assert(RapidsAutotuneTaskHints.currentScanHint.contains(scanHint))
+      assert(RapidsAutotuneTaskHints.currentGpuHint.contains(gpuHint))
     } finally {
       RapidsAutotuneTaskHints.clearCurrentHint()
     }
     assert(RapidsAutotuneTaskHints.currentScanHint.isEmpty)
+    assert(RapidsAutotuneTaskHints.currentGpuHint.isEmpty)
   }
 
   test("stage shape detects gpu scan prefetch candidates from RDD scopes") {
@@ -171,6 +186,54 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(GraphScanHintPolicy.fromConf(localConf).scanHintFor(candidate) == ScanRuntimeHint.empty)
   }
 
+  test("graph GPU hint policy emits positive caps only in graph mode") {
+    val graphConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4"))
+    val localConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.LOCAL.toString,
+      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4"))
+    val defaultConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString))
+    val stageShape =
+      AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
+
+    assert(GraphGpuHintPolicy.fromConf(graphConf).gpuHintFor(stageShape) ==
+      GpuRuntimeHint(maxConcurrentTasks = 4))
+    assert(GraphGpuHintPolicy.fromConf(localConf).gpuHintFor(stageShape) == GpuRuntimeHint.empty)
+    assert(GraphGpuHintPolicy.fromConf(defaultConf).gpuHintFor(stageShape) == GpuRuntimeHint.empty)
+    assert(GraphGpuHintPolicy.fromConf(graphConf).gpuHintFor(stageShape.copy(numTasks = 0)) ==
+      GpuRuntimeHint.empty)
+  }
+
+  test("GPU admission controller applies the minimum active positive stage cap") {
+    val appliedLimits = mutable.ArrayBuffer.empty[Int]
+    val controller = new RapidsAutotuneGpuAdmissionController(limit => {
+      appliedLimits += limit
+      limit
+    })
+    val secondKey = key.copy(stageId = 4, stageAttemptId = 0)
+    val hint4 = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
+      version = 1L,
+      gpu = GpuRuntimeHint(maxConcurrentTasks = 4)), hasHint = true)
+    val hint2 = AutotuneCachedHint(StageRuntimeHint.empty(secondKey).copy(
+      version = 2L,
+      gpu = GpuRuntimeHint(maxConcurrentTasks = 2)), hasHint = true)
+
+    assert(controller.taskStarted(key, hint4) == 4)
+    assert(controller.taskStarted(key, hint4) == 4)
+    assert(controller.taskStarted(secondKey, hint2) == 2)
+    assert(controller.taskCompleted(secondKey) == 4)
+    assert(controller.taskCompleted(key) == 4)
+    assert(controller.taskCompleted(key) == 0)
+    assert(controller.reset() == 0)
+
+    assert(appliedLimits == Seq(4, 4, 2, 4, 4, 0, 0))
+  }
+
   test("driver endpoint publishes stable positive default no-op hints") {
     val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
     RapidsAutotuneDriverEndpoint.init(null, conf)
@@ -185,6 +248,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(second.version == 2L)
       assert(!first.scan.eagerPrefetch)
       assert(first.scan.maxReadWindow == 0)
+      assert(first.gpu == GpuRuntimeHint.empty)
 
       val response = RapidsAutotuneDriverEndpoint.handleHintRequest(
         RapidsAutotuneHintRequestMsg("exec-1", key))
@@ -211,6 +275,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(second.exists(_.version == 2L))
       assert(first.exists(_.scan == ScanRuntimeHint.empty))
       assert(second.exists(_.scan == ScanRuntimeHint.empty))
+      assert(first.exists(_.gpu == GpuRuntimeHint.empty))
+      assert(second.exists(_.gpu == GpuRuntimeHint.empty))
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
@@ -222,7 +288,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
       RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
       RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "4",
-      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "1024"))
+      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "1024",
+      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4"))
     RapidsAutotuneDriverEndpoint.init(null, conf)
     try {
       val listener = new RapidsAutotuneStageHintListener(conf)
@@ -237,6 +304,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
         minReadWindow = 1,
         maxReadWindow = 4,
         maxReadyBytes = 1024L))
+      assert(hint.gpu == GpuRuntimeHint(maxConcurrentTasks = 4))
 
       val response = RapidsAutotuneDriverEndpoint.handleHintRequest(
         RapidsAutotuneHintRequestMsg("exec-1", key))

@@ -19,6 +19,7 @@ package com.nvidia.spark.rapids
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
+import scala.collection.mutable
 import scala.util.Try
 import scala.util.control.NonFatal
 
@@ -49,12 +50,19 @@ object ScanRuntimeHint {
     maxReadyBytes = Long.MaxValue)
 }
 
+case class GpuRuntimeHint(maxConcurrentTasks: Int)
+
+object GpuRuntimeHint {
+  val empty: GpuRuntimeHint = GpuRuntimeHint(maxConcurrentTasks = 0)
+}
+
 case class StageRuntimeHint(
     executionId: Long,
     stageId: Int,
     stageAttemptId: Int,
     version: Long,
     scan: ScanRuntimeHint,
+    gpu: GpuRuntimeHint,
     expiresAtNanos: Long) {
   def key: AutotuneStageKey = AutotuneStageKey(executionId, stageId, stageAttemptId)
 
@@ -68,6 +76,7 @@ object StageRuntimeHint {
     stageAttemptId = key.stageAttemptId,
     version = 0L,
     scan = ScanRuntimeHint.empty,
+    gpu = GpuRuntimeHint.empty,
     expiresAtNanos = Long.MaxValue)
 }
 
@@ -97,7 +106,9 @@ case class RapidsAutotuneHintAppliedMsg(
     partitionId: Int,
     hintVersion: Long,
     hasHint: Boolean,
-    scan: ScanRuntimeHint)
+    scan: ScanRuntimeHint,
+    gpu: GpuRuntimeHint,
+    gpuAppliedMaxConcurrentTasks: Int)
 
 object RapidsAutotuneTaskHints {
   private val currentHint = new ThreadLocal[AutotuneCachedHint]()
@@ -108,6 +119,74 @@ object RapidsAutotuneTaskHints {
 
   def currentScanHint: Option[ScanRuntimeHint] =
     Option(currentHint.get()).filter(_.hasHint).map(_.hint.scan)
+
+  def currentGpuHint: Option[GpuRuntimeHint] =
+    Option(currentHint.get()).filter(_.hasHint).map(_.hint.gpu)
+}
+
+private case class ActiveGpuAdmissionHint(
+    var maxConcurrentTasks: Int,
+    var activeTasks: Int)
+
+private[rapids] class RapidsAutotuneGpuAdmissionController(applyLimit: Int => Int) {
+  private val activeHints = mutable.HashMap.empty[AutotuneStageKey, ActiveGpuAdmissionHint]
+
+  def taskStarted(key: AutotuneStageKey, cachedHint: AutotuneCachedHint): Int = synchronized {
+    val maxConcurrentTasks =
+      if (cachedHint.hasHint) math.max(0, cachedHint.hint.gpu.maxConcurrentTasks) else 0
+    if (maxConcurrentTasks > 0) {
+      activeHints.get(key) match {
+        case Some(active) =>
+          active.maxConcurrentTasks = math.min(active.maxConcurrentTasks, maxConcurrentTasks)
+          active.activeTasks += 1
+        case None =>
+          activeHints.put(key, ActiveGpuAdmissionHint(maxConcurrentTasks, activeTasks = 1))
+      }
+      applyCurrentLimit()
+    } else {
+      currentLimit
+    }
+  }
+
+  def taskCompleted(key: AutotuneStageKey): Int = synchronized {
+    activeHints.get(key) match {
+      case Some(active) =>
+        active.activeTasks -= 1
+        if (active.activeTasks <= 0) {
+          activeHints.remove(key)
+        }
+        applyCurrentLimit()
+      case None =>
+        currentLimit
+    }
+  }
+
+  def reset(): Int = synchronized {
+    activeHints.clear()
+    applyLimit(0)
+  }
+
+  private def currentLimit: Int = {
+    if (activeHints.isEmpty) {
+      0
+    } else {
+      activeHints.values.map(_.maxConcurrentTasks).min
+    }
+  }
+
+  private def applyCurrentLimit(): Int = applyLimit(currentLimit)
+}
+
+object RapidsAutotuneGpuAdmission {
+  private val controller =
+    new RapidsAutotuneGpuAdmissionController(GpuSemaphore.setRuntimeMaxConcurrentGpuTasksLimit)
+
+  def taskStarted(key: AutotuneStageKey, cachedHint: AutotuneCachedHint): Int =
+    controller.taskStarted(key, cachedHint)
+
+  def taskCompleted(key: AutotuneStageKey): Int = controller.taskCompleted(key)
+
+  def reset(): Int = controller.reset()
 }
 
 case class AutotuneStageShape(
@@ -207,12 +286,13 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   }
 
   def publishDefaultNoopHint(key: AutotuneStageKey): StageRuntimeHint = synchronized {
-    publishStageHint(key, ScanRuntimeHint.empty)
+    publishStageHint(key, ScanRuntimeHint.empty, GpuRuntimeHint.empty)
   }
 
   def publishStageHint(
       key: AutotuneStageKey,
-      scanHint: ScanRuntimeHint): StageRuntimeHint = synchronized {
+      scanHint: ScanRuntimeHint,
+      gpuHint: GpuRuntimeHint = GpuRuntimeHint.empty): StageRuntimeHint = synchronized {
     if (!enabled) {
       StageRuntimeHint.empty(key)
     } else {
@@ -225,6 +305,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
             stageAttemptId = key.stageAttemptId,
             version = nextHintVersion.getAndIncrement(),
             scan = scanHint,
+            gpu = gpuHint,
             expiresAtNanos = Long.MaxValue)
           hints.put(key, hint)
           hint
@@ -257,12 +338,15 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       scanEagerPrefetch = msg.scan.eagerPrefetch,
       scanMinReadWindow = msg.scan.minReadWindow,
       scanMaxReadWindow = msg.scan.maxReadWindow,
-      scanMaxReadyBytes = msg.scan.maxReadyBytes))
+      scanMaxReadyBytes = msg.scan.maxReadyBytes,
+      gpuMaxConcurrentTasks = msg.gpu.maxConcurrentTasks,
+      gpuAppliedMaxConcurrentTasks = msg.gpuAppliedMaxConcurrentTasks))
   }
 }
 
 class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener with Logging {
   private val scanHintPolicy = GraphScanHintPolicy.fromConf(conf)
+  private val gpuHintPolicy = GraphGpuHintPolicy.fromConf(conf)
 
   override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
     val executionId = Option(jobStart.properties)
@@ -300,12 +384,14 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
       executionId = executionId,
       stageId = stageId,
       stageAttemptId = stageAttemptId)
-    val hint = RapidsAutotuneDriverEndpoint.publishStageHint(key,
-      scanHintPolicy.scanHintFor(stageShape))
+    val hint = RapidsAutotuneDriverEndpoint.publishStageHint(
+      key,
+      scanHintPolicy.scanHintFor(stageShape),
+      gpuHintPolicy.gpuHintFor(stageShape))
     if (hint.version > 0) {
       logDebug(s"Published RAPIDS graph autotune hint version ${hint.version} " +
         s"for execution $executionId, stage ${key.stageId}.${key.stageAttemptId}, " +
-        s"scan hint ${hint.scan}")
+        s"scan hint ${hint.scan}, GPU hint ${hint.gpu}")
     }
     hint
   }
@@ -337,6 +423,26 @@ object GraphScanHintPolicy {
   }
 }
 
+case class GraphGpuHintPolicy(
+    enabled: Boolean,
+    maxConcurrentTasks: Int) {
+  def gpuHintFor(stageShape: AutotuneStageShape): GpuRuntimeHint = {
+    if (enabled && maxConcurrentTasks > 0 && stageShape.numTasks > 0) {
+      GpuRuntimeHint(maxConcurrentTasks = maxConcurrentTasks)
+    } else {
+      GpuRuntimeHint.empty
+    }
+  }
+}
+
+object GraphGpuHintPolicy {
+  def fromConf(conf: RapidsConf): GraphGpuHintPolicy = {
+    GraphGpuHintPolicy(
+      enabled = conf.autotuneGraphEnabled && conf.autotuneGraphMode == AutotuneGraphMode.GRAPH,
+      maxConcurrentTasks = conf.autotuneGpuMaxConcurrentTasks)
+  }
+}
+
 class RapidsAutotuneExecutorEndpoint(
     pluginContext: PluginContext,
     conf: RapidsConf) extends Logging {
@@ -350,7 +456,8 @@ class RapidsAutotuneExecutorEndpoint(
       key: AutotuneStageKey,
       taskAttemptId: Long,
       partitionId: Int,
-      cachedHint: AutotuneCachedHint): Unit = {
+      cachedHint: AutotuneCachedHint,
+      gpuAppliedMaxConcurrentTasks: Int): Unit = {
     logDebug(s"Applied RAPIDS graph autotune hint version ${cachedHint.version} " +
       s"for execution ${key.executionId}, stage ${key.stageId}.${key.stageAttemptId}, " +
       s"task $taskAttemptId")
@@ -362,10 +469,31 @@ class RapidsAutotuneExecutorEndpoint(
         partitionId = partitionId,
         hintVersion = cachedHint.version,
         hasHint = cachedHint.hasHint,
-        scan = cachedHint.hint.scan))
+        scan = cachedHint.hint.scan,
+        gpu = cachedHint.hint.gpu,
+        gpuAppliedMaxConcurrentTasks = gpuAppliedMaxConcurrentTasks))
     } catch {
       case NonFatal(e) if failOpen =>
         logWarning("Failed to report RAPIDS graph autotune applied hint; continuing", e)
+    }
+  }
+
+  def taskStarted(key: AutotuneStageKey, cachedHint: AutotuneCachedHint): Int = {
+    try {
+      RapidsAutotuneGpuAdmission.taskStarted(key, cachedHint)
+    } catch {
+      case NonFatal(e) if failOpen =>
+        logWarning("Failed to apply RAPIDS graph autotune GPU hint; continuing", e)
+        0
+    }
+  }
+
+  def taskCompleted(key: AutotuneStageKey): Unit = {
+    try {
+      RapidsAutotuneGpuAdmission.taskCompleted(key)
+    } catch {
+      case NonFatal(e) if failOpen =>
+        logWarning("Failed to clear RAPIDS graph autotune GPU hint; continuing", e)
     }
   }
 

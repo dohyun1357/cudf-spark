@@ -1897,6 +1897,17 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValue(v => v > 0, "The autotune scan max ready bytes must be greater than 0.")
       .createWithDefault(Long.MaxValue)
 
+  val AUTOTUNE_GPU_MAX_CONCURRENT_TASKS =
+    conf("spark.rapids.sql.autotune.gpu.maxConcurrentTasks")
+      .doc("Graph autotune hint for the maximum number of tasks that can execute " +
+        "concurrently per GPU. The effective runtime limit can only tighten " +
+        s"'${MAX_CONCURRENT_GPU_TASKS.key}' when that static cap is set. Set to 0 " +
+        "to disable GPU admission hinting.")
+      .integerConf
+      .checkValue(v => v >= 0,
+        "The autotune GPU max concurrent tasks value must be non-negative.")
+      .createWithDefault(0)
+
   val AUTOTUNE_FAIL_OPEN =
     conf("spark.rapids.sql.autotune.failOpen")
       .doc("When true, autotune controller failures fall back to existing RAPIDS behavior.")
@@ -3886,6 +3897,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val autotuneScanMaxReadWindow: Int = get(AUTOTUNE_SCAN_MAX_READ_WINDOW)
 
   lazy val autotuneScanMaxReadyBytes: Long = get(AUTOTUNE_SCAN_MAX_READY_BYTES)
+
+  lazy val autotuneGpuMaxConcurrentTasks: Int = get(AUTOTUNE_GPU_MAX_CONCURRENT_TASKS)
 
   lazy val autotuneFailOpen: Boolean = get(AUTOTUNE_FAIL_OPEN)
 
