@@ -480,6 +480,11 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
           manager.handleStats(executorId, stats)
         }
         null // No response needed for stats report
+      case m: RapidsAutotuneHintRequestMsg =>
+        RapidsAutotuneDriverEndpoint.handleHintRequest(m)
+      case m: RapidsAutotuneHintAppliedMsg =>
+        RapidsAutotuneDriverEndpoint.handleHintApplied(m)
+        null
       case m => throw new IllegalStateException(s"Unknown message $m")
     }
   }
@@ -493,6 +498,7 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
     RapidsPluginUtils.logPluginMode(conf)
     GpuCoreDumpHandler.driverInit(sc, conf)
     ProfilerOnDriver.init(sc, conf)
+    RapidsAutotuneDriverEndpoint.init(sc, conf)
 
     // Initialize ShuffleCleanupManager and listener for MULTITHREADED mode when:
     // 1. skipMerge is enabled
@@ -551,6 +557,7 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
   override def shutdown(): Unit = {
     extraDriverPlugins.foreach(_.shutdown())
     FileCacheLocalityManager.shutdown()
+    RapidsAutotuneDriverEndpoint.shutdown()
     // Shutdown listener first to trigger cleanup for any remaining jobs
     Option(shuffleCleanupListener).foreach(_.shutdown())
     ShuffleCleanupManager.shutdown()
@@ -589,6 +596,7 @@ case class ActiveTaskMetrics(
 class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
   var rapidsShuffleHeartbeatEndpoint: RapidsShuffleHeartbeatEndpoint = null
   var shuffleCleanupEndpoint: ShuffleCleanupEndpoint = null
+  var autotuneHintEndpoint: RapidsAutotuneExecutorEndpoint = null
   private lazy val extraExecutorPlugins =
     RapidsPluginUtils.extraPlugins.map(_.executorPlugin()).filterNot(_ == null)
 
@@ -608,6 +616,11 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
       val conf = new RapidsConf(extraConf.asScala.toMap)
 
       isAsyncProfilerEnabled = conf.asyncProfilerPathPrefix.nonEmpty
+      if (conf.autotuneGraphEnabled) {
+        logInfo(s"Initializing RAPIDS graph autotune executor endpoint in " +
+          s"${conf.autotuneGraphMode} mode")
+        autotuneHintEndpoint = new RapidsAutotuneExecutorEndpoint(pluginContext, conf)
+      }
 
       ProfilerOnExecutor.init(pluginContext, conf)
       if (isAsyncProfilerEnabled) {
@@ -814,6 +827,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
     }
     Option(rapidsShuffleHeartbeatEndpoint).foreach(_.close())
     Option(shuffleCleanupEndpoint).foreach(_.close())
+    Option(autotuneHintEndpoint).foreach(_.shutdown())
     extraExecutorPlugins.foreach(_.shutdown())
     FileCache.shutdown()
     GpuCoreDumpHandler.shutdown()
@@ -850,6 +864,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
   override def onTaskStart(): Unit = {
     val tc = TaskContext.get
     startTaskNvtx(tc)
+    recordAutotuneHintForTask(tc)
     // Set the priority for the task as soon as it is launched
     TaskPriority.getTaskPriority(tc.taskAttemptId())
     onTaskCompletion(tc, tc => {
@@ -878,6 +893,23 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
     activeTaskInfo.put(
       Thread.currentThread(),
       ActiveTaskMetrics(stageId, taskAttemptId, attemptNumber))
+  }
+
+  private def recordAutotuneHintForTask(taskCtx: TaskContext): Unit = {
+    val endpoint = autotuneHintEndpoint
+    if (endpoint == null) {
+      return
+    }
+    val executionId = Option(taskCtx.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
+      .flatMap(v => Try(v.toLong).toOption)
+    executionId.foreach { id =>
+      val key = AutotuneStageKey(
+        executionId = id,
+        stageId = taskCtx.stageId(),
+        stageAttemptId = taskCtx.stageAttemptNumber())
+      val hint = endpoint.hintFor(key)
+      endpoint.recordAppliedHint(key, taskCtx.taskAttemptId(), taskCtx.partitionId(), hint)
+    }
   }
 
   private def endTaskNvtx(): Unit = {

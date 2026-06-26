@@ -45,3 +45,14 @@ case class SparkRapidsShuffleDiskSavingsEvent(
   numSpills: Int = 0,
   numForcedFileOnly: Int = 0
 ) extends SparkListenerEvent
+
+case class SparkRapidsAutotuneHintAppliedEvent(
+  executorId: String,
+  executionId: Long,
+  stageId: Int,
+  stageAttemptId: Int,
+  taskAttemptId: Long,
+  partitionId: Int,
+  hintVersion: Long,
+  hasHint: Boolean
+) extends SparkListenerEvent
