@@ -38,6 +38,7 @@ import org.apache.spark.sql.rapids.execution.TrampolineUtil
  */
 object RapidsAutotuneDriverEndpoint extends Logging {
   private val hints = new ConcurrentHashMap[AutotuneStageKey, StageRuntimeHint]()
+  private val observations = new ConcurrentHashMap[AutotuneStageKey, StageObservationAgg]()
   private val nextHintVersion = new AtomicLong(1L)
 
   @volatile private var sparkContext: SparkContext = _
@@ -47,6 +48,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     enabled = conf.autotuneGraphEnabled
     sparkContext = if (enabled) sc else null
     hints.clear()
+    observations.clear()
     nextHintVersion.set(1L)
     if (enabled) {
       logInfo(s"Initialized RAPIDS graph autotune driver endpoint in " +
@@ -58,6 +60,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     enabled = false
     sparkContext = null
     hints.clear()
+    observations.clear()
     nextHintVersion.set(1L)
   }
 
@@ -141,6 +144,70 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       batchTargetBatchBytes = msg.batch.targetBatchBytes,
       batchMaxBatchBytes = msg.batch.maxBatchBytes,
       batchSplitUntilSize = msg.batch.splitUntilSize)
+
+  /** Ingest a runtime observation: update the per-stage aggregate and post an eventlog record. */
+  def handleObservation(msg: RapidsAutotuneObservationMsg): Unit = {
+    if (!enabled) {
+      return
+    }
+    val agg = observations.compute(msg.key, (_, prev) =>
+      (if (prev == null) StageObservationAgg.empty else prev).merge(msg))
+    if (sparkContext != null) {
+      TrampolineUtil.postEvent(sparkContext, toObservationEvent(msg, agg))
+    }
+  }
+
+  /** Current aggregated observations for a stage key, if any have been reported (model input). */
+  def observationFor(key: AutotuneStageKey): Option[StageObservationAgg] =
+    Option(observations.get(key))
+
+  private[rapids] def toObservationEvent(
+      msg: RapidsAutotuneObservationMsg,
+      agg: StageObservationAgg): SparkRapidsAutotuneObservationEvent =
+    SparkRapidsAutotuneObservationEvent(
+      executorId = msg.executorId,
+      executionId = msg.key.executionId,
+      stageId = msg.key.stageId,
+      stageAttemptId = msg.key.stageAttemptId,
+      taskAttemptId = msg.taskAttemptId,
+      partitionId = msg.partitionId,
+      hintVersion = msg.hintVersion,
+      gpuSemaphoreWaitNanos = msg.gpuSemaphoreWaitNanos,
+      gpuHoldingNanos = msg.gpuHoldingNanos,
+      hostMemoryBytes = msg.hostMemoryBytes,
+      stageTaskCount = agg.taskCount,
+      stageMaxHostMemoryBytes = agg.maxHostMemoryBytes)
+}
+
+/**
+ * Driver-side running aggregate of executor observations for one stage attempt. Pure value type;
+ * the closed-loop model reads it to derive per-stage pressure signals.
+ */
+case class StageObservationAgg(
+    taskCount: Long,
+    totalGpuSemaphoreWaitNanos: Long,
+    totalGpuHoldingNanos: Long,
+    maxHostMemoryBytes: Long) {
+  def merge(msg: RapidsAutotuneObservationMsg): StageObservationAgg = StageObservationAgg(
+    taskCount = taskCount + 1L,
+    totalGpuSemaphoreWaitNanos = totalGpuSemaphoreWaitNanos + msg.gpuSemaphoreWaitNanos,
+    totalGpuHoldingNanos = totalGpuHoldingNanos + msg.gpuHoldingNanos,
+    maxHostMemoryBytes = math.max(maxHostMemoryBytes, msg.hostMemoryBytes))
+
+  /**
+   * GPU wait ratio = sum(semaphore wait) / sum(holding) across the stage's reported tasks -- a
+   * time-weighted stage ratio (not a mean of per-task ratios); a key pressure signal for the model.
+   */
+  def gpuWaitRatio: Double =
+    if (totalGpuHoldingNanos > 0L) {
+      totalGpuSemaphoreWaitNanos.toDouble / totalGpuHoldingNanos
+    } else {
+      0.0
+    }
+}
+
+object StageObservationAgg {
+  val empty: StageObservationAgg = StageObservationAgg(0L, 0L, 0L, 0L)
 }
 
 /**

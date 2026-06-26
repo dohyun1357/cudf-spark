@@ -68,3 +68,24 @@ case class SparkRapidsAutotuneHintAppliedEvent(
   batchMaxBatchBytes: Long = Long.MaxValue,
   batchSplitUntilSize: Long = 0L
 ) extends SparkListenerEvent
+
+/**
+ * Eventlog record for a runtime observation reported by an executor task (graph autotune closed
+ * loop). Carries the per-task pressure signals plus the driver's running per-stage aggregate, so
+ * eventlogs show what the closed-loop model observed. Observe-only: recording these changes no
+ * execution behavior.
+ */
+case class SparkRapidsAutotuneObservationEvent(
+  executorId: String,
+  executionId: Long,
+  stageId: Int,
+  stageAttemptId: Int,
+  taskAttemptId: Long,
+  partitionId: Int,
+  hintVersion: Long,
+  gpuSemaphoreWaitNanos: Long,
+  gpuHoldingNanos: Long,
+  hostMemoryBytes: Long,
+  stageTaskCount: Long,
+  stageMaxHostMemoryBytes: Long
+) extends SparkListenerEvent

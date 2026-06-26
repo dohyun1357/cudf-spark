@@ -131,3 +131,24 @@ case class RapidsAutotuneHintAppliedMsg(
     shuffle: ShuffleRuntimeHint,
     batch: BatchRuntimeHint,
     gpuAppliedMaxConcurrentTasks: Int)
+
+/**
+ * Executor -> driver runtime observation reported (fire-and-forget) at task completion. Feeds the
+ * driver-side closed-loop model. Advisory only: dropped/lost messages never affect correctness.
+ * Carries the pressure signals available at task end; more fields can be added as the model needs
+ * them (this is the Phase 6 "Observation and Update" channel).
+ *
+ * The metric values are best-effort snapshots read from `GpuTaskMetrics` at completion. Task
+ * completion listeners have no guaranteed ordering, so a value may occasionally be approximate
+ * (e.g. a final semaphore-hold interval not yet folded in). That is acceptable: observations are
+ * advisory model input, never used for correctness.
+ */
+case class RapidsAutotuneObservationMsg(
+    executorId: String,
+    key: AutotuneStageKey,
+    taskAttemptId: Long,
+    partitionId: Int,
+    hintVersion: Long,
+    gpuSemaphoreWaitNanos: Long,
+    gpuHoldingNanos: Long,
+    hostMemoryBytes: Long)

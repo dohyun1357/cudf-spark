@@ -107,6 +107,34 @@ class RapidsAutotuneExecutorEndpoint(
     }
   }
 
+  /**
+   * Report a runtime observation for a completed task back to the driver (fire-and-forget). Feeds
+   * the driver closed-loop model; advisory, so a dropped report never affects correctness.
+   */
+  def reportObservation(
+      key: AutotuneStageKey,
+      taskAttemptId: Long,
+      partitionId: Int,
+      hintVersion: Long,
+      gpuSemaphoreWaitNanos: Long,
+      gpuHoldingNanos: Long,
+      hostMemoryBytes: Long): Unit = {
+    try {
+      pluginContext.send(RapidsAutotuneObservationMsg(
+        executorId = executorId,
+        key = key,
+        taskAttemptId = taskAttemptId,
+        partitionId = partitionId,
+        hintVersion = hintVersion,
+        gpuSemaphoreWaitNanos = gpuSemaphoreWaitNanos,
+        gpuHoldingNanos = gpuHoldingNanos,
+        hostMemoryBytes = hostMemoryBytes))
+    } catch {
+      case NonFatal(e) if failOpen =>
+        logWarning("Failed to report RAPIDS graph autotune observation; continuing", e)
+    }
+  }
+
   def taskStarted(key: AutotuneStageKey, cachedHint: AutotuneCachedHint): Int = {
     try {
       RapidsAutotuneGpuAdmission.taskStarted(key, cachedHint)

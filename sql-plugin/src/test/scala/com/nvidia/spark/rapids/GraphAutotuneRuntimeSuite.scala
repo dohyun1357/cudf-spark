@@ -617,4 +617,64 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
   }
+
+  test("stage observation aggregate merges per-task pressure signals") {
+    def obs(wait: Long, hold: Long, host: Long) = RapidsAutotuneObservationMsg(
+      executorId = "exec-1", key = key, taskAttemptId = 1L, partitionId = 0,
+      hintVersion = 1L, gpuSemaphoreWaitNanos = wait, gpuHoldingNanos = hold,
+      hostMemoryBytes = host)
+    val agg = StageObservationAgg.empty.merge(obs(10L, 100L, 500L)).merge(obs(30L, 100L, 800L))
+    assert(agg.taskCount == 2L)
+    assert(agg.totalGpuSemaphoreWaitNanos == 40L)
+    assert(agg.totalGpuHoldingNanos == 200L)
+    assert(agg.maxHostMemoryBytes == 800L)
+    assert(math.abs(agg.gpuWaitRatio - 0.2) < 1e-9)
+    assert(StageObservationAgg.empty.gpuWaitRatio == 0.0)  // no divide-by-zero
+  }
+
+  test("driver ingests observations into the per-stage aggregate") {
+    val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
+    RapidsAutotuneDriverEndpoint.init(null, conf)
+    try {
+      val m1 = RapidsAutotuneObservationMsg("exec-1", key, 1L, 0, 1L, 10L, 100L, 500L)
+      val m2 = RapidsAutotuneObservationMsg("exec-1", key, 2L, 1, 1L, 30L, 100L, 800L)
+      RapidsAutotuneDriverEndpoint.handleObservation(m1)
+      RapidsAutotuneDriverEndpoint.handleObservation(m2)
+      val agg = RapidsAutotuneDriverEndpoint.observationFor(key)
+      assert(agg.exists(_.taskCount == 2L))
+      assert(agg.exists(_.totalGpuSemaphoreWaitNanos == 40L))
+      assert(agg.exists(_.maxHostMemoryBytes == 800L))
+      val ev = RapidsAutotuneDriverEndpoint.toObservationEvent(m2, agg.get)
+      assert(ev.executionId == key.executionId && ev.stageId == key.stageId)
+      assert(ev.taskAttemptId == 2L && ev.partitionId == 1 && ev.gpuSemaphoreWaitNanos == 30L)
+      assert(ev.hostMemoryBytes == 800L && ev.stageTaskCount == 2L)
+      assert(ev.stageMaxHostMemoryBytes == 800L)
+    } finally {
+      RapidsAutotuneDriverEndpoint.shutdown()
+    }
+  }
+
+  test("executor endpoint reports a runtime observation to the driver") {
+    val ctx = new CapturingPluginContext
+    val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_FAIL_OPEN.key -> "true"))
+    val endpoint = new RapidsAutotuneExecutorEndpoint(ctx, conf)
+    endpoint.reportObservation(key, taskAttemptId = 7L, partitionId = 3, hintVersion = 5L,
+      gpuSemaphoreWaitNanos = 11L, gpuHoldingNanos = 22L, hostMemoryBytes = 33L)
+    ctx.lastSent match {
+      case msg: RapidsAutotuneObservationMsg =>
+        assert(msg.executorId == "exec-7")
+        assert(msg.key == key && msg.taskAttemptId == 7L && msg.partitionId == 3)
+        assert(msg.hintVersion == 5L && msg.gpuSemaphoreWaitNanos == 11L)
+        assert(msg.gpuHoldingNanos == 22L && msg.hostMemoryBytes == 33L)
+      case other => fail(s"unexpected message: $other")
+    }
+  }
+
+  test("executor endpoint fails open when reporting an observation fails") {
+    val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_FAIL_OPEN.key -> "true"))
+    val endpoint = new RapidsAutotuneExecutorEndpoint(new FailingPluginContext, conf)
+    // FailingPluginContext.send throws; reportObservation must swallow it (fail-open), not throw.
+    endpoint.reportObservation(key, taskAttemptId = 1L, partitionId = 0, hintVersion = 1L,
+      gpuSemaphoreWaitNanos = 5L, gpuHoldingNanos = 10L, hostMemoryBytes = 20L)
+  }
 }

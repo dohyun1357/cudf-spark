@@ -46,7 +46,7 @@ import org.apache.spark.serializer.{JavaSerializer, KryoSerializer}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.internal.StaticSQLConf
-import org.apache.spark.sql.rapids.{GpuShuffleEnv, ShuffleCleanupListener, XxHash64Utils}
+import org.apache.spark.sql.rapids.{GpuShuffleEnv, GpuTaskMetrics, ShuffleCleanupListener, XxHash64Utils}
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 
 class PluginException(msg: String) extends RuntimeException(msg)
@@ -485,6 +485,9 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
         RapidsAutotuneDriverEndpoint.handleHintRequest(m)
       case m: RapidsAutotuneHintAppliedMsg =>
         RapidsAutotuneDriverEndpoint.handleHintApplied(m)
+        null
+      case m: RapidsAutotuneObservationMsg =>
+        RapidsAutotuneDriverEndpoint.handleObservation(m)
         null
       case m => throw new IllegalStateException(s"Unknown message $m")
     }
@@ -928,6 +931,25 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
         taskCtx.partitionId(),
         hint,
         gpuAppliedMaxConcurrentTasks)
+      // Report a runtime observation at task completion to feed the driver closed-loop model.
+      // Fully fail-open: a completion listener that threw could fail the task, so reading the
+      // metrics and reporting must never propagate an exception.
+      onTaskCompletion(taskCtx, _ => {
+        try {
+          val taskMetrics = GpuTaskMetrics.get
+          endpoint.reportObservation(
+            key,
+            taskCtx.taskAttemptId(),
+            taskCtx.partitionId(),
+            hint.version,
+            taskMetrics.getSemWaitTime(),
+            taskMetrics.getSemaphoreHoldingTime,
+            taskMetrics.getMaxHostBytesAllocated)
+        } catch {
+          case scala.util.control.NonFatal(e) =>
+            logWarning("Failed to record RAPIDS graph autotune observation; continuing", e)
+        }
+      })
     }
   }
 
