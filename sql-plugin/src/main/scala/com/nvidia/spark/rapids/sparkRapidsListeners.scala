@@ -54,5 +54,9 @@ case class SparkRapidsAutotuneHintAppliedEvent(
   taskAttemptId: Long,
   partitionId: Int,
   hintVersion: Long,
-  hasHint: Boolean
+  hasHint: Boolean,
+  scanEagerPrefetch: Boolean,
+  scanMinReadWindow: Int,
+  scanMaxReadWindow: Int,
+  scanMaxReadyBytes: Long
 ) extends SparkListenerEvent

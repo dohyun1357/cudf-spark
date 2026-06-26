@@ -104,6 +104,46 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     endpoint.recordAppliedHint(key, taskAttemptId = 22L, partitionId = 1, hint)
   }
 
+  test("stage shape detects gpu scan prefetch candidates from RDD scopes") {
+    val candidate = AutotuneStageShape.fromRddScopeNames(
+      Seq("GpuScan parquet ", "GpuFilter", "GpuHashAggregate", "GpuColumnarExchange"),
+      numTasks = 50)
+    val scanOnly = AutotuneStageShape.fromRddScopeNames(
+      Seq("GpuScan parquet ", "GpuFilter"),
+      numTasks = 50)
+    val consumerOnly = AutotuneStageShape.fromRddScopeNames(
+      Seq("GpuHashAggregate", "GpuColumnarExchange"),
+      numTasks = 50)
+
+    assert(candidate.isScanPrefetchCandidate)
+    assert(!scanOnly.isScanPrefetchCandidate)
+    assert(!consumerOnly.isScanPrefetchCandidate)
+  }
+
+  test("graph scan hint policy emits bounded scan hints only in graph mode") {
+    val graphConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
+      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "4",
+      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "1024"))
+    val localConf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.LOCAL.toString,
+      RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
+      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "4",
+      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "1024"))
+    val candidate =
+      AutotuneStageShape(hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50)
+
+    val graphHint = GraphScanHintPolicy.fromConf(graphConf).scanHintFor(candidate)
+    assert(graphHint.eagerPrefetch)
+    assert(graphHint.minReadWindow == 1)
+    assert(graphHint.maxReadWindow == 4)
+    assert(graphHint.maxReadyBytes == 1024L)
+    assert(GraphScanHintPolicy.fromConf(localConf).scanHintFor(candidate) == ScanRuntimeHint.empty)
+  }
+
   test("driver endpoint publishes stable positive default no-op hints") {
     val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
     RapidsAutotuneDriverEndpoint.init(null, conf)
@@ -131,7 +171,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
     RapidsAutotuneDriverEndpoint.init(null, conf)
     try {
-      val listener = new RapidsAutotuneStageHintListener()
+      val listener = new RapidsAutotuneStageHintListener(conf)
       listener.publishDefaultHint(key.executionId, key.stageId, key.stageAttemptId)
       listener.publishDefaultHint(key.executionId, 4, 0)
 
@@ -144,6 +184,36 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(second.exists(_.version == 2L))
       assert(first.exists(_.scan == ScanRuntimeHint.empty))
       assert(second.exists(_.scan == ScanRuntimeHint.empty))
+    } finally {
+      RapidsAutotuneDriverEndpoint.shutdown()
+    }
+  }
+
+  test("stage hint listener publishes graph scan hints for candidate stages") {
+    val conf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
+      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "4",
+      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "1024"))
+    RapidsAutotuneDriverEndpoint.init(null, conf)
+    try {
+      val listener = new RapidsAutotuneStageHintListener(conf)
+      val candidate =
+        AutotuneStageShape(hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50)
+      val hint = listener.publishHintForStage(
+        key.executionId, key.stageId, key.stageAttemptId, candidate)
+
+      assert(hint.version == 1L)
+      assert(hint.scan == ScanRuntimeHint(
+        eagerPrefetch = true,
+        minReadWindow = 1,
+        maxReadWindow = 4,
+        maxReadyBytes = 1024L))
+
+      val response = RapidsAutotuneDriverEndpoint.handleHintRequest(
+        RapidsAutotuneHintRequestMsg("exec-1", key))
+      assert(response.hint.contains(hint))
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
     }

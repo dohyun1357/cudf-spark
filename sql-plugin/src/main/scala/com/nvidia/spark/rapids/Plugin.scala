@@ -501,7 +501,7 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
     ProfilerOnDriver.init(sc, conf)
     RapidsAutotuneDriverEndpoint.init(sc, conf)
     if (conf.autotuneGraphEnabled) {
-      autotuneStageHintListener = new RapidsAutotuneStageHintListener()
+      autotuneStageHintListener = new RapidsAutotuneStageHintListener(conf)
       sc.addSparkListener(autotuneStageHintListener)
       logInfo(s"RAPIDS graph autotune stage hint listener initialized in " +
         s"${conf.autotuneGraphMode} mode")

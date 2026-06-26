@@ -28,6 +28,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
+import org.apache.spark.storage.RDDInfo
 
 case class AutotuneStageKey(
     executionId: Long,
@@ -95,7 +96,41 @@ case class RapidsAutotuneHintAppliedMsg(
     taskAttemptId: Long,
     partitionId: Int,
     hintVersion: Long,
-    hasHint: Boolean)
+    hasHint: Boolean,
+    scan: ScanRuntimeHint)
+
+case class AutotuneStageShape(
+    hasGpuScan: Boolean,
+    hasGpuPrefetchConsumer: Boolean,
+    numTasks: Int) {
+  def isScanPrefetchCandidate: Boolean =
+    hasGpuScan && hasGpuPrefetchConsumer && numTasks > 0
+}
+
+object AutotuneStageShape {
+  private val GpuScanPrefix = "GpuScan"
+  private val GpuConsumerPrefixes = Seq(
+    "GpuHashAggregate",
+    "GpuSort",
+    "GpuShuffled",
+    "GpuHashJoin")
+
+  def fromStageInfo(stageInfo: org.apache.spark.scheduler.StageInfo): AutotuneStageShape = {
+    fromRddScopeNames(stageInfo.rddInfos.flatMap(scopeName), stageInfo.numTasks)
+  }
+
+  def fromRddScopeNames(scopeNames: Seq[String], numTasks: Int): AutotuneStageShape = {
+    AutotuneStageShape(
+      hasGpuScan = scopeNames.exists(_.startsWith(GpuScanPrefix)),
+      hasGpuPrefetchConsumer = scopeNames.exists { name =>
+        GpuConsumerPrefixes.exists(name.startsWith)
+      },
+      numTasks = numTasks)
+  }
+
+  private def scopeName(info: RDDInfo): Option[String] =
+    info.scope.map(_.name)
+}
 
 class AutotuneHintCache(fetchHint: AutotuneStageKey => AutotuneCachedHint) {
   private val hints = new ConcurrentHashMap[AutotuneStageKey, AutotuneCachedHint]()
@@ -161,6 +196,12 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   }
 
   def publishDefaultNoopHint(key: AutotuneStageKey): StageRuntimeHint = synchronized {
+    publishStageHint(key, ScanRuntimeHint.empty)
+  }
+
+  def publishStageHint(
+      key: AutotuneStageKey,
+      scanHint: ScanRuntimeHint): StageRuntimeHint = synchronized {
     if (!enabled) {
       StageRuntimeHint.empty(key)
     } else {
@@ -172,7 +213,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
             stageId = key.stageId,
             stageAttemptId = key.stageAttemptId,
             version = nextHintVersion.getAndIncrement(),
-            scan = ScanRuntimeHint.empty,
+            scan = scanHint,
             expiresAtNanos = Long.MaxValue)
           hints.put(key, hint)
           hint
@@ -201,11 +242,17 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       taskAttemptId = msg.taskAttemptId,
       partitionId = msg.partitionId,
       hintVersion = msg.hintVersion,
-      hasHint = msg.hasHint))
+      hasHint = msg.hasHint,
+      scanEagerPrefetch = msg.scan.eagerPrefetch,
+      scanMinReadWindow = msg.scan.minReadWindow,
+      scanMaxReadWindow = msg.scan.maxReadWindow,
+      scanMaxReadyBytes = msg.scan.maxReadyBytes))
   }
 }
 
-class RapidsAutotuneStageHintListener extends SparkListener with Logging {
+class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener with Logging {
+  private val scanHintPolicy = GraphScanHintPolicy.fromConf(conf)
+
   override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
     val executionId = Option(jobStart.properties)
       .flatMap(p => Option(p.getProperty(SQLExecution.EXECUTION_ID_KEY)))
@@ -213,7 +260,11 @@ class RapidsAutotuneStageHintListener extends SparkListener with Logging {
 
     executionId.foreach { execId =>
       jobStart.stageInfos.foreach { stageInfo =>
-        publishDefaultHint(execId, stageInfo.stageId, stageInfo.attemptNumber())
+        publishHintForStage(
+          execId,
+          stageInfo.stageId,
+          stageInfo.attemptNumber(),
+          AutotuneStageShape.fromStageInfo(stageInfo))
       }
     }
   }
@@ -222,16 +273,56 @@ class RapidsAutotuneStageHintListener extends SparkListener with Logging {
       executionId: Long,
       stageId: Int,
       stageAttemptId: Int): StageRuntimeHint = {
+    publishHintForStage(
+      executionId,
+      stageId,
+      stageAttemptId,
+      AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 0))
+  }
+
+  private[rapids] def publishHintForStage(
+      executionId: Long,
+      stageId: Int,
+      stageAttemptId: Int,
+      stageShape: AutotuneStageShape): StageRuntimeHint = {
     val key = AutotuneStageKey(
       executionId = executionId,
       stageId = stageId,
       stageAttemptId = stageAttemptId)
-    val hint = RapidsAutotuneDriverEndpoint.publishDefaultNoopHint(key)
+    val hint = RapidsAutotuneDriverEndpoint.publishStageHint(key,
+      scanHintPolicy.scanHintFor(stageShape))
     if (hint.version > 0) {
-      logDebug(s"Published default RAPIDS graph autotune hint version ${hint.version} " +
-        s"for execution $executionId, stage ${key.stageId}.${key.stageAttemptId}")
+      logDebug(s"Published RAPIDS graph autotune hint version ${hint.version} " +
+        s"for execution $executionId, stage ${key.stageId}.${key.stageAttemptId}, " +
+        s"scan hint ${hint.scan}")
     }
     hint
+  }
+}
+
+case class GraphScanHintPolicy(
+    enabled: Boolean,
+    maxReadWindow: Int,
+    maxReadyBytes: Long) {
+  def scanHintFor(stageShape: AutotuneStageShape): ScanRuntimeHint = {
+    if (enabled && stageShape.isScanPrefetchCandidate && maxReadWindow > 0) {
+      ScanRuntimeHint(
+        eagerPrefetch = true,
+        minReadWindow = ScanReadWindowSettings.MIN_WINDOW,
+        maxReadWindow = maxReadWindow,
+        maxReadyBytes = maxReadyBytes)
+    } else {
+      ScanRuntimeHint.empty
+    }
+  }
+}
+
+object GraphScanHintPolicy {
+  def fromConf(conf: RapidsConf): GraphScanHintPolicy = {
+    GraphScanHintPolicy(
+      enabled = conf.autotuneGraphEnabled && conf.autotuneGraphMode == AutotuneGraphMode.GRAPH,
+      maxReadWindow = math.min(conf.autotuneScanMaxReadWindow, conf.scanPrefetchMaxParallelism),
+      maxReadyBytes = conf.autotuneScanMaxReadyBytes)
   }
 }
 
@@ -259,7 +350,8 @@ class RapidsAutotuneExecutorEndpoint(
         taskAttemptId = taskAttemptId,
         partitionId = partitionId,
         hintVersion = cachedHint.version,
-        hasHint = cachedHint.hasHint))
+        hasHint = cachedHint.hasHint,
+        scan = cachedHint.hint.scan))
     } catch {
       case NonFatal(e) if failOpen =>
         logWarning("Failed to report RAPIDS graph autotune applied hint; continuing", e)
