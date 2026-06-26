@@ -1377,7 +1377,8 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
       targetBatchSizeBytes, maxGpuColumnSizeBytes,
       useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes, compressCfg,
       metrics, partitionSchema, poolConf, ignoreMissingFiles, ignoreCorruptFiles,
-      readUseFieldId)
+      readUseFieldId,
+      Some(ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, files.length)))
   }
 
   /**
@@ -2329,10 +2330,11 @@ abstract class MultiFileCoalescingParquetPartitionReaderBase(
     partitionSchema: StructType,
     poolConf: ThreadPoolConf,
     ignoreMissingFiles: Boolean,
-    ignoreCorruptFiles: Boolean)
+    ignoreCorruptFiles: Boolean,
+    readWindowSettings: Option[ScanReadWindowSettings] = None)
   extends MultiFileCoalescingPartitionReaderBase(conf, clippedBlocks,
     partitionSchema, maxReadBatchSizeRows, maxReadBatchSizeBytes, maxGpuColumnSizeBytes,
-    poolConf, execMetrics)
+    poolConf, execMetrics, readWindowSettings)
   with ParquetPartitionReaderBase {
 
   // Some implicits to convert the base class to the sub-class and vice versa
@@ -2540,11 +2542,12 @@ class MultiFileParquetPartitionReader(
     poolConf: ThreadPoolConf,
     ignoreMissingFiles: Boolean,
     ignoreCorruptFiles: Boolean,
-    useFieldId: Boolean)
+    useFieldId: Boolean,
+    readWindowSettings: Option[ScanReadWindowSettings] = None)
   extends MultiFileCoalescingParquetPartitionReaderBase(fileIO, conf, clippedBlocks,
     isSchemaCaseSensitive, maxReadBatchSizeRows, maxReadBatchSizeBytes, targetBatchSizeBytes,
     maxGpuColumnSizeBytes, compressCfg, execMetrics, partitionSchema, poolConf,
-    ignoreMissingFiles, ignoreCorruptFiles) {
+    ignoreMissingFiles, ignoreCorruptFiles, readWindowSettings) {
 
   override def readBufferToTablesAndClose(dataBuffer: HostMemoryBuffer, dataSize: Long,
       clippedSchema: SchemaBase, readDataSchema: StructType,

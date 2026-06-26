@@ -481,6 +481,26 @@ case class GpuFileSourceScanExec(
           // by meta-level pruning.
           bf += "readBufferSize" -> createSizeMetric(DEBUG_LEVEL, "size of read buffer")
         }
+        bf += SCAN_READ_WINDOW_INITIAL ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_INITIAL)
+        bf += SCAN_READ_WINDOW_CURRENT ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_CURRENT)
+        bf += SCAN_READ_WINDOW_MAX ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_MAX)
+        bf += SCAN_READ_IN_FLIGHT_MAX ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_IN_FLIGHT_MAX)
+        bf += SCAN_READ_READY_MAX ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_READY_MAX)
+        bf += SCAN_READ_BACKLOG_MAX ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_BACKLOG_MAX)
+        bf += SCAN_READ_WINDOW_INCREASES ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_INCREASES)
+        bf += SCAN_READ_WINDOW_DECREASES ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_DECREASES)
+        bf += SCAN_READ_WINDOW_MEMORY_DECREASES ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_MEMORY_DECREASES)
+        bf += SCAN_READ_WINDOW_SCHEDULE_DECREASES ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_SCHEDULE_DECREASES)
         if (ExternalSource.isSupportedFormat(relation.fileFormat.getClass)) {
           // This metric is used to post the time spent in generating the `skip_row` column
           // in Delta Lake 3.3.0+

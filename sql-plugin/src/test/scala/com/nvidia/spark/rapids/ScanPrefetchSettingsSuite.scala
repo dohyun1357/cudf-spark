@@ -141,4 +141,74 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
     controller.observeReadWait(1L, 0L, 2L, 0L)
     assert(controller.currentReadWindow == 1)
   }
+
+  test("scan read window controller records decision metrics") {
+    val metricKeys = Seq(
+      GpuMetric.SCAN_READ_WINDOW_INITIAL,
+      GpuMetric.SCAN_READ_WINDOW_CURRENT,
+      GpuMetric.SCAN_READ_WINDOW_MAX,
+      GpuMetric.SCAN_READ_IN_FLIGHT_MAX,
+      GpuMetric.SCAN_READ_READY_MAX,
+      GpuMetric.SCAN_READ_BACKLOG_MAX,
+      GpuMetric.SCAN_READ_WINDOW_INCREASES,
+      GpuMetric.SCAN_READ_WINDOW_DECREASES,
+      GpuMetric.SCAN_READ_WINDOW_MEMORY_DECREASES,
+      GpuMetric.SCAN_READ_WINDOW_SCHEDULE_DECREASES)
+    val metrics = metricKeys.map(_ -> new LocalGpuMetric()).toMap
+    val settings = ScanReadWindowSettings(
+      enabled = true,
+      initialWindow = 1,
+      maxWindow = 4,
+      maxReadyBytes = 100L)
+    val controller = new ScanReadWindowController(settings, metrics)
+
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_INITIAL).value == 1)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_CURRENT).value == 1)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_MAX).value == 1)
+
+    controller.observeReadQueue(inFlightReadTasks = 2, readyReadTasks = 1,
+      backlogReadTasks = 5)
+    controller.observeReadQueue(inFlightReadTasks = 1, readyReadTasks = 3,
+      backlogReadTasks = 2)
+    assert(metrics(GpuMetric.SCAN_READ_IN_FLIGHT_MAX).value == 2)
+    assert(metrics(GpuMetric.SCAN_READ_READY_MAX).value == 3)
+    assert(metrics(GpuMetric.SCAN_READ_BACKLOG_MAX).value == 5)
+
+    controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
+    assert(controller.currentReadWindow == 2)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_CURRENT).value == 2)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_MAX).value == 2)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_INCREASES).value == 1)
+
+    controller.observeReadWait(0L, 0L, 1L, 101L)
+    assert(controller.currentReadWindow == 1)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_CURRENT).value == 1)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_DECREASES).value == 1)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_MEMORY_DECREASES).value == 1)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW_SCHEDULE_DECREASES).value == 1)
+  }
+
+  test("disabled scan read window controller does not record decision metrics") {
+    val metricKeys = Seq(
+      GpuMetric.SCAN_READ_WINDOW_INITIAL,
+      GpuMetric.SCAN_READ_WINDOW_CURRENT,
+      GpuMetric.SCAN_READ_WINDOW_MAX,
+      GpuMetric.SCAN_READ_IN_FLIGHT_MAX,
+      GpuMetric.SCAN_READ_READY_MAX,
+      GpuMetric.SCAN_READ_BACKLOG_MAX)
+    val metrics = metricKeys.map(_ -> new LocalGpuMetric()).toMap
+    val settings = ScanReadWindowSettings(
+      enabled = false,
+      initialWindow = 4,
+      maxWindow = 4,
+      maxReadyBytes = Long.MaxValue)
+    val controller = new ScanReadWindowController(settings, metrics)
+
+    controller.observeReadQueue(inFlightReadTasks = 2, readyReadTasks = 1,
+      backlogReadTasks = 5)
+
+    metricKeys.foreach { key =>
+      assert(metrics(key).value == 0)
+    }
+  }
 }

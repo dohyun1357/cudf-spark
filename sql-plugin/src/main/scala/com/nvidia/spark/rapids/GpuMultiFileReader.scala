@@ -116,17 +116,64 @@ object ScanReadWindowSettings {
   }
 }
 
-class ScanReadWindowController(settings: ScanReadWindowSettings) extends Logging {
+class ScanReadWindowController(
+    settings: ScanReadWindowSettings,
+    metrics: Map[String, GpuMetric] = Map.empty) extends Logging {
   private val MIN_WAIT_NS_FOR_INCREASE = TimeUnit.MILLISECONDS.toNanos(1)
 
   private var readWindow = settings.initialWindow
   private var increaseCooldownReads = 0
+  private var maxObservedReadWindow = 0
+  private var maxObservedInFlightReads = 0
+  private var maxObservedReadyReads = 0
+  private var maxObservedBacklogReads = 0
+
+  private val readWindowInitialMetric =
+    metrics.getOrElse(SCAN_READ_WINDOW_INITIAL, NoopMetric)
+  private val readWindowCurrentMetric =
+    metrics.getOrElse(SCAN_READ_WINDOW_CURRENT, NoopMetric)
+  private val readWindowMaxMetric =
+    metrics.getOrElse(SCAN_READ_WINDOW_MAX, NoopMetric)
+  private val inFlightReadMaxMetric =
+    metrics.getOrElse(SCAN_READ_IN_FLIGHT_MAX, NoopMetric)
+  private val readyReadMaxMetric =
+    metrics.getOrElse(SCAN_READ_READY_MAX, NoopMetric)
+  private val backlogReadMaxMetric =
+    metrics.getOrElse(SCAN_READ_BACKLOG_MAX, NoopMetric)
+  private val readWindowIncreaseMetric =
+    metrics.getOrElse(SCAN_READ_WINDOW_INCREASES, NoopMetric)
+  private val readWindowDecreaseMetric =
+    metrics.getOrElse(SCAN_READ_WINDOW_DECREASES, NoopMetric)
+  private val readWindowMemoryDecreaseMetric =
+    metrics.getOrElse(SCAN_READ_WINDOW_MEMORY_DECREASES, NoopMetric)
+  private val readWindowScheduleDecreaseMetric =
+    metrics.getOrElse(SCAN_READ_WINDOW_SCHEDULE_DECREASES, NoopMetric)
+
+  if (settings.enabled) {
+    updateMetricValue(readWindowInitialMetric, readWindow)
+    recordCurrentReadWindow()
+  }
 
   def enabled: Boolean = settings.enabled
 
   def initialReadWindow: Int = readWindow
 
   def currentReadWindow: Int = readWindow
+
+  def observeReadQueue(
+      inFlightReadTasks: Int,
+      readyReadTasks: Int,
+      backlogReadTasks: Int): Unit = {
+    if (!settings.enabled) {
+      return
+    }
+    maxObservedInFlightReads = setMaxMetric(
+      inFlightReadMaxMetric, maxObservedInFlightReads, inFlightReadTasks)
+    maxObservedReadyReads = setMaxMetric(
+      readyReadMaxMetric, maxObservedReadyReads, readyReadTasks)
+    maxObservedBacklogReads = setMaxMetric(
+      backlogReadMaxMetric, maxObservedBacklogReads, backlogReadTasks)
+  }
 
   def observeReadWait(
       bufferWaitNs: Long,
@@ -146,6 +193,14 @@ class ScanReadWindowController(settings: ScanReadWindowSettings) extends Logging
           s"(hostBytes=$hostBytesAllocated, maxReadyBytes=${settings.maxReadyBytes}, " +
           s"bufferWaitNs=$bufferWaitNs, scheduleWaitNs=$scheduleWaitNs)")
         readWindow = nextWindow
+        readWindowDecreaseMetric += 1
+        if (memoryPressureHigh) {
+          readWindowMemoryDecreaseMetric += 1
+        }
+        if (scheduleWaitHigh) {
+          readWindowScheduleDecreaseMetric += 1
+        }
+        recordCurrentReadWindow()
         increaseCooldownReads = 1
       }
     } else if (increaseCooldownReads > 0) {
@@ -156,6 +211,31 @@ class ScanReadWindowController(settings: ScanReadWindowSettings) extends Logging
       logDebug(s"increase scan read window from $readWindow to $nextWindow " +
         s"(bufferWaitNs=$bufferWaitNs, bufferGpuIdleNs=$bufferGpuIdleNs)")
       readWindow = nextWindow
+      readWindowIncreaseMetric += 1
+      recordCurrentReadWindow()
+    }
+  }
+
+  private def recordCurrentReadWindow(): Unit = {
+    updateMetricValue(readWindowCurrentMetric, readWindow)
+    maxObservedReadWindow = setMaxMetric(
+      readWindowMaxMetric, maxObservedReadWindow, readWindow)
+  }
+
+  private def setMaxMetric(metric: GpuMetric, currentMax: Int, observed: Int): Int = {
+    val sanitized = math.max(observed, 0)
+    if (sanitized > currentMax) {
+      updateMetricValue(metric, sanitized)
+      sanitized
+    } else {
+      currentMax
+    }
+  }
+
+  private def updateMetricValue(metric: GpuMetric, value: Long): Unit = {
+    val delta = value - metric.value
+    if (delta != 0) {
+      metric += delta
     }
   }
 }
@@ -643,7 +723,8 @@ abstract class MultiFileCloudPartitionReaderBase(
   private val tasks = new ConcurrentLinkedQueue[Future[RunnerResult]]()
   private val tasksToRun = new Queue[AsyncRunner[BufferInfo]]()
   private val readWindowController = new ScanReadWindowController(
-    ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, inputFiles.length))
+    ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, inputFiles.length),
+    execMetrics)
   private[this] val inputMetrics = Option(TaskContext.get).map(_.taskMetrics().inputMetrics)
     .getOrElse(TrampolineUtil.newInputMetrics())
   // this is used when the read order doesn't matter and in that case, the tasks queue
@@ -719,6 +800,7 @@ abstract class MultiFileCloudPartitionReaderBase(
       val file = inputFiles(i)
       tasksToRun.enqueue(newTaskRunner(file))
     }
+    recordReadQueueDepths()
     filesToRead = inputFiles.length
     limit
   }
@@ -824,6 +906,7 @@ abstract class MultiFileCloudPartitionReaderBase(
       initSize: Long,
       initNumRows: Long,
       results: ArrayBuffer[HostMemoryBuffersWithMetaDataBase]): Unit = {
+    recordReadQueueDepths()
     var takeMore = true
     var currSize = initSize
     var currNumRows = initNumRows
@@ -859,6 +942,7 @@ abstract class MultiFileCloudPartitionReaderBase(
             results.append(hmbAndMeta)
             currSize += hmbAndMeta.memBuffersAndSizes.map(_.bytes).sum
             filesToRead -= 1
+            recordReadQueueDepths()
           }
         } else {
           // wait time is <= 0
@@ -870,6 +954,7 @@ abstract class MultiFileCloudPartitionReaderBase(
         currSize += hmbWithMeta.memBuffersAndSizes.map(_.bytes).sum
         currNumRows += hmbWithMeta.memBuffersAndSizes.map(_.numRows).sum
         filesToRead -= 1
+        recordReadQueueDepths()
       }
     }
   }
@@ -901,6 +986,7 @@ abstract class MultiFileCloudPartitionReaderBase(
   }
 
   private def getNextBuffersAndMetaSingleFile(): HostMemoryBuffersWithMetaDataBase = {
+    recordReadQueueDepths()
     val taskResult = if (keepReadsInOrder) {
       tasks.poll().get()
     } else {
@@ -909,6 +995,7 @@ abstract class MultiFileCloudPartitionReaderBase(
       bufMetaFut.get()
     }
     filesToRead -= 1
+    recordReadQueueDepths()
     convertAsyncResult(taskResult)
   }
 
@@ -1071,6 +1158,7 @@ abstract class MultiFileCloudPartitionReaderBase(
       val threadPool = MultiFileReaderThreadPool.getOrCreateThreadPool(poolConf)
       tasks.add(threadPool.submit(runner))
     }
+    recordReadQueueDepths()
   }
 
   private def refillReadWindowIfNeeded(): Unit = {
@@ -1082,6 +1170,14 @@ abstract class MultiFileCloudPartitionReaderBase(
         addNextTaskIfNeeded()
       }
     }
+    recordReadQueueDepths()
+  }
+
+  private def recordReadQueueDepths(): Unit = {
+    readWindowController.observeReadQueue(
+      inFlightReadTasks = tasks.size(),
+      readyReadTasks = tasks.iterator().asScala.count(_.isDone),
+      backlogReadTasks = tasksToRun.size)
   }
 
   private def observeReadWait(
@@ -1216,12 +1312,21 @@ abstract class MultiFileCoalescingPartitionReaderBase(
     maxReadBatchSizeBytes: Long,
     maxGpuColumnSizeBytes: Long,
     poolConf: ThreadPoolConf,
-    execMetrics: Map[String, GpuMetric]) extends FilePartitionReaderBase(conf, execMetrics)
+    execMetrics: Map[String, GpuMetric],
+    readWindowSettings: Option[ScanReadWindowSettings] = None)
+    extends FilePartitionReaderBase(conf, execMetrics)
     with MultiFileReaderFunctions {
 
   private val blockIterator: BufferedIterator[SingleDataBlockInfo] =
     clippedBlocks.iterator.buffered
   private[this] val inputMetrics = TaskContext.get.taskMetrics().inputMetrics
+  private val readWindowController = new ScanReadWindowController(
+    readWindowSettings.getOrElse(ScanReadWindowSettings(
+      enabled = false,
+      initialWindow = 0,
+      maxWindow = 0,
+      maxReadyBytes = Long.MaxValue)),
+    execMetrics)
 
   /**
    * A group of blocks in one coalesced read that have the same file path.
@@ -1587,7 +1692,9 @@ abstract class MultiFileCoalescingPartitionReaderBase(
         }
         filesAndBlocks += file -> dataBlocks
       }
-      val tasks = new java.util.ArrayList[Future[AsyncResult[(Seq[DataBlockBase], Long)]]]()
+      type BatchRunnerResult = AsyncResult[(Seq[DataBlockBase], Long)]
+      val tasks = new java.util.ArrayList[Future[BatchRunnerResult]]()
+      val queuedTasks = Queue[AsyncRunner[(Seq[DataBlockBase], Long)]]()
 
       val batchContext = createBatchContext(filesAndBlocks, clippedSchema)
       // First, estimate the output file size for the initial allocating.
@@ -1608,16 +1715,61 @@ abstract class MultiFileCoalescingPartitionReaderBase(
             val fileBlockSize = blocks.map(_.getBlockSize).sum
             // use a single buffer and slice it up for different files if we need
             val outLocal = hmb.slice(offset, fileBlockSize)
-            // Third, copy the blocks for each file in parallel using background threads
-            tasks.add(threadPool.submit(
-              getBatchRunner(tc, file, outLocal, blocks, offset, batchContext)))
+            val runner = getBatchRunner(tc, file, outLocal, blocks, offset, batchContext)
+            if (readWindowController.enabled) {
+              queuedTasks.enqueue(runner)
+            } else {
+              // Third, copy the blocks for each file in parallel using background threads
+              tasks.add(threadPool.submit(runner))
+            }
             offset += fileBlockSize
           }
 
-          for (future <- tasks.asScala) {
-            val (blocks, bytesRead) = future.get().data
-            allOutputBlocks ++= blocks
-            TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
+          if (readWindowController.enabled) {
+            val activeTasks = Queue[Future[BatchRunnerResult]]()
+            def recordReadQueueDepths(): Unit = {
+              readWindowController.observeReadQueue(
+                inFlightReadTasks = activeTasks.size,
+                readyReadTasks = activeTasks.count(_.isDone),
+                backlogReadTasks = queuedTasks.size)
+            }
+            def submitNextTask(): Unit = {
+              activeTasks.enqueue(threadPool.submit(queuedTasks.dequeue()))
+              recordReadQueueDepths()
+            }
+            def refillReadWindow(): Unit = {
+              while (queuedTasks.nonEmpty &&
+                  activeTasks.size < readWindowController.currentReadWindow) {
+                submitNextTask()
+              }
+              recordReadQueueDepths()
+            }
+            def collectFuture(future: Future[BatchRunnerResult]): Unit = {
+              val waitStart = System.nanoTime()
+              val (blocks, bytesRead) = future.get().data
+              val waitNs = System.nanoTime() - waitStart
+              allOutputBlocks ++= blocks
+              TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
+              readWindowController.observeReadWait(
+                bufferWaitNs = waitNs,
+                bufferGpuIdleNs = 0L,
+                scheduleWaitNs = 0L,
+                hostBytesAllocated = GpuTaskMetrics.get.getHostBytesAllocated)
+            }
+
+            recordReadQueueDepths()
+            refillReadWindow()
+            while (activeTasks.nonEmpty) {
+              collectFuture(activeTasks.dequeue())
+              recordReadQueueDepths()
+              refillReadWindow()
+            }
+          } else {
+            for (future <- tasks.asScala) {
+              val (blocks, bytesRead) = future.get().data
+              allOutputBlocks ++= blocks
+              TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
+            }
           }
 
           // Fourth, calculate the final buffer size
