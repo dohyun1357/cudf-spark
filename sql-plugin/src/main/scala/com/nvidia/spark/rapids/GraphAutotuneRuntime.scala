@@ -31,54 +31,10 @@ import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 import org.apache.spark.storage.RDDInfo
 
-case class AutotuneStageKey(
-    executionId: Long,
-    stageId: Int,
-    stageAttemptId: Int)
-
-case class ScanRuntimeHint(
-    eagerPrefetch: Boolean,
-    minReadWindow: Int,
-    maxReadWindow: Int,
-    maxReadyBytes: Long)
-
-object ScanRuntimeHint {
-  val empty: ScanRuntimeHint = ScanRuntimeHint(
-    eagerPrefetch = false,
-    minReadWindow = 0,
-    maxReadWindow = 0,
-    maxReadyBytes = Long.MaxValue)
-}
-
-case class GpuRuntimeHint(maxConcurrentTasks: Int)
-
-object GpuRuntimeHint {
-  val empty: GpuRuntimeHint = GpuRuntimeHint(maxConcurrentTasks = 0)
-}
-
-case class StageRuntimeHint(
-    executionId: Long,
-    stageId: Int,
-    stageAttemptId: Int,
-    version: Long,
-    scan: ScanRuntimeHint,
-    gpu: GpuRuntimeHint,
-    expiresAtNanos: Long) {
-  def key: AutotuneStageKey = AutotuneStageKey(executionId, stageId, stageAttemptId)
-
-  def isExpired(nowNanos: Long): Boolean = expiresAtNanos <= nowNanos
-}
-
-object StageRuntimeHint {
-  def empty(key: AutotuneStageKey): StageRuntimeHint = StageRuntimeHint(
-    executionId = key.executionId,
-    stageId = key.stageId,
-    stageAttemptId = key.stageAttemptId,
-    version = 0L,
-    scan = ScanRuntimeHint.empty,
-    gpu = GpuRuntimeHint.empty,
-    expiresAtNanos = Long.MaxValue)
-}
+// The serialized autotune wire types -- AutotuneStageKey, ScanRuntimeHint, GpuRuntimeHint,
+// StageRuntimeHint and the RapidsAutotuneHint*Msg messages -- live in the sql-plugin-api module
+// (see GraphAutotuneMessages) so they are packaged at the jar root / base classloader and Spark's
+// RpcEnv can deserialize them. Everything below uses them but is not itself sent over the wire.
 
 case class AutotuneCachedHint(hint: StageRuntimeHint, hasHint: Boolean) {
   def version: Long = hint.version
@@ -90,25 +46,6 @@ object AutotuneCachedHint {
   def empty(key: AutotuneStageKey): AutotuneCachedHint =
     AutotuneCachedHint(StageRuntimeHint.empty(key), hasHint = false)
 }
-
-case class RapidsAutotuneHintRequestMsg(
-    executorId: String,
-    key: AutotuneStageKey)
-
-case class RapidsAutotuneHintResponseMsg(
-    key: AutotuneStageKey,
-    hint: Option[StageRuntimeHint])
-
-case class RapidsAutotuneHintAppliedMsg(
-    executorId: String,
-    key: AutotuneStageKey,
-    taskAttemptId: Long,
-    partitionId: Int,
-    hintVersion: Long,
-    hasHint: Boolean,
-    scan: ScanRuntimeHint,
-    gpu: GpuRuntimeHint,
-    gpuAppliedMaxConcurrentTasks: Int)
 
 object RapidsAutotuneTaskHints {
   private val currentHint = new ThreadLocal[AutotuneCachedHint]()
