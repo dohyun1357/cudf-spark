@@ -57,6 +57,12 @@ object BucketJoinTwoSidesPrefetch extends Rule[SparkPlan] {
     sizedJoins.foreach(enablePrefetchRecursively(_))
   }
 
+  // "GPU prefetch consumer" = a GPU op downstream of a scan that makes eager scan prefetch
+  // worthwhile. This is the columnar-plan-rule view (live class matching); the driver-side,
+  // RDD-scope-name view of the same concept is AutotuneStageShape.GpuConsumerPrefixes. Keep the two
+  // in sync. Note GpuHashJoin is a trait, so this matches broadcast and (non-sized) shuffled hash
+  // joins; the scope-name view catches shuffled joins via its broad "GpuShuffled" prefix but may
+  // miss broadcast hash joins.
   private def isGpuPrefetchConsumer(plan: SparkPlan): Boolean = plan match {
     case _: GpuShuffledSizedHashJoinExec[_] | _: GpuHashJoin | _: GpuHashAggregateExec |
         _: GpuSortExec => true

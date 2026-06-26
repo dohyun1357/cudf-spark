@@ -126,6 +126,20 @@ case class GpuFileSourceScanExec(
   private lazy val selectedScanFileCount: Int =
     dynamicallySelectedPartitions.map(_.files.length).sum
 
+  // Eager scan prefetch / read-window decision logic.
+  //
+  // There are three independent triggers:
+  //   1. the manual `applyEagerPrefetch` flag set by BucketJoinTwoSidesPrefetch (optionally
+  //      requiring a minimum scan-file count, in AUTO mode);
+  //   2. the general `scan.prefetch.enabled = ALL` policy;
+  //   3. the executor-local autotune read window (LOCAL mode, Parquet only).
+  //
+  // `shouldPrefetchEagerly` is the RUNTIME-EFFECTIVE decision: it gates the Hadoop-conf flags the
+  // reader actually reads. `prefetchPolicyLabelsScanEager` is the LABEL view used only for the
+  // plan/eventlog `Eager_IO_Prefetch` metadata. They deliberately diverge in the non-default modes:
+  // a manual-prefetch or ALL-mode scan below `scanPrefetchMinScanFiles` is labeled eager but does
+  // not prefetch at runtime. This is intentional (the label reports "policy marked this scan"); do
+  // not collapse the label into the runtime gate, as that would change observable eventlog strings.
   private def shouldApplyGeneralPrefetch: Boolean =
     rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL &&
       selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles
@@ -142,14 +156,13 @@ case class GpuFileSourceScanExec(
       shouldApplyGeneralPrefetch ||
       shouldApplyLocalScanReadWindow
 
-  private def prefetchPolicyMarksScan: Boolean =
+  private def prefetchPolicyLabelsScanEager: Boolean =
     prefetchEagerly || rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL ||
       shouldApplyLocalScanReadWindow
 
-  private def localScanInitialReadWindow: Int = 1
+  private val localScanInitialReadWindow: Int = ScanReadWindowSettings.MIN_WINDOW
 
-  private def localScanMaxReadWindow: Int =
-    math.min(rapidsConf.autotuneScanMaxReadWindow, rapidsConf.scanPrefetchMaxParallelism)
+  private def localScanMaxReadWindow: Int = rapidsConf.autotuneScanReadWindowCap
 
   private def effectivePrefetchWindow: Option[Int] = {
     val configuredWindow = if (shouldApplyLocalScanReadWindow) {
@@ -329,7 +342,7 @@ case class GpuFileSourceScanExec(
         "PushedFilters" -> seqToString(pushedDownFilters),
         "DataFilters" -> seqToString(dataFilters),
         "Location" -> locationDesc,
-        "Eager_IO_Prefetch" -> prefetchPolicyMarksScan.toString,
+        "Eager_IO_Prefetch" -> prefetchPolicyLabelsScanEager.toString,
         "Eager_IO_Prefetch_Window" -> effectivePrefetchWindow.map(_.toString).getOrElse("default"),
         "Local_Scan_Read_Window" -> shouldApplyLocalScanReadWindow.toString,
         "Local_Scan_Read_Window_Max" ->

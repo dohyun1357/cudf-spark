@@ -566,9 +566,7 @@ class GpuDeltaParquetFileFormatBase2(
     override def buildBaseColumnarReaderForCoalescing(
         files: Array[PartitionedFile],
         conf: Configuration): PartitionReader[ColumnarBatch] = {
-      val readWindowSettings = currentGraphScanHint
-        .flatMap(scanReadWindowSettingsFromHint(_, files.length))
-        .getOrElse(ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, files.length))
+      val readWindowSettings = resolveReadWindowSettings(files, conf)
 
       val poolConf = poolConfBuilder.build()
       val clippedBlocks = ArrayBuffer[ParquetSingleDataBlockMeta]()

@@ -1181,8 +1181,7 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
   protected val compressCfg = CpuCompressionConfig.forParquet(rapidsConf)
   protected val graphScanHintsEnabled =
     rapidsConf.autotuneGraphEnabled && rapidsConf.autotuneGraphMode == AutotuneGraphMode.GRAPH
-  protected val graphScanMaxReadWindow = rapidsConf.autotuneScanMaxReadWindow
-  protected val graphScanPrefetchMaxParallelism = rapidsConf.scanPrefetchMaxParallelism
+  protected val graphScanReadWindowCap = rapidsConf.autotuneScanReadWindowCap
 
   protected def currentGraphScanHint: Option[ScanRuntimeHint] = {
     if (graphScanHintsEnabled) {
@@ -1195,12 +1194,21 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
   protected def scanReadWindowSettingsFromHint(
       hint: ScanRuntimeHint,
       inputFileCount: Int): Option[ScanReadWindowSettings] = {
-    val maxReadWindowCap = Seq(
-      maxNumFileProcessed,
-      graphScanMaxReadWindow,
-      graphScanPrefetchMaxParallelism).min
+    val maxReadWindowCap = math.min(maxNumFileProcessed, graphScanReadWindowCap)
     ScanReadWindowSettings.fromHint(hint, maxReadWindowCap, inputFileCount)
   }
+
+  /**
+   * Resolve the read-window settings for a coalescing reader: a graph scan hint if one applies to
+   * this task, otherwise the Hadoop-conf-derived settings (which collapse to the existing static
+   * fanout when autotune is off). Shared by the Parquet and Delta coalescing reader factories.
+   */
+  protected def resolveReadWindowSettings(
+      files: Array[PartitionedFile],
+      conf: Configuration): ScanReadWindowSettings =
+    currentGraphScanHint
+      .flatMap(scanReadWindowSettingsFromHint(_, files.length))
+      .getOrElse(ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, files.length))
 
   // We can't use the coalescing files reader when InputFileName, InputFileBlockStart,
   // or InputFileBlockLength because we are combining all the files into a single buffer
@@ -1378,9 +1386,7 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
   override def buildBaseColumnarReaderForCoalescing(
       files: Array[PartitionedFile],
       conf: Configuration): PartitionReader[ColumnarBatch] = {
-    val readWindowSettings = currentGraphScanHint
-      .flatMap(scanReadWindowSettingsFromHint(_, files.length))
-      .getOrElse(ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed, files.length))
+    val readWindowSettings = resolveReadWindowSettings(files, conf)
 
     val poolConf = poolConfBuilder.build()
     val clippedBlocks = ArrayBuffer[ParquetSingleDataBlockMeta]()
