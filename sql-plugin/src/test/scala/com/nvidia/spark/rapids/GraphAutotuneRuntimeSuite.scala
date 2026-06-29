@@ -919,9 +919,9 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
       RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",
       RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "1",
-      RapidsConf.AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS.key -> "1")) // 1ms = 1_000_000ns debounce
+      RapidsConf.AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS.key -> "1")) // 1ms = 1000000ns debounce
     RapidsAutotuneDriverEndpoint.init(null, conf)
-    var clock = 10_000_000L
+    var clock = 10000000L
     RapidsAutotuneDriverEndpoint.setNanoSourceForTest(() => clock)
     try {
       val listener = new RapidsAutotuneStageHintListener(conf)
@@ -935,10 +935,10 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
 
       pressure()                       // first eval -> reduce 4 -> 2, v2
       assert(served.version == 2L && served.gpu.maxConcurrentTasks == 2)
-      clock += 500_000L                // 0.5ms < 1ms -> debounced
+      clock += 500000L                // 0.5ms < 1ms -> debounced
       pressure()
       assert(served.version == 2L && served.gpu.maxConcurrentTasks == 2)
-      clock += 600_000L                // total 1.1ms since last eval -> allowed
+      clock += 600000L                // total 1.1ms since last eval -> allowed
       pressure()
       assert(served.version == 3L && served.gpu.maxConcurrentTasks == 1)
     } finally {
@@ -954,7 +954,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "1",
       RapidsConf.AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS.key -> "1")) // interval 1ms, cooldown 2ms
     RapidsAutotuneDriverEndpoint.init(null, conf)
-    var clock = 10_000_000L
+    var clock = 10000000L
     RapidsAutotuneDriverEndpoint.setNanoSourceForTest(() => clock)
     try {
       val listener = new RapidsAutotuneStageHintListener(conf)
@@ -968,14 +968,14 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
 
       obs(500L, 50L)        // reduce 4 -> 2 (decrease at t0)
       assert(served.gpu.maxConcurrentTasks == 2)
-      clock += 1_000_000L   // past debounce, still within 2ms cooldown
+      clock += 1000000L   // past debounce, still within 2ms cooldown
       obs(500L, 50L)        // a DECREASE is still allowed during cooldown -> 2 -> 1
       assert(served.gpu.maxConcurrentTasks == 1)
-      clock += 1_000_000L   // past debounce; cooldown measured from the t1 decrease -> still inside
+      clock += 1000000L   // past debounce; cooldown measured from the t1 decrease -> still inside
       obs(1L, 100L)         // relaxed -> would restore, but suppressed by cooldown
       assert(served.gpu.maxConcurrentTasks == 1)
       val held = served.version
-      clock += 1_500_000L   // now well past the cooldown from the last decrease
+      clock += 1500000L   // now well past the cooldown from the last decrease
       obs(1L, 100L)         // relaxed -> restore allowed 1 -> 2
       assert(served.gpu.maxConcurrentTasks == 2 && served.version > held)
     } finally {
