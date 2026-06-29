@@ -1947,6 +1947,20 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
         "The autotune optimize GPU max concurrent tasks value must be non-negative.")
       .createWithDefault(0)
 
+  val AUTOTUNE_OPTIMIZE_SCAN_MAX_READ_WINDOW =
+    conf("spark.rapids.sql.autotune.optimize.scan.maxReadWindow")
+      .doc("OPTIMIZE-mode ceiling the scan read-window controller may grow to, ABOVE the static " +
+        s"'${AUTOTUNE_SCAN_MAX_READ_WINDOW.key}' / scan.prefetch.maxParallelism cap. Used only " +
+        "in OPTIMIZE mode and only when positive. The window is additionally bounded by the " +
+        "per-task input file count -- it cannot exceed what the stock (non-autotune) multi-file " +
+        "reader already reads concurrently -- and the executor controller backs it off on host " +
+        s"pressure ('${AUTOTUNE_SCAN_MAX_READY_BYTES.key}', which should be set to a host budget " +
+        "when raising the window). 0 (default) means no above-static scan window.")
+      .integerConf
+      .checkValue(v => v >= 0,
+        "The autotune optimize scan max read window must be non-negative.")
+      .createWithDefault(0)
+
   val AUTOTUNE_FAIL_OPEN =
     conf("spark.rapids.sql.autotune.failOpen")
       .doc("When true, autotune controller failures fall back to existing RAPIDS behavior.")
@@ -4019,6 +4033,23 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
    */
   lazy val autotuneScanReadWindowCap: Int =
     math.min(autotuneScanMaxReadWindow, scanPrefetchMaxParallelism)
+
+  lazy val autotuneOptimizeScanReadWindowCap: Int =
+    get(AUTOTUNE_OPTIMIZE_SCAN_MAX_READ_WINDOW)
+
+  /**
+   * Effective scan read-window ceiling. GRAPH/other modes bound it at the static autotune cap;
+   * OPTIMIZE raises it to the (higher) OPTIMIZE ceiling when that is configured, letting the window
+   * grow above static. The per-task reader still bounds the actual window by the format's
+   * multiThreadedRead.maxNumFilesParallel and the input file count, so it never exceeds what the
+   * stock multi-file reader would read concurrently.
+   */
+  lazy val autotuneEffectiveScanReadWindowCap: Int =
+    if (isAutotuneOptimizeMode && autotuneOptimizeScanReadWindowCap > 0) {
+      math.max(autotuneScanReadWindowCap, autotuneOptimizeScanReadWindowCap)
+    } else {
+      autotuneScanReadWindowCap
+    }
 
   lazy val autotuneScanMaxReadyBytes: Long = get(AUTOTUNE_SCAN_MAX_READY_BYTES)
 

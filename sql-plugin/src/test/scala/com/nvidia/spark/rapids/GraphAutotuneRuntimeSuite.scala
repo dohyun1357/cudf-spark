@@ -1107,4 +1107,46 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Slice 3b: OPTIMIZE mode -- above-static scan read window
+  // ---------------------------------------------------------------------------
+
+  test("OPTIMIZE raises the effective scan read-window cap above static; others keep it static") {
+    def conf(mode: String, optScan: String) = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> mode,
+      RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
+      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "8",
+      RapidsConf.AUTOTUNE_OPTIMIZE_SCAN_MAX_READ_WINDOW.key -> optScan))
+    // static cap = min(8, 8) = 8
+    assert(conf(AutotuneGraphMode.GRAPH.toString, "32").autotuneEffectiveScanReadWindowCap == 8)
+    assert(conf(AutotuneGraphMode.OPTIMIZE.toString, "0").autotuneEffectiveScanReadWindowCap == 8)
+    assert(conf(AutotuneGraphMode.OPTIMIZE.toString, "32").autotuneEffectiveScanReadWindowCap == 32)
+  }
+
+  test("OPTIMIZE: GraphScanHintPolicy publishes the raised scan envelope") {
+    val conf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
+      RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
+      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "8",
+      RapidsConf.AUTOTUNE_OPTIMIZE_SCAN_MAX_READ_WINDOW.key -> "32",
+      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "2048"))
+    val candidate =
+      AutotuneStageShape(hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50)
+    val hint = GraphScanHintPolicy.fromConf(conf).scanHintFor(candidate)
+    assert(hint.eagerPrefetch && hint.maxReadWindow == 32 && hint.maxReadyBytes == 2048L)
+  }
+
+  test("scan read-window envelope can exceed the static cap, bounded by files-per-task") {
+    val hint = ScanRuntimeHint(
+      eagerPrefetch = true, minReadWindow = 1, maxReadWindow = 32, maxReadyBytes = 2048L)
+    // executor cap 32 (OPTIMIZE-raised), 50 files -> maxWindow 32 (above the static cap of 8)
+    val s = ScanReadWindowSettings.fromHint(hint, maxReadWindowCap = 32, inputFileCount = 50).get
+    assert(s.enabled && s.maxWindow == 32 && s.initialWindow == 1)
+    // bounded by files-per-task: 10 files -> maxWindow 10 (cannot exceed what the reader reads)
+    val sFew = ScanReadWindowSettings.fromHint(hint, maxReadWindowCap = 32, inputFileCount = 10).get
+    assert(sFew.maxWindow == 10)
+  }
 }

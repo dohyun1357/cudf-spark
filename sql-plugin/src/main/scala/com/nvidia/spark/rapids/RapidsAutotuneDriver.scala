@@ -86,7 +86,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       conf.autotuneGpuMaxConcurrentTasks
     }
     caps = AutotuneModelCaps(
-      scanMaxReadWindow = conf.autotuneScanReadWindowCap,
+      scanMaxReadWindow = conf.autotuneEffectiveScanReadWindowCap,
       scanMaxReadyBytes = conf.autotuneScanMaxReadyBytes,
       gpuMaxConcurrentTasks = gpuCeiling,
       minSampleTasks = conf.autotuneGraphMinSampleTasks.toLong,
@@ -429,8 +429,9 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
 
 /**
  * Driver policy that emits a bounded scan-prefetch hint for stages classified as scan-prefetch
- * candidates, in the closed-loop modes (GRAPH or OPTIMIZE). The hinted window never exceeds the
- * static read-window cap (above-static scan is a later slice).
+ * candidates, in the closed-loop modes (GRAPH or OPTIMIZE). GRAPH bounds the window at the static
+ * read-window cap; OPTIMIZE raises it to the effective (above-static) cap. The executor still
+ * bounds the actual window by the per-task file count, so it never exceeds stock reader concurrency.
  */
 case class GraphScanHintPolicy(
     enabled: Boolean,
@@ -453,7 +454,8 @@ object GraphScanHintPolicy {
   def fromConf(conf: RapidsConf): GraphScanHintPolicy = {
     GraphScanHintPolicy(
       enabled = conf.isAutotuneClosedLoopMode,
-      maxReadWindow = conf.autotuneScanReadWindowCap,
+      // OPTIMIZE raises this above the static cap; the executor still bounds it by files-per-task.
+      maxReadWindow = conf.autotuneEffectiveScanReadWindowCap,
       maxReadyBytes = conf.autotuneScanMaxReadyBytes)
   }
 }
