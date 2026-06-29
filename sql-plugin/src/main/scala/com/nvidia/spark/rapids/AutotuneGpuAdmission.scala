@@ -20,27 +20,34 @@ import scala.collection.mutable
 
 private case class ActiveGpuAdmissionHint(
     var maxConcurrentTasks: Int,
+    var hintVersion: Long,
     activeTasks: mutable.Set[Long])
 
 /**
  * Executor-local GPU admission controller driven by graph autotune hints.
  *
- * It tracks, per active stage key, the tightest GPU-concurrency cap requested by tasks of that
- * stage and pushes the executor-wide effective cap (the minimum across active stages) into the
- * `GpuSemaphore` via `applyLimit`. The runtime cap can only ever *tighten* the static
- * `spark.rapids.sql.concurrentGpuTasks` limit; the semaphore remains the memory-safety layer.
+ * It tracks, per active stage key, the GPU-concurrency cap requested for that stage and pushes the
+ * executor-wide effective cap (the minimum across active stages) into the `GpuSemaphore` via
+ * `applyLimit`. The semaphore's memory-permit pool remains the hard safety layer in every mode.
  *
- * Conservatism by design: a key's cap only ratchets down for the life of its active window (until
- * its in-flight tasks drain). A newer hint that *raises* the cap is ignored while tasks admitted
- * under the stricter cap are still running, so admission never loosens out from under them.
+ * Per-key cap policy depends on the mode (`optimizeRaise`):
+ *  - GRAPH / default (`optimizeRaise = false`): the cap only ratchets DOWN for the life of a key's
+ *    active window. A newer hint that *raises* the cap is ignored while tasks admitted under the
+ *    stricter cap are still running, so admission never loosens out from under them (tighten-only).
+ *  - OPTIMIZE (`optimizeRaise = true`): the cap tracks the highest-VERSION hint seen for the key,
+ *    so it follows the model's latest decision UP as well as down. Raising out from under active
+ *    tasks is safe here: the permit pool still gates every admission (see PrioritySemaphore), so
+ *    above-static concurrency cannot OOM. Versioning (not arrival order) decides which hint wins,
+ *    so out-of-order task starts cannot regress the cap to a stale value.
  *
  * Active membership is tracked by `taskAttemptId`, not a bare counter, so a completion only ever
- * releases a task that actually registered. This matters once hints can change mid-stage (the
- * Slice-2 fetch TTL): a task that started under no hint (cap 0, never registered) must NOT release
- * an entry created by a sibling task that started under a positive cap, or the runtime cap could
- * loosen out from under a still-running capped task.
+ * releases a task that actually registered. This matters once hints change mid-stage (the Slice-2
+ * fetch TTL): a task that started under no hint (cap 0, never registered) must NOT release an entry
+ * created by a sibling task that started under a positive cap.
  */
-private[rapids] class RapidsAutotuneGpuAdmissionController(applyLimit: Int => Int) {
+private[rapids] class RapidsAutotuneGpuAdmissionController(
+    applyLimit: Int => Int,
+    optimizeRaise: () => Boolean = () => false) {
   private val activeHints = mutable.HashMap.empty[AutotuneStageKey, ActiveGpuAdmissionHint]
 
   def taskStarted(
@@ -50,14 +57,23 @@ private[rapids] class RapidsAutotuneGpuAdmissionController(applyLimit: Int => In
     val maxConcurrentTasks =
       if (cachedHint.hasHint) math.max(0, cachedHint.hint.gpu.maxConcurrentTasks) else 0
     if (maxConcurrentTasks > 0) {
+      val version = cachedHint.version
       activeHints.get(key) match {
         case Some(active) =>
-          // Ratchet to the tightest cap seen during this key's active window (see class doc).
-          active.maxConcurrentTasks = math.min(active.maxConcurrentTasks, maxConcurrentTasks)
+          if (optimizeRaise()) {
+            // Track the latest model decision (by hint version) -- may raise or lower the cap.
+            if (version >= active.hintVersion) {
+              active.maxConcurrentTasks = maxConcurrentTasks
+              active.hintVersion = version
+            }
+          } else {
+            // Ratchet to the tightest cap seen during this key's active window (see class doc).
+            active.maxConcurrentTasks = math.min(active.maxConcurrentTasks, maxConcurrentTasks)
+          }
           active.activeTasks += taskAttemptId
         case None =>
           activeHints.put(key,
-            ActiveGpuAdmissionHint(maxConcurrentTasks, mutable.Set(taskAttemptId)))
+            ActiveGpuAdmissionHint(maxConcurrentTasks, version, mutable.Set(taskAttemptId)))
       }
       applyCurrentLimit()
     } else {
@@ -107,7 +123,8 @@ object RapidsAutotuneGpuAdmission {
   @volatile private var allowAboveStatic: Boolean = false
 
   private val controller = new RapidsAutotuneGpuAdmissionController(
-    limit => GpuSemaphore.setRuntimeMaxConcurrentGpuTasksLimit(limit, allowAboveStatic))
+    limit => GpuSemaphore.setRuntimeMaxConcurrentGpuTasksLimit(limit, allowAboveStatic),
+    () => allowAboveStatic)
 
   /** Set whether the runtime cap may exceed the static cap (true only in OPTIMIZE mode). */
   def setAllowAboveStatic(allow: Boolean): Unit = {

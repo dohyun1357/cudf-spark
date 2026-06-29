@@ -506,6 +506,28 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(appliedLimits == Seq(3, 0))
   }
 
+  test("OPTIMIZE admission: per-key cap tracks the highest-version hint (raises and lowers)") {
+    val controller = new RapidsAutotuneGpuAdmissionController(
+      applyLimit = limit => limit, optimizeRaise = () => true)
+    def hint(ver: Long, cap: Int) = AutotuneCachedHint(
+      StageRuntimeHint.empty(key).copy(version = ver, gpu = GpuRuntimeHint(cap)), hasHint = true)
+
+    assert(controller.taskStarted(key, 1L, hint(1L, 2)) == 2) // start at cap 2
+    assert(controller.taskStarted(key, 2L, hint(2L, 5)) == 5) // newer version RAISES above static 2
+    assert(controller.taskStarted(key, 3L, hint(1L, 3)) == 5) // stale (older) version ignored
+    assert(controller.taskStarted(key, 4L, hint(3L, 3)) == 3) // newer lower cap backs off
+  }
+
+  test("non-OPTIMIZE admission keeps ratchet-down (a higher cap does not raise an active key)") {
+    val controller = new RapidsAutotuneGpuAdmissionController(applyLimit = limit => limit)
+    def hint(ver: Long, cap: Int) = AutotuneCachedHint(
+      StageRuntimeHint.empty(key).copy(version = ver, gpu = GpuRuntimeHint(cap)), hasHint = true)
+
+    assert(controller.taskStarted(key, 1L, hint(1L, 4)) == 4)
+    assert(controller.taskStarted(key, 2L, hint(2L, 6)) == 4) // higher cap ignored (ratchet-down)
+    assert(controller.taskStarted(key, 3L, hint(3L, 2)) == 2) // lower cap still tightens
+  }
+
   test("hint cache put overrides fetch and refreshes once the pushed hint expires") {
     var fetches = 0
     val cache = new AutotuneHintCache(stageKey => {
