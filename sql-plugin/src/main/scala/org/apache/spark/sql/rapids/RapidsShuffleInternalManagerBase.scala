@@ -1150,6 +1150,11 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
     sqlMetrics.get(METRIC_THREADED_READER_LIMITER_ACQUIRE_FAIL_COUNT)
   private val limiterPendingBlockCount =
     sqlMetrics.get(METRIC_THREADED_READER_LIMITER_PENDING_BLOCK_COUNT)
+  // Capture on the task thread. Background deserializers do not carry Spark's TaskContext, so a
+  // later GpuTaskMetrics.get there would return a throwaway instance.
+  private val autotuneTaskMetrics = GpuTaskMetrics.get
+  private val optimizerPrefetchWindow = ShuffleReadHints.effectivePrefetchWindow(
+    RapidsAutotuneTaskHints.currentShuffleHint)
 
   private var shuffleReadRange: NvtxId = NvtxRegistry.THREADED_READER_READ.push()
 
@@ -1199,6 +1204,17 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
     private val futures = new mutable.Queue[Future[Option[BlockState]]]()
     private val serializerInstance = serializer.newInstance()
     private val limiter = new BytesInFlightLimiter(maxBytesInFlight)
+
+    private def tryAcquire(bytes: Long): Boolean = {
+      limiterAcquireCount.foreach(_ += 1)
+      val didFit = limiter.acquire(bytes)
+      autotuneTaskMetrics.recordShuffleReadLimiterAcquire(didFit)
+      if (!didFit) {
+        limiterAcquireFailCount.foreach(_ += 1)
+      }
+      didFit
+    }
+
     private val fallbackIter: Iterator[(Any, Any)] with AutoCloseable =
       if (numReaderThreads == 1) {
         // this is the non-optimized case, where we add metrics to capture the blocked
@@ -1442,13 +1458,10 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
             queued.offer(batch)
             // peek at the next batch
             currentBatchSize = blockState.getNextBatchSize
-            limiterAcquireCount.foreach(_ += 1)
-            didFit = limiter.acquire(currentBatchSize)
+            didFit = tryAcquire(currentBatchSize)
             if (didFit) {
               // Successfully acquired, add to sizeToRelease for later release
               sizeToRelease += currentBatchSize
-            } else {
-              limiterAcquireFailCount.foreach(_ += 1)
             }
           }
           success = true
@@ -1479,13 +1492,11 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
           val blockState = pendingIts.head
           // check if we can handle the head batch now
           val nextBatchSize = blockState.getNextBatchSize
-          limiterAcquireCount.foreach(_ += 1)
-          if (limiter.acquire(nextBatchSize)) {
+          if (tryAcquire(nextBatchSize)) {
             // kick off deserialization task
             pendingIts.dequeue()
             deserializeTask(blockState, nextBatchSize)
           } else {
-            limiterAcquireFailCount.foreach(_ += 1)
             continue = false
           }
         }
@@ -1498,7 +1509,9 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
             // we are trying to get a batch and we haven't received any results
             // yet, we need to block on the fetch for this case so we have
             // something to return.
-            var amountToDrain = Math.max(fetcherIterator.resultCount, 1)
+            val queuedWork = futures.size.toLong + pendingIts.size.toLong + queued.size().toLong
+            var amountToDrain = ShuffleReadHints.blocksToDrain(
+              optimizerPrefetchWindow, queuedWork, fetcherIterator.resultCount)
             val fetchTimeStart = System.nanoTime()
 
             // We drain fetched results. That is, we push decode tasks
@@ -1521,15 +1534,13 @@ abstract class RapidsShuffleThreadedReaderBase[K, C](
               val blockState = BlockState(blockId, batchIter, inputStream)
               // get the next known batch size (there could be multiple batches)
               val nextBatchSize = blockState.getNextBatchSize
-              limiterAcquireCount.foreach(_ += 1)
-              if (limiter.acquire(nextBatchSize)) {
+              if (tryAcquire(nextBatchSize)) {
                 // we can fit at least the first batch in this block
                 // kick off a deserialization task
                 deserializeTask(blockState, nextBatchSize)
               } else {
                 // first batch didn't fit, put iterator aside and stop asking for results
                 // from the fetcher
-                limiterAcquireFailCount.foreach(_ += 1)
                 limiterPendingBlockCount.foreach(_ += 1)
                 pendingIts.enqueue(blockState)
                 didFit = false
@@ -2044,12 +2055,15 @@ class RapidsShuffleInternalManagerBase(conf: SparkConf, val isDriver: Boolean)
             RapidsShuffleInternalManagerBase.startThreadPoolIfNeeded(
               rapidsConf.shuffleMultiThreadedWriterThreads,
               rapidsConf.shuffleMultiThreadedReaderThreads)
-            // Graph-autotune shuffle-read actuator: a per-task hint may only tighten the static
-            // maxBytesInFlight cap (default-off, fail-open; see ShuffleReadHints).
+            // Graph-autotune shuffle-read actuator: GRAPH may only tighten the static cap;
+            // OPTIMIZE may raise it to its explicit per-task host-memory ceiling. Default-off and
+            // fail-open; see ShuffleReadHints.
             val effectiveMaxBytesInFlight = ShuffleReadHints.effectiveMaxBytesInFlight(
               rapidsConf.shuffleMultiThreadedMaxBytesInFlight,
               RapidsAutotuneTaskHints.currentShuffleHint,
-              rapidsConf.isAutotuneGraphShuffleEnabled)
+              rapidsConf.isAutotuneGraphShuffleEnabled,
+              allowAboveStatic = rapidsConf.isAutotuneOptimizeMode,
+              optimizeMaxBytesInFlight = rapidsConf.autotuneEffectiveShuffleMaxBytesInFlight)
             new RapidsShuffleThreadedReader(
               startMapIndex,
               endMapIndex,

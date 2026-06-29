@@ -35,8 +35,8 @@ import org.apache.spark.internal.Logging
  *   - [[ScanReadWindowSettings]]: the resolved, bounded read-window envelope a reader runs under,
  *     built either from Hadoop conf ([[ScanReadWindowSettings.fromConf]], LOCAL mode) or from a
  *     driver [[ScanRuntimeHint]] ([[ScanReadWindowSettings.fromHint]], GRAPH mode).
- *   - [[ScanReadWindowController]]: the per-reader AIMD controller that grows/shrinks the window
- *     inside that envelope and records decision metrics.
+ *   - [[ScanReadWindowController]]: the per-reader actuator. LOCAL mode retains its AIMD behavior;
+ *     GRAPH/OPTIMIZE tasks apply the optimizer's selected window directly and only record metrics.
  *
  * The whole feature is default-off: when disabled the settings collapse to the pre-existing static
  * fanout and the controller is inert, so reader behavior is unchanged.
@@ -72,7 +72,8 @@ case class ScanReadWindowSettings(
     enabled: Boolean,
     initialWindow: Int,
     maxWindow: Int,
-    maxReadyBytes: Long)
+    maxReadyBytes: Long,
+    adaptive: Boolean = true)
 
 object ScanReadWindowSettings {
   val ENABLED_KEY = "rapids.sql.autotune.scan.readWindow.enabled"
@@ -135,27 +136,26 @@ object ScanReadWindowSettings {
       None
     } else {
       val maxWindow = Seq(maxReadWindowCap, inputFileCount, hint.maxReadWindow).min
-      val configuredInitial =
-        positiveOrElse(hint.minReadWindow, MIN_WINDOW)
-      val initialWindow =
-        math.min(math.max(configuredInitial, MIN_WINDOW), maxWindow)
       val maxReadyBytes =
         positiveLongOrElse(hint.maxReadyBytes, Long.MaxValue)
       Some(ScanReadWindowSettings(
         enabled = true,
-        initialWindow = initialWindow,
+        // In graph modes maxReadWindow is the optimizer-selected target, not an envelope for a
+        // second executor-local tuner. Apply it immediately for this task.
+        initialWindow = maxWindow,
         maxWindow = maxWindow,
-        maxReadyBytes = maxReadyBytes))
+        maxReadyBytes = maxReadyBytes,
+        adaptive = false))
     }
   }
 }
 
 /**
- * Per-reader AIMD controller for the scan read window.
+ * Per-reader actuator for the scan read window.
  *
- * The reader feeds it consumer-side signals ([[observeReadWait]]) and queue depths
- * ([[observeReadQueue]]); the controller grows the window by 1 on read/GPU-idle wait and halves it
- * on host-memory or scheduling pressure, staying within `[MIN_WINDOW, settings.maxWindow]`.
+ * LOCAL mode feeds it consumer-side signals ([[observeReadWait]]) and uses its historical AIMD
+ * behavior. GRAPH/OPTIMIZE settings have `adaptive=false`: the driver optimizer owns tuning, and
+ * this class applies the selected fixed target while continuing to record queue-depth evidence.
  *
  * Threading: a controller instance is owned by one reader and only touched from that reader's
  * task thread (the async read runners never call back in), so its mutable `var`s need no locking.
@@ -231,7 +231,7 @@ class ScanReadWindowController(
       bufferGpuIdleNs: Long,
       scheduleWaitNs: Long,
       hostBytesAllocated: Long): Unit = {
-    if (!settings.enabled || settings.maxWindow <= 0) {
+    if (!settings.enabled || !settings.adaptive || settings.maxWindow <= 0) {
       return
     }
 

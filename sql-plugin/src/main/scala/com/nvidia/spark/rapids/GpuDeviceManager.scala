@@ -104,10 +104,12 @@ object GpuDeviceManager extends Logging {
   @volatile private var poolSizeLimit = 0L
 
   // Never split below 100 MiB (but this is really just for testing)
+  val MIN_SPLIT_UNTIL_SIZE: Long = 100L * 1024L * 1024L
+
   def getSplitUntilSize: Long = {
     val conf = new RapidsConf(SQLConf.get)
     conf.splitUntilSizeOverride
-        .getOrElse(Math.max(poolSizeLimit / 8, 100 * 1024 * 1024))
+        .getOrElse(Math.max(poolSizeLimit / 8, MIN_SPLIT_UNTIL_SIZE))
   }
 
   // Attempt to set and acquire the gpu, return true if acquired, false otherwise
