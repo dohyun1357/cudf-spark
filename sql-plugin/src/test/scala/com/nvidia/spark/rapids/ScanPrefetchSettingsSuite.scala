@@ -125,9 +125,10 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
 
     assert(settings.contains(ScanReadWindowSettings(
       enabled = true,
-      initialWindow = 2,
+      initialWindow = 3,
       maxWindow = 3,
-      maxReadyBytes = 1024L)))
+      maxReadyBytes = 1024L,
+      adaptive = false)))
 
     assert(ScanReadWindowSettings.fromHint(
       hint.copy(maxReadWindow = 0), maxReadWindowCap = 4, inputFileCount = 3).isEmpty)
@@ -150,6 +151,27 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
     assert(controller.currentReadWindow == 3)
     controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
     assert(controller.currentReadWindow == 3)
+  }
+
+  test("graph scan hints apply a fixed optimizer-selected target") {
+    val settings = ScanReadWindowSettings.fromHint(
+      ScanRuntimeHint(true, minReadWindow = 1, maxReadWindow = 8, maxReadyBytes = 1024L),
+      maxReadWindowCap = 8,
+      inputFileCount = 6).get
+    val controller = new ScanReadWindowController(settings)
+    assert(controller.currentReadWindow == 6)
+    controller.observeReadWait(
+      bufferWaitNs = TimeUnit.MILLISECONDS.toNanos(10),
+      bufferGpuIdleNs = 10L,
+      scheduleWaitNs = 0L,
+      hostBytesAllocated = 0L)
+    assert(controller.currentReadWindow == 6)
+    controller.observeReadWait(
+      bufferWaitNs = 0L,
+      bufferGpuIdleNs = 0L,
+      scheduleWaitNs = 10L,
+      hostBytesAllocated = Long.MaxValue)
+    assert(controller.currentReadWindow == 6)
   }
 
   test("scan read window controller decreases on memory or schedule pressure") {

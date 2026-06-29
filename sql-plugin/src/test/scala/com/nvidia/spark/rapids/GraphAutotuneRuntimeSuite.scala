@@ -27,6 +27,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.apache.spark.SparkConf
 import org.apache.spark.api.plugin.PluginContext
 import org.apache.spark.resource.ResourceInformation
+import org.apache.spark.sql.rapids.GpuTaskMetrics
 
 class GraphAutotuneRuntimeSuite extends AnyFunSuite {
   private val key = AutotuneStageKey(executionId = 11L, stageId = 3, stageAttemptId = 1)
@@ -210,6 +211,42 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       staticCap)
   }
 
+  test("shuffle read actuator raises only in OPTIMIZE and clamps to the host ceiling") {
+    val staticCap = 128L
+    val optimizeCeiling = 512L
+    def hint(b: Long): Option[ShuffleRuntimeHint] =
+      Some(ShuffleRuntimeHint(prefetchWindow = 0, maxReadyBytes = b, coalesceTargetBytes = 0L))
+
+    // GRAPH semantics remain tighten-only even when an above-static ceiling is supplied.
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(
+      staticCap, hint(256L), enabled = true, allowAboveStatic = false,
+      optimizeMaxBytesInFlight = optimizeCeiling) == staticCap)
+    // OPTIMIZE accepts an above-static hint but never exceeds the separate hard ceiling.
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(
+      staticCap, hint(256L), enabled = true, allowAboveStatic = true,
+      optimizeMaxBytesInFlight = optimizeCeiling) == 256L)
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(
+      staticCap, hint(1024L), enabled = true, allowAboveStatic = true,
+      optimizeMaxBytesInFlight = optimizeCeiling) == optimizeCeiling)
+    // No configured increase and the empty sentinel both preserve the static cap.
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(
+      staticCap, hint(256L), enabled = true, allowAboveStatic = true,
+      optimizeMaxBytesInFlight = 0L) == staticCap)
+    assert(ShuffleReadHints.effectiveMaxBytesInFlight(
+      staticCap, Some(ShuffleRuntimeHint.empty), enabled = true, allowAboveStatic = true,
+      optimizeMaxBytesInFlight = optimizeCeiling) == staticCap)
+  }
+
+  test("shuffle prefetch actuator enforces the optimizer-selected outstanding-work window") {
+    val hint = Some(ShuffleRuntimeHint(
+      prefetchWindow = 4, maxReadyBytes = 128L, coalesceTargetBytes = 0L))
+    assert(ShuffleReadHints.effectivePrefetchWindow(hint) == 4)
+    assert(ShuffleReadHints.effectivePrefetchWindow(None) == Integer.MAX_VALUE)
+    assert(ShuffleReadHints.blocksToDrain(4, outstandingBlocks = 1L, readyBlocks = 10) == 3)
+    // Always permit one blocking fetch so a tight/stale window cannot deadlock the reader.
+    assert(ShuffleReadHints.blocksToDrain(4, outstandingBlocks = 4L, readyBlocks = 10) == 1)
+  }
+
   test("stage shape detects gpu scan prefetch candidates from RDD scopes") {
     val candidate = AutotuneStageShape.fromRddScopeNames(
       Seq("GpuScan parquet ", "GpuFilter", "GpuHashAggregate", "GpuColumnarExchange"),
@@ -243,110 +280,37 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(noTasks.hasShuffle && !noTasks.isShuffleStage && !noTasks.hasGpuWork)
   }
 
-  test("graph scan hint policy emits bounded scan hints only in graph mode") {
-    val graphConf = new RapidsConf(Map(
+  test("one graph optimizer owns the complete initial joint hint") {
+    val conf = new RapidsConf(Map(
       RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
       RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
-      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "4",
-      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "1024"))
-    val localConf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.LOCAL.toString,
-      RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
-      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "4",
-      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "1024"))
-    val candidate =
-      AutotuneStageShape(hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50)
-
-    val graphHint = GraphScanHintPolicy.fromConf(graphConf).scanHintFor(candidate)
-    assert(graphHint.eagerPrefetch)
-    assert(graphHint.minReadWindow == 1)
-    assert(graphHint.maxReadWindow == 4)
-    assert(graphHint.maxReadyBytes == 1024L)
-    assert(GraphScanHintPolicy.fromConf(localConf).scanHintFor(candidate) == ScanRuntimeHint.empty)
-  }
-
-  test("graph GPU hint policy emits positive caps only in graph mode") {
-    val graphConf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
-      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4"))
-    val localConf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.LOCAL.toString,
-      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4"))
-    val defaultConf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString))
-    val stageShape =
-      AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
-
-    assert(GraphGpuHintPolicy.fromConf(graphConf).gpuHintFor(stageShape) ==
-      GpuRuntimeHint(maxConcurrentTasks = 4))
-    assert(GraphGpuHintPolicy.fromConf(localConf).gpuHintFor(stageShape) == GpuRuntimeHint.empty)
-    assert(GraphGpuHintPolicy.fromConf(defaultConf).gpuHintFor(stageShape) == GpuRuntimeHint.empty)
-    assert(GraphGpuHintPolicy.fromConf(graphConf).gpuHintFor(stageShape.copy(numTasks = 0)) ==
-      GpuRuntimeHint.empty)
-  }
-
-  test("graph shuffle hint policy emits bounded shuffle hints only when enabled in graph mode") {
-    val graphConf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "8",
+      RapidsConf.AUTOTUNE_OPTIMIZE_SCAN_MAX_READ_WINDOW.key -> "32",
+      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "1024",
+      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",
+      RapidsConf.AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS.key -> "8",
       RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true",
+      RapidsConf.SHUFFLE_MULTITHREADED_MAX_BYTES_IN_FLIGHT.key -> "2048",
+      RapidsConf.AUTOTUNE_OPTIMIZE_SHUFFLE_MAX_BYTES_IN_FLIGHT.key -> "8192",
       RapidsConf.AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW.key -> "6",
-      RapidsConf.AUTOTUNE_SHUFFLE_MAX_READY_BYTES.key -> "2048",
-      RapidsConf.AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES.key -> "1024"))
-    val disabledConf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
-      RapidsConf.AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW.key -> "6"))
-    val localConf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.LOCAL.toString,
-      RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true"))
-    val shuffleStage = AutotuneStageShape(
-      hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50, hasShuffle = true)
-    val nonShuffleStage =
-      AutotuneStageShape(hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50)
-
-    assert(GraphShuffleHintPolicy.fromConf(graphConf).shuffleHintFor(shuffleStage) ==
-      ShuffleRuntimeHint(prefetchWindow = 6, maxReadyBytes = 2048L, coalesceTargetBytes = 1024L))
-    // A non-shuffle stage gets an empty hint even when the policy is enabled.
-    assert(GraphShuffleHintPolicy.fromConf(graphConf).shuffleHintFor(nonShuffleStage) ==
-      ShuffleRuntimeHint.empty)
-    // Default-off enable flag and non-GRAPH mode both keep the hint empty.
-    assert(GraphShuffleHintPolicy.fromConf(disabledConf).shuffleHintFor(shuffleStage) ==
-      ShuffleRuntimeHint.empty)
-    assert(GraphShuffleHintPolicy.fromConf(localConf).shuffleHintFor(shuffleStage) ==
-      ShuffleRuntimeHint.empty)
-  }
-
-  test("graph batch hint policy emits bounded batch hints only when enabled in graph mode") {
-    val graphConf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
+      RapidsConf.AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES.key -> "4096",
       RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true",
       RapidsConf.AUTOTUNE_BATCH_TARGET_BYTES.key -> "4096",
-      RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "8192",
+      RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "16384",
       RapidsConf.AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE.key -> "512"))
-    val disabledConf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
-      RapidsConf.AUTOTUNE_BATCH_TARGET_BYTES.key -> "4096"))
-    val gpuStage =
-      AutotuneStageShape(hasGpuScan = true, hasGpuPrefetchConsumer = false, numTasks = 50)
-    val noGpuStage =
-      AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
+    val optimizer = new AnalyticalGraphWideAutotuneOptimizer(
+      GraphOptimizerConstraints.fromConf(conf))
+    val shape = AutotuneStageShape(
+      hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50, hasShuffle = true)
+    val hint = optimizer.initialHint(key, AutotuneStageDescriptor(shape, Seq(1, 2)))
 
-    assert(GraphBatchHintPolicy.fromConf(graphConf).batchHintFor(gpuStage) ==
-      BatchRuntimeHint(targetBatchBytes = 4096L, maxBatchBytes = 8192L, splitUntilSize = 512L))
-    // A stage doing no GPU work gets an empty hint even when enabled.
-    assert(GraphBatchHintPolicy.fromConf(graphConf).batchHintFor(noGpuStage) ==
-      BatchRuntimeHint.empty)
-    assert(GraphBatchHintPolicy.fromConf(disabledConf).batchHintFor(gpuStage) ==
-      BatchRuntimeHint.empty)
+    // OPTIMIZE starts from static values. The larger values are feasible constraints selected only
+    // by the joint objective after observations arrive.
+    assert(hint.scan == ScanRuntimeHint(true, 1, 8, 1024L))
+    assert(hint.gpu == GpuRuntimeHint(4))
+    assert(hint.shuffle == ShuffleRuntimeHint(1, 2048L, 4096L))
+    assert(hint.batch == BatchRuntimeHint(4096L, 16384L, 512L))
   }
 
   test("GPU admission controller applies the minimum active positive stage cap") {
@@ -506,9 +470,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(appliedLimits == Seq(3, 0))
   }
 
-  test("OPTIMIZE admission: per-key cap tracks the highest-version hint (raises and lowers)") {
-    val controller = new RapidsAutotuneGpuAdmissionController(
-      applyLimit = limit => limit, optimizeRaise = () => true)
+  test("GPU admission tracks the highest-version optimizer hint in both graph modes") {
+    val controller = new RapidsAutotuneGpuAdmissionController(applyLimit = limit => limit)
     def hint(ver: Long, cap: Int) = AutotuneCachedHint(
       StageRuntimeHint.empty(key).copy(version = ver, gpu = GpuRuntimeHint(cap)), hasHint = true)
 
@@ -518,14 +481,14 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(controller.taskStarted(key, 4L, hint(3L, 3)) == 3) // newer lower cap backs off
   }
 
-  test("non-OPTIMIZE admission keeps ratchet-down (a higher cap does not raise an active key)") {
+  test("GRAPH admission follows bounded optimizer increases as well as decreases") {
     val controller = new RapidsAutotuneGpuAdmissionController(applyLimit = limit => limit)
     def hint(ver: Long, cap: Int) = AutotuneCachedHint(
       StageRuntimeHint.empty(key).copy(version = ver, gpu = GpuRuntimeHint(cap)), hasHint = true)
 
     assert(controller.taskStarted(key, 1L, hint(1L, 4)) == 4)
-    assert(controller.taskStarted(key, 2L, hint(2L, 6)) == 4) // higher cap ignored (ratchet-down)
-    assert(controller.taskStarted(key, 3L, hint(3L, 2)) == 2) // lower cap still tightens
+    assert(controller.taskStarted(key, 2L, hint(2L, 6)) == 6)
+    assert(controller.taskStarted(key, 3L, hint(3L, 2)) == 2)
   }
 
   test("hint cache put overrides fetch and refreshes once the pushed hint expires") {
@@ -647,7 +610,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
 
       assert(hint.version == 1L)
       assert(hint.shuffle ==
-        ShuffleRuntimeHint(prefetchWindow = 6, maxReadyBytes = 2048L, coalesceTargetBytes = 1024L))
+        ShuffleRuntimeHint(prefetchWindow = 1, maxReadyBytes = 2048L,
+          coalesceTargetBytes = 1024L))
       assert(hint.batch ==
         BatchRuntimeHint(targetBatchBytes = 4096L, maxBatchBytes = 8192L, splitUntilSize = 512L))
       // A shuffle-only stage is not a scan-prefetch candidate, so the scan slot stays empty.
@@ -662,25 +626,43 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
   }
 
   test("stage observation aggregate merges per-task pressure signals") {
-    def obs(wait: Long, hold: Long, host: Long) = RapidsAutotuneObservationMsg(
+    def obs(wait: Long, hold: Long, host: Long, shuffleAcquires: Long, shuffleFails: Long) =
+      RapidsAutotuneObservationMsg(
       executorId = "exec-1", key = key, taskAttemptId = 1L, partitionId = 0,
       hintVersion = 1L, gpuSemaphoreWaitNanos = wait, gpuHoldingNanos = hold,
-      hostMemoryBytes = host)
-    val agg = StageObservationAgg.empty.merge(obs(10L, 100L, 500L)).merge(obs(30L, 100L, 800L))
+      hostMemoryBytes = host, shuffleReadLimiterAcquireCount = shuffleAcquires,
+      shuffleReadLimiterAcquireFailCount = shuffleFails)
+    val agg = StageObservationAgg.empty
+      .merge(obs(10L, 100L, 500L, 40L, 4L))
+      .merge(obs(30L, 100L, 800L, 60L, 16L))
     assert(agg.taskCount == 2L)
     assert(agg.totalGpuSemaphoreWaitNanos == 40L)
     assert(agg.totalGpuHoldingNanos == 200L)
     assert(agg.maxHostMemoryBytes == 800L)
+    assert(agg.totalShuffleReadLimiterAcquireCount == 100L)
+    assert(agg.totalShuffleReadLimiterAcquireFailCount == 20L)
     assert(math.abs(agg.gpuWaitRatio - 0.2) < 1e-9)
+    assert(math.abs(agg.shuffleReadLimiterFailureRatio - 0.2) < 1e-9)
     assert(StageObservationAgg.empty.gpuWaitRatio == 0.0)  // no divide-by-zero
+    assert(StageObservationAgg.empty.shuffleReadLimiterFailureRatio == 0.0)
+  }
+
+  test("task metrics record multithreaded shuffle limiter pressure") {
+    val metrics = new GpuTaskMetrics
+    metrics.recordShuffleReadLimiterAcquire(didFit = true)
+    metrics.recordShuffleReadLimiterAcquire(didFit = false)
+    assert(metrics.getShuffleReadLimiterAcquireCount == 2L)
+    assert(metrics.getShuffleReadLimiterAcquireFailCount == 1L)
   }
 
   test("driver ingests observations into the per-stage aggregate") {
     val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
     RapidsAutotuneDriverEndpoint.init(null, conf)
     try {
-      val m1 = RapidsAutotuneObservationMsg("exec-1", key, 1L, 0, 1L, 10L, 100L, 500L)
-      val m2 = RapidsAutotuneObservationMsg("exec-1", key, 2L, 1, 1L, 30L, 100L, 800L)
+      val m1 = RapidsAutotuneObservationMsg("exec-1", key, 1L, 0, 1L, 10L, 100L, 500L,
+        shuffleReadLimiterAcquireCount = 40L, shuffleReadLimiterAcquireFailCount = 4L)
+      val m2 = RapidsAutotuneObservationMsg("exec-1", key, 2L, 1, 1L, 30L, 100L, 800L,
+        shuffleReadLimiterAcquireCount = 60L, shuffleReadLimiterAcquireFailCount = 16L)
       RapidsAutotuneDriverEndpoint.handleObservation(m1)
       RapidsAutotuneDriverEndpoint.handleObservation(m2)
       val agg = RapidsAutotuneDriverEndpoint.observationFor(key)
@@ -692,6 +674,10 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(ev.taskAttemptId == 2L && ev.partitionId == 1 && ev.gpuSemaphoreWaitNanos == 30L)
       assert(ev.hostMemoryBytes == 800L && ev.stageTaskCount == 2L)
       assert(ev.stageMaxHostMemoryBytes == 800L)
+      assert(ev.shuffleReadLimiterAcquireCount == 60L)
+      assert(ev.shuffleReadLimiterAcquireFailCount == 16L)
+      assert(ev.stageShuffleReadLimiterAcquireCount == 100L)
+      assert(ev.stageShuffleReadLimiterAcquireFailCount == 20L)
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
@@ -702,13 +688,16 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_FAIL_OPEN.key -> "true"))
     val endpoint = new RapidsAutotuneExecutorEndpoint(ctx, conf)
     endpoint.reportObservation(key, taskAttemptId = 7L, partitionId = 3, hintVersion = 5L,
-      gpuSemaphoreWaitNanos = 11L, gpuHoldingNanos = 22L, hostMemoryBytes = 33L, spillBytes = 44L)
+      gpuSemaphoreWaitNanos = 11L, gpuHoldingNanos = 22L, hostMemoryBytes = 33L, spillBytes = 44L,
+      shuffleReadLimiterAcquireCount = 55L, shuffleReadLimiterAcquireFailCount = 6L)
     ctx.lastSent match {
       case msg: RapidsAutotuneObservationMsg =>
         assert(msg.executorId == "exec-7")
         assert(msg.key == key && msg.taskAttemptId == 7L && msg.partitionId == 3)
         assert(msg.hintVersion == 5L && msg.gpuSemaphoreWaitNanos == 11L)
         assert(msg.gpuHoldingNanos == 22L && msg.hostMemoryBytes == 33L && msg.spillBytes == 44L)
+        assert(msg.shuffleReadLimiterAcquireCount == 55L)
+        assert(msg.shuffleReadLimiterAcquireFailCount == 6L)
       case other => fail(s"unexpected message: $other")
     }
   }
@@ -722,431 +711,208 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
   }
 
   // ---------------------------------------------------------------------------
-  // Slice 2: closed-loop model + mid-query re-hint
+  // Graph-wide analytical optimizer and closed-loop re-hint
   // ---------------------------------------------------------------------------
 
-  private val slice2Caps = AutotuneModelCaps(
-    scanMaxReadWindow = 8, scanMaxReadyBytes = 1000L, gpuMaxConcurrentTasks = 4,
-    minSampleTasks = 2L)
+  private def optimizerConstraints(
+      minSamples: Long = 2L,
+      intervalNanos: Long = 0L): GraphOptimizerConstraints = GraphOptimizerConstraints(
+    minSampleTasks = minSamples,
+    updateIntervalNanos = intervalNanos,
+    scan = ScanOptimizerBounds(enabled = true, initialReadWindow = 2,
+      maxReadWindow = 8, maxReadyBytes = 4096L),
+    gpu = GpuOptimizerBounds(enabled = true, initialConcurrentTasks = 2,
+      maxConcurrentTasks = 8),
+    shuffle = ShuffleOptimizerBounds(enabled = true, initialPrefetchWindow = 1,
+      maxPrefetchWindow = 16,
+      initialReadyBytes = 128L, maxReadyBytes = 512L, initialCoalesceBytes = 256L),
+    batch = BatchOptimizerBounds(enabled = true, initialTargetBytes = 256L,
+      maxBatchBytes = 1024L, initialSplitUntilSize = 128L))
 
-  private def stageHint(scanWindow: Int, gpuCap: Int): StageRuntimeHint =
-    StageRuntimeHint.empty(key).copy(
-      version = 1L,
-      scan = if (scanWindow > 0) {
-        ScanRuntimeHint(eagerPrefetch = true, minReadWindow = 1,
-          maxReadWindow = scanWindow, maxReadyBytes = 1000L)
-      } else ScanRuntimeHint.empty,
-      gpu = if (gpuCap > 0) GpuRuntimeHint(gpuCap) else GpuRuntimeHint.empty)
+  private def optimizerObservation(
+      stageKey: AutotuneStageKey,
+      taskAttemptId: Long,
+      wait: Long,
+      holding: Long,
+      duration: Long,
+      input: Long,
+      output: Long,
+      shuffleRead: Long = 0L,
+      shuffleWrite: Long = 0L,
+      spill: Long = 0L,
+      retry: Long = 0L): RapidsAutotuneObservationMsg = RapidsAutotuneObservationMsg(
+    executorId = "exec-1",
+    key = stageKey,
+    taskAttemptId = taskAttemptId,
+    partitionId = taskAttemptId.toInt,
+    hintVersion = 1L,
+    gpuSemaphoreWaitNanos = wait,
+    gpuHoldingNanos = holding,
+    hostMemoryBytes = 0L,
+    spillBytes = spill,
+    taskDurationNanos = duration,
+    inputBytes = input,
+    outputBytes = output,
+    shuffleReadBytes = shuffleRead,
+    shuffleWriteBytes = shuffleWrite,
+    retryOrLostTimeNanos = retry)
 
-  private def agg(
-      tasks: Long, wait: Long, hold: Long, host: Long, spill: Long): StageObservationAgg =
-    StageObservationAgg(taskCount = tasks, totalGpuSemaphoreWaitNanos = wait,
-      totalGpuHoldingNanos = hold, maxHostMemoryBytes = host, totalSpillBytes = spill)
+  test("analytical optimizer solves scan GPU and shuffle controls as one joint candidate") {
+    val constraints = optimizerConstraints()
+    val shape = AutotuneStageShape(
+      hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50, hasShuffle = true)
+    val current = StageRuntimeHint.empty(key).copy(
+      scan = ScanRuntimeHint(true, 1, 2, 4096L),
+      gpu = GpuRuntimeHint(2),
+      shuffle = ShuffleRuntimeHint(1, 128L, 0L))
+    val observation = StageObservationAgg.empty
+      .merge(optimizerObservation(key, 1L, wait = 0L, holding = 2000L,
+        duration = 10000L, input = 1000L, output = 500L, shuffleRead = 500L))
+      .merge(optimizerObservation(key, 2L, wait = 0L, holding = 2000L,
+        duration = 10000L, input = 1000L, output = 500L, shuffleRead = 500L))
 
-  test("model does not act before the minimum sample count") {
-    // Heavy pressure, but only one sampled task (< minSampleTasks=2): no decision.
-    val obs = agg(tasks = 1L, wait = 1000L, hold = 1L, host = 999L, spill = 5L)
-    assert(AutotuneGraphModel.decide(obs, stageHint(8, 4), slice2Caps).isEmpty)
+    val decision = AnalyticalStageCostModel.optimize(observation, current, shape, constraints).get
+    assert(decision.predictedSelectedNanos < decision.predictedCurrentNanos)
+    assert(decision.hint.scan.maxReadWindow == 8)
+    // Four GPU tasks are sufficient once scan/shuffle become the max-resource bottleneck; the
+    // joint optimizer therefore does not spend the remaining GPU envelope with no path benefit.
+    assert(decision.hint.gpu.maxConcurrentTasks == 4)
+    assert(decision.hint.shuffle.prefetchWindow == 4)
+    // The byte search never crosses below the configured safe starting point merely to win a
+    // resource tie. Window and ready bytes remain one jointly optimized service capacity.
+    assert(decision.hint.shuffle.maxReadyBytes >= constraints.shuffle.initialReadyBytes)
   }
 
-  test("model leaves inactive (un-hinted) knobs untouched") {
-    // No scan window, no GPU cap in the current hint -> nothing to tune even under pressure.
-    val obs = agg(tasks = 50L, wait = 1000L, hold = 1L, host = 999L, spill = 100L)
-    assert(AutotuneGraphModel.decide(obs, stageHint(0, 0), slice2Caps).isEmpty)
+  test("analytical GPU objective treats semaphore wait as admission queueing") {
+    val constraints = optimizerConstraints()
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
+    val current = StageRuntimeHint.empty(key).copy(gpu = GpuRuntimeHint(4))
+    val observation = StageObservationAgg.empty
+      .merge(optimizerObservation(key, 1L, wait = 1000L, holding = 100L,
+        duration = 1100L, input = 0L, output = 0L))
+      .merge(optimizerObservation(key, 2L, wait = 1000L, holding = 100L,
+        duration = 1100L, input = 0L, output = 0L))
+
+    val decision = AnalyticalStageCostModel.optimize(observation, current, shape, constraints).get
+    assert(decision.hint.gpu.maxConcurrentTasks == 8)
   }
 
-  test("model halves the scan window under host-memory pressure, never below the floor") {
-    val obs = agg(tasks = 50L, wait = 0L, hold = 100L, host = 950L, spill = 0L) // 950 >= 0.9*1000
-    val d = AutotuneGraphModel.decide(obs, stageHint(8, 0), slice2Caps).get
-    assert(d.isDecrease)
-    assert(d.hint.scan.maxReadWindow == 4)
-    // From a window of 1 (== floor) there is nowhere to go down -> no decision.
-    assert(AutotuneGraphModel.decide(obs, stageHint(1, 0), slice2Caps).isEmpty)
+  test("analytical optimizer owns batch and split targets") {
+    val constraints = optimizerConstraints()
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
+    val current = StageRuntimeHint.empty(key).copy(
+      gpu = GpuRuntimeHint(2),
+      batch = BatchRuntimeHint(256L, 1024L, 128L))
+    val observation = StageObservationAgg.empty
+      .merge(optimizerObservation(key, 1L, wait = 0L, holding = 1000L,
+        duration = 5000L, input = 4096L, output = 4096L))
+      .merge(optimizerObservation(key, 2L, wait = 0L, holding = 1000L,
+        duration = 5000L, input = 4096L, output = 4096L))
+
+    val decision = AnalyticalStageCostModel.optimize(observation, current, shape, constraints).get
+    assert(decision.hint.batch.targetBatchBytes == 1024L)
+    assert(decision.hint.batch.splitUntilSize == 1024L)
   }
 
-  test("model lowers the GPU cap under high semaphore-wait pressure") {
-    val obs = agg(tasks = 50L, wait = 1000L, hold = 100L, host = 0L, spill = 0L) // ratio 10 >= 1.0
-    val d = AutotuneGraphModel.decide(obs, stageHint(0, 4), slice2Caps).get
-    assert(d.isDecrease && d.hint.gpu.maxConcurrentTasks == 2)
-    assert(AutotuneGraphModel.decide(obs, stageHint(0, 1), slice2Caps).isEmpty) // already at floor
+  test("optimizer state owns sample windows and update cadence") {
+    val optimizer = new AnalyticalGraphWideAutotuneOptimizer(
+      optimizerConstraints(minSamples = 2L, intervalNanos = 100L))
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
+    val initial = optimizer.initialHint(key, AutotuneStageDescriptor(shape)).copy(version = 1L)
+    val first = optimizerObservation(key, 1L, wait = 0L, holding = 1000L,
+      duration = 1000L, input = 0L, output = 0L)
+    val second = optimizerObservation(key, 2L, wait = 0L, holding = 1000L,
+      duration = 1000L, input = 0L, output = 0L)
+
+    assert(optimizer.observe(first, initial, nowNanos = 1000L).isEmpty)
+    val changed = optimizer.observe(second, initial, nowNanos = 1000L)
+    assert(changed.exists(_.hint.gpu.maxConcurrentTasks == 8))
+    // A fresh two-sample window inside the interval remains queued, not evaluated.
+    assert(optimizer.observe(first, changed.get.hint, nowNanos = 1050L).isEmpty)
+    assert(optimizer.observe(second, changed.get.hint, nowNanos = 1050L).isEmpty)
   }
 
-  test("model reduces both knobs under spill pressure (prefer-reduce over restore)") {
-    // Spill present plus otherwise-relaxed signals (low wait, low host): reduce wins, no restore.
-    val obs = agg(tasks = 50L, wait = 0L, hold = 100L, host = 10L, spill = 1L)
-    val d = AutotuneGraphModel.decide(obs, stageHint(8, 4), slice2Caps).get
-    assert(d.isDecrease)
-    assert(d.hint.scan.maxReadWindow == 4)
-    assert(d.hint.gpu.maxConcurrentTasks == 2)
+  test("optimizer calibrates only observations from the current complete hint version") {
+    val optimizer = new AnalyticalGraphWideAutotuneOptimizer(
+      optimizerConstraints(minSamples = 2L, intervalNanos = 0L))
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
+    val initial = optimizer.initialHint(key, AutotuneStageDescriptor(shape)).copy(version = 4L)
+    val stale = optimizerObservation(key, 1L, wait = 0L, holding = 1000L,
+      duration = 1000L, input = 0L, output = 0L).copy(hintVersion = 3L)
+    val current1 = stale.copy(taskAttemptId = 2L, hintVersion = 4L)
+    val current2 = stale.copy(taskAttemptId = 3L, hintVersion = 4L)
+
+    assert(optimizer.observe(stale, initial, nowNanos = 1000L).isEmpty)
+    assert(optimizer.observe(current1, initial, nowNanos = 1000L).isEmpty)
+    assert(optimizer.observe(current2, initial, nowNanos = 1000L).nonEmpty)
   }
 
-  test("model restores knobs toward the static cap once pressure clears, never beyond it") {
-    // Relaxed: low wait ratio, no spill, host well under budget. Knobs sit below their caps.
-    val relaxed = agg(tasks = 50L, wait = 1L, hold = 100L, host = 100L, spill = 0L)
-    val d = AutotuneGraphModel.decide(relaxed, stageHint(4, 2), slice2Caps).get
-    assert(!d.isDecrease)
-    assert(d.hint.scan.maxReadWindow == 5)            // +1 toward cap 8
-    assert(d.hint.gpu.maxConcurrentTasks == 3)        // +1 toward cap 4
-    // At the caps already -> nothing to restore.
-    assert(AutotuneGraphModel.decide(relaxed, stageHint(8, 4), slice2Caps).isEmpty)
+  test("optimizer retains unidentifiable batch control instead of minimizing it to one byte") {
+    val constraints = optimizerConstraints()
+    val shape = AutotuneStageShape(
+      hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50, hasShuffle = true)
+    val current = StageRuntimeHint.empty(key).copy(
+      scan = ScanRuntimeHint(true, 1, 2, 4096L),
+      gpu = GpuRuntimeHint(2),
+      shuffle = ShuffleRuntimeHint(1, 128L, 256L),
+      batch = BatchRuntimeHint(256L, 1024L, 128L))
+    val observation = StageObservationAgg.empty
+      .merge(optimizerObservation(key, 1L, wait = 0L, holding = 1000L,
+        duration = 5000L, input = 4096L, output = 4096L, shuffleWrite = 4096L))
+      .merge(optimizerObservation(key, 2L, wait = 0L, holding = 1000L,
+        duration = 5000L, input = 4096L, output = 4096L, shuffleWrite = 4096L))
+
+    val decision = AnalyticalStageCostModel.optimize(observation, current, shape, constraints).get
+    assert(decision.hint.batch.targetBatchBytes == 256L)
+    assert(decision.hint.batch.splitUntilSize == 128L)
   }
 
-  test("republishStageHint overwrites with a bumped version and is inert when disabled") {
-    val conf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString))
-    RapidsAutotuneDriverEndpoint.init(null, conf)
-    try {
-      val first = RapidsAutotuneDriverEndpoint.publishDefaultNoopHint(key)
-      assert(first.version == 1L)
-      val updated = RapidsAutotuneDriverEndpoint.republishStageHint(
-        key, first.copy(gpu = GpuRuntimeHint(2)))
-      assert(updated.version == 2L)
-      assert(updated.gpu == GpuRuntimeHint(2))
-      assert(updated.expiresAtNanos == Long.MaxValue)
-      // The endpoint now serves the republished version.
-      val served = RapidsAutotuneDriverEndpoint.handleHintRequest(
-        RapidsAutotuneHintRequestMsg("exec-1", key)).hint
-      assert(served.contains(updated))
-    } finally {
-      RapidsAutotuneDriverEndpoint.shutdown()
-    }
-    // Disabled endpoint republishes nothing.
-    assert(RapidsAutotuneDriverEndpoint.republishStageHint(key, stageHint(8, 4)).version == 0L)
-  }
-
-  test("driver closes the loop: observed GPU pressure bumps the hint version and lowers the cap") {
-    val conf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
-      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",
-      RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "2",
-      RapidsConf.AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS.key -> "0")) // no debounce/cooldown for the test
-    RapidsAutotuneDriverEndpoint.init(null, conf)
-    try {
-      val listener = new RapidsAutotuneStageHintListener(conf)
-      val shape =
-        AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
-      val initial = listener.publishHintForStage(
-        key.executionId, key.stageId, key.stageAttemptId, shape)
-      assert(initial.version == 1L && initial.gpu.maxConcurrentTasks == 4)
-
-      // High semaphore-wait observations (wait >> holding) -> GPU contention pressure. The model
-      // consumes a per-decision window, so each decision needs minSampleTasks (=2) fresh samples.
-      def obs() = RapidsAutotuneObservationMsg("exec-1", key, taskAttemptId = 1L, partitionId = 0,
-        hintVersion = 1L, gpuSemaphoreWaitNanos = 500L, gpuHoldingNanos = 50L,
-        hostMemoryBytes = 0L, spillBytes = 0L)
-      def feed(n: Int): Unit =
-        (1 to n).foreach(_ => RapidsAutotuneDriverEndpoint.handleObservation(obs()))
-      def served = RapidsAutotuneDriverEndpoint.handleHintRequest(
-        RapidsAutotuneHintRequestMsg("exec-1", key)).hint.get
-
-      feed(1) // window 1 < 2 -> no decision yet
-      assert(served.version == 1L && served.gpu.maxConcurrentTasks == 4)
-      feed(1) // window hits 2 -> reduce 4 -> 2, v2
-      assert(served.version == 2L && served.gpu.maxConcurrentTasks == 2)
-      feed(2) // next window -> reduce 2 -> 1, v3
-      assert(served.version == 3L && served.gpu.maxConcurrentTasks == 1)
-      feed(2) // at floor -> no change, version held
-      assert(served.version == 3L && served.gpu.maxConcurrentTasks == 1)
-    } finally {
-      RapidsAutotuneDriverEndpoint.shutdown()
-    }
-  }
-
-  test("driver does not run the model outside GRAPH mode") {
-    val conf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true", // OBSERVE mode (default)
-      RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "1"))
-    RapidsAutotuneDriverEndpoint.init(null, conf)
-    try {
-      RapidsAutotuneDriverEndpoint.publishDefaultNoopHint(key)
-      RapidsAutotuneDriverEndpoint.handleObservation(RapidsAutotuneObservationMsg(
-        "exec-1", key, 1L, 0, 1L, 5000L, 1L, 999L, 1000L))
-      // OBSERVE never republishes: still version 1.
-      assert(RapidsAutotuneDriverEndpoint.handleHintRequest(
-        RapidsAutotuneHintRequestMsg("exec-1", key)).hint.exists(_.version == 1L))
-    } finally {
-      RapidsAutotuneDriverEndpoint.shutdown()
-    }
-  }
-
-  test("stage observation aggregate sums spill bytes") {
-    def obs(spill: Long) = RapidsAutotuneObservationMsg(
-      executorId = "exec-1", key = key, taskAttemptId = 1L, partitionId = 0,
-      hintVersion = 1L, gpuSemaphoreWaitNanos = 0L, gpuHoldingNanos = 0L,
-      hostMemoryBytes = 0L, spillBytes = spill)
-    val a = StageObservationAgg.empty.merge(obs(100L)).merge(obs(50L))
-    assert(a.totalSpillBytes == 150L)
-  }
-
-  test("hint cache refetches after the fetch TTL elapses, memoizes within it") {
-    var version = 0L
-    var nowNanos = 1000L
-    val cache = new AutotuneHintCache(
-      stageKey => {
-        version += 1
-        AutotuneCachedHint(StageRuntimeHint.empty(stageKey).copy(version = version), hasHint = true)
-      },
-      fetchTtlNanos = 100L,
-      nowNanos = () => nowNanos)
-
-    assert(cache.get(key).version == 1L) // initial fetch at t=1000
-    nowNanos = 1050L
-    assert(cache.get(key).version == 1L) // within TTL -> memoized
-    nowNanos = 1100L                     // 1100 - 1000 == 100 >= TTL -> stale
-    assert(cache.get(key).version == 2L) // refetch
-    assert(version == 2L)
-  }
-
-  test("model RESTORE is reachable on the live path once a fresh window clears (windowing)") {
-    // Regression for the cumulative-aggregate latch: drive the GPU cap down under pressure, then
-    // feed a clean window and confirm the cap is restored toward the static cap. With a lifetime
-    // cumulative aggregate this would be impossible (pressure would latch forever).
-    val conf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
-      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",
-      RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "2",
-      RapidsConf.AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS.key -> "0")) // no debounce/cooldown for the test
-    RapidsAutotuneDriverEndpoint.init(null, conf)
-    try {
-      val listener = new RapidsAutotuneStageHintListener(conf)
-      val shape =
-        AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
-      listener.publishHintForStage(key.executionId, key.stageId, key.stageAttemptId, shape)
-      def feed(n: Int, wait: Long, hold: Long): Unit = (1 to n).foreach(_ =>
-        RapidsAutotuneDriverEndpoint.handleObservation(RapidsAutotuneObservationMsg(
-          "exec-1", key, 1L, 0, 1L, wait, hold, hostMemoryBytes = 0L, spillBytes = 0L)))
-      def served = RapidsAutotuneDriverEndpoint.handleHintRequest(
-        RapidsAutotuneHintRequestMsg("exec-1", key)).hint.get
-
-      feed(2, wait = 500L, hold = 50L)  // pressure window -> reduce 4 -> 2
-      assert(served.gpu.maxConcurrentTasks == 2)
-      feed(2, wait = 1L, hold = 100L)   // clean window (ratio 0.01) -> restore 2 -> 3
-      assert(served.gpu.maxConcurrentTasks == 3)
-      feed(2, wait = 1L, hold = 100L)   // clean window -> restore 3 -> 4 (the static cap)
-      assert(served.gpu.maxConcurrentTasks == 4)
-      val atCap = served.version
-      feed(2, wait = 1L, hold = 100L)   // at the cap -> no change
-      assert(served.gpu.maxConcurrentTasks == 4 && served.version == atCap)
-    } finally {
-      RapidsAutotuneDriverEndpoint.shutdown()
-    }
-  }
-
-  test("driver debounces model evaluations within the update interval") {
-    val conf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
-      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",
-      RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "1",
-      RapidsConf.AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS.key -> "1")) // 1ms = 1000000ns debounce
-    RapidsAutotuneDriverEndpoint.init(null, conf)
-    var clock = 10000000L
-    RapidsAutotuneDriverEndpoint.setNanoSourceForTest(() => clock)
-    try {
-      val listener = new RapidsAutotuneStageHintListener(conf)
-      val shape =
-        AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
-      listener.publishHintForStage(key.executionId, key.stageId, key.stageAttemptId, shape)
-      def pressure(): Unit = RapidsAutotuneDriverEndpoint.handleObservation(
-        RapidsAutotuneObservationMsg("exec-1", key, 1L, 0, 1L, 500L, 50L, 0L, 0L))
-      def served = RapidsAutotuneDriverEndpoint.handleHintRequest(
-        RapidsAutotuneHintRequestMsg("exec-1", key)).hint.get
-
-      pressure()                       // first eval -> reduce 4 -> 2, v2
-      assert(served.version == 2L && served.gpu.maxConcurrentTasks == 2)
-      clock += 500000L                // 0.5ms < 1ms -> debounced
-      pressure()
-      assert(served.version == 2L && served.gpu.maxConcurrentTasks == 2)
-      clock += 600000L                // total 1.1ms since last eval -> allowed
-      pressure()
-      assert(served.version == 3L && served.gpu.maxConcurrentTasks == 1)
-    } finally {
-      RapidsAutotuneDriverEndpoint.shutdown()
-    }
-  }
-
-  test("driver allows decreases during cooldown but suppresses increases until it elapses") {
-    val conf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
-      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",
-      RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "1",
-      RapidsConf.AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS.key -> "1")) // interval 1ms, cooldown 2ms
-    RapidsAutotuneDriverEndpoint.init(null, conf)
-    var clock = 10000000L
-    RapidsAutotuneDriverEndpoint.setNanoSourceForTest(() => clock)
-    try {
-      val listener = new RapidsAutotuneStageHintListener(conf)
-      val shape =
-        AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
-      listener.publishHintForStage(key.executionId, key.stageId, key.stageAttemptId, shape)
-      def obs(wait: Long, hold: Long): Unit = RapidsAutotuneDriverEndpoint.handleObservation(
-        RapidsAutotuneObservationMsg("exec-1", key, 1L, 0, 1L, wait, hold, 0L, 0L))
-      def served = RapidsAutotuneDriverEndpoint.handleHintRequest(
-        RapidsAutotuneHintRequestMsg("exec-1", key)).hint.get
-
-      obs(500L, 50L)        // reduce 4 -> 2 (decrease at t0)
-      assert(served.gpu.maxConcurrentTasks == 2)
-      clock += 1000000L   // past debounce, still within 2ms cooldown
-      obs(500L, 50L)        // a DECREASE is still allowed during cooldown -> 2 -> 1
-      assert(served.gpu.maxConcurrentTasks == 1)
-      clock += 1000000L   // past debounce; cooldown measured from the t1 decrease -> still inside
-      obs(1L, 100L)         // relaxed -> would restore, but suppressed by cooldown
-      assert(served.gpu.maxConcurrentTasks == 1)
-      val held = served.version
-      clock += 1500000L   // now well past the cooldown from the last decrease
-      obs(1L, 100L)         // relaxed -> restore allowed 1 -> 2
-      assert(served.gpu.maxConcurrentTasks == 2 && served.version > held)
-    } finally {
-      RapidsAutotuneDriverEndpoint.shutdown()
-    }
-  }
-
-  test("model does not restore a knob with headroom while another knob is under pressure") {
-    // Global 'relaxed' gate: GPU pressure must block a scan-window restore even though the scan
-    // knob has headroom and no host/spill pressure of its own. ratio 1000/100 = 10 -> gpu pressure.
-    val obs = agg(tasks = 50L, wait = 1000L, hold = 100L, host = 0L, spill = 0L)
-    val d = AutotuneGraphModel.decide(obs, stageHint(4, 2), slice2Caps).get
-    assert(d.isDecrease)
-    assert(d.hint.scan.maxReadWindow == 4)        // scan NOT restored (gpu pressure blocks relaxed)
-    assert(d.hint.gpu.maxConcurrentTasks == 1)    // gpu reduced
-  }
-
-  test("driver model no-ops when observations arrive before any hint is published") {
-    val conf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
-      RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "1"))
-    RapidsAutotuneDriverEndpoint.init(null, conf)
-    try {
-      // No publishStageHint for this key. Observations must still be aggregated (cumulative view)
-      // but the model must NOT synthesize/serve a hint for an un-published stage, and the call must
-      // not propagate an exception to the RPC handler.
-      RapidsAutotuneDriverEndpoint.handleObservation(
-        RapidsAutotuneObservationMsg("exec-1", key, 1L, 0, 0L, 500L, 50L, 0L, 0L))
-      RapidsAutotuneDriverEndpoint.handleObservation(
-        RapidsAutotuneObservationMsg("exec-1", key, 2L, 1, 0L, 500L, 50L, 0L, 0L))
-      // Observations were ingested into the cumulative aggregate...
-      assert(RapidsAutotuneDriverEndpoint.observationFor(key).exists(_.taskCount == 2L))
-      // ...but no hint was ever published or synthesized for the key.
-      assert(RapidsAutotuneDriverEndpoint.handleHintRequest(
-        RapidsAutotuneHintRequestMsg("exec-1", key)).hint.isEmpty)
-    } finally {
-      RapidsAutotuneDriverEndpoint.shutdown()
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Slice 3a: OPTIMIZE mode -- above-static GPU concurrency
-  // ---------------------------------------------------------------------------
-
-  // ceiling 8 (> static start of 4), optimizeGpu = aggressive above-static raise gate.
-  private val optimizeCaps = AutotuneModelCaps(
-    scanMaxReadWindow = 8, scanMaxReadyBytes = 1000L, gpuMaxConcurrentTasks = 8,
-    minSampleTasks = 2L, optimizeGpu = true)
-
-  test("OPTIMIZE: model raises the GPU cap above static toward the optimize ceiling") {
-    val relaxed = agg(tasks = 50L, wait = 1L, hold = 100L, host = 0L, spill = 0L) // ratio 0.01
-    val d = AutotuneGraphModel.decide(relaxed, stageHint(0, 4), optimizeCaps).get
-    assert(!d.isDecrease)
-    assert(d.hint.gpu.maxConcurrentTasks == 5)  // 4 (== static) -> 5, above static, toward ceiling
-    // At the ceiling -> no further raise.
-    assert(AutotuneGraphModel.decide(relaxed, stageHint(0, 8), optimizeCaps).isEmpty)
-  }
-
-  test("OPTIMIZE: GPU raise is decoupled from host-memory pressure") {
-    // Host pressure present (950 >= 0.9*1000) but GPU uncontended, no spill. GRAPH would block the
-    // GPU restore; OPTIMIZE raises GPU anyway (host memory bounds the scan window, not GPU).
-    val obs = agg(tasks = 50L, wait = 1L, hold = 100L, host = 950L, spill = 0L)
-    val d = AutotuneGraphModel.decide(obs, stageHint(0, 4), optimizeCaps).get
-    assert(!d.isDecrease && d.hint.gpu.maxConcurrentTasks == 5)
-  }
-
-  test("OPTIMIZE: model backs off the GPU cap on contention or spill") {
-    val contended = agg(tasks = 50L, wait = 1000L, hold = 100L, host = 0L, spill = 0L) // ratio 10
-    val d1 = AutotuneGraphModel.decide(contended, stageHint(0, 6), optimizeCaps).get
-    assert(d1.isDecrease && d1.hint.gpu.maxConcurrentTasks == 3) // 6 -> 3
-    val spilling = agg(tasks = 50L, wait = 1L, hold = 100L, host = 0L, spill = 1L)
-    val d2 = AutotuneGraphModel.decide(spilling, stageHint(0, 6), optimizeCaps).get
-    assert(d2.isDecrease && d2.hint.gpu.maxConcurrentTasks == 3) // spill forces back-off
-  }
-
-  test("driver OPTIMIZE loop raises the GPU cap above the static cap") {
+  test("driver publishes and republishes optimizer-owned complete hints") {
     val conf = new RapidsConf(Map(
       RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
       RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
-      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",          // starting cap (== static)
-      RapidsConf.AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS.key -> "8", // above-static ceiling
+      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "2",
+      RapidsConf.AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS.key -> "8",
       RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "2",
       RapidsConf.AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS.key -> "0"))
     RapidsAutotuneDriverEndpoint.init(null, conf)
     try {
       val listener = new RapidsAutotuneStageHintListener(conf)
-      val shape =
-        AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
+      val shape = AutotuneStageShape(
+        hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
       val initial = listener.publishHintForStage(
-        key.executionId, key.stageId, key.stageAttemptId, shape)
-      assert(initial.gpu.maxConcurrentTasks == 4) // starts at the static cap
-
-      // Low-wait, no-spill observations -> the model raises the GPU cap ABOVE static toward 8.
-      def feed(n: Int): Unit = (1 to n).foreach(_ =>
-        RapidsAutotuneDriverEndpoint.handleObservation(RapidsAutotuneObservationMsg(
-          "exec-1", key, 1L, 0, 1L, gpuSemaphoreWaitNanos = 1L, gpuHoldingNanos = 100L,
-          hostMemoryBytes = 0L, spillBytes = 0L)))
-      def served = RapidsAutotuneDriverEndpoint.handleHintRequest(
+        key.executionId, key.stageId, key.stageAttemptId, shape, Seq(1))
+      assert(initial.version == 1L && initial.gpu.maxConcurrentTasks == 2)
+      RapidsAutotuneDriverEndpoint.handleObservation(
+        optimizerObservation(key, 1L, wait = 0L, holding = 1000L,
+          duration = 1000L, input = 0L, output = 0L))
+      RapidsAutotuneDriverEndpoint.handleObservation(
+        optimizerObservation(key, 2L, wait = 0L, holding = 1000L,
+          duration = 1000L, input = 0L, output = 0L))
+      val served = RapidsAutotuneDriverEndpoint.handleHintRequest(
         RapidsAutotuneHintRequestMsg("exec-1", key)).hint.get
-
-      feed(2)
-      assert(served.gpu.maxConcurrentTasks == 5) // 4 -> 5, above the static cap of 4
-      feed(2)
-      assert(served.gpu.maxConcurrentTasks == 6) // 5 -> 6, still climbing toward the ceiling
+      assert(served.version == 2L)
+      assert(served.gpu.maxConcurrentTasks == 8)
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Slice 3b: OPTIMIZE mode -- above-static scan read window
-  // ---------------------------------------------------------------------------
-
-  test("OPTIMIZE raises the effective scan read-window cap above static; others keep it static") {
-    def conf(mode: String, optScan: String) = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> mode,
-      RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
-      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "8",
-      RapidsConf.AUTOTUNE_OPTIMIZE_SCAN_MAX_READ_WINDOW.key -> optScan))
-    // static cap = min(8, 8) = 8
-    assert(conf(AutotuneGraphMode.GRAPH.toString, "32").autotuneEffectiveScanReadWindowCap == 8)
-    assert(conf(AutotuneGraphMode.OPTIMIZE.toString, "0").autotuneEffectiveScanReadWindowCap == 8)
-    assert(conf(AutotuneGraphMode.OPTIMIZE.toString, "32").autotuneEffectiveScanReadWindowCap == 32)
-  }
-
-  test("OPTIMIZE: GraphScanHintPolicy publishes the raised scan envelope") {
-    val conf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
-      RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "8",
-      RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "8",
-      RapidsConf.AUTOTUNE_OPTIMIZE_SCAN_MAX_READ_WINDOW.key -> "32",
-      RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "2048"))
-    val candidate =
-      AutotuneStageShape(hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50)
-    val hint = GraphScanHintPolicy.fromConf(conf).scanHintFor(candidate)
-    assert(hint.eagerPrefetch && hint.maxReadWindow == 32 && hint.maxReadyBytes == 2048L)
-  }
-
-  test("scan read-window envelope can exceed the static cap, bounded by files-per-task") {
-    val hint = ScanRuntimeHint(
-      eagerPrefetch = true, minReadWindow = 1, maxReadWindow = 32, maxReadyBytes = 2048L)
-    // executor cap 32 (OPTIMIZE-raised), 50 files -> maxWindow 32 (above the static cap of 8)
-    val s = ScanReadWindowSettings.fromHint(hint, maxReadWindowCap = 32, inputFileCount = 50).get
-    assert(s.enabled && s.maxWindow == 32 && s.initialWindow == 1)
-    // bounded by files-per-task: 10 files -> maxWindow 10 (cannot exceed what the reader reads)
-    val sFew = ScanReadWindowSettings.fromHint(hint, maxReadWindowCap = 32, inputFileCount = 10).get
-    assert(sFew.maxWindow == 10)
+  test("batch runtime hint helpers clamp and fail open") {
+    val batch = BatchRuntimeHint(targetBatchBytes = 1024L, maxBatchBytes = 768L,
+      splitUntilSize = 900L)
+    val shuffle = ShuffleRuntimeHint(prefetchWindow = 0, maxReadyBytes = 1L,
+      coalesceTargetBytes = 2048L)
+    assert(BatchRuntimeHints.effectiveTargetBatchBytes(256L, Some(batch)) == 768L)
+    assert(BatchRuntimeHints.effectiveShuffleCoalesceTargetBytes(
+      256L, Some(shuffle), Some(batch)) == 768L)
+    assert(BatchRuntimeHints.effectiveSplitUntilSize(256L, Some(batch)) ==
+      GpuDeviceManager.MIN_SPLIT_UNTIL_SIZE)
+    assert(BatchRuntimeHints.effectiveTargetBatchBytes(256L, None) == 256L)
+    assert(BatchRuntimeHints.effectiveSplitUntilSize(256L, None) == 256L)
   }
 }
