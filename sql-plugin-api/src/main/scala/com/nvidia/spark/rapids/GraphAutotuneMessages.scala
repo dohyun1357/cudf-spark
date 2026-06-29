@@ -151,4 +151,8 @@ case class RapidsAutotuneObservationMsg(
     hintVersion: Long,
     gpuSemaphoreWaitNanos: Long,
     gpuHoldingNanos: Long,
-    hostMemoryBytes: Long)
+    hostMemoryBytes: Long,
+    // Total bytes spilled (host + disk) by the task. A spill pressure signal for the closed-loop
+    // model: when positive, the model reduces a knob (read window / GPU concurrency) to relieve
+    // memory pressure. Defaulted so older positional constructions keep compiling.
+    spillBytes: Long = 0L)

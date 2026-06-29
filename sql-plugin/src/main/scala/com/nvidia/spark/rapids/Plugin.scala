@@ -923,8 +923,9 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
         stageAttemptId = taskCtx.stageAttemptNumber())
       val hint = endpoint.hintFor(key)
       RapidsAutotuneTaskHints.setCurrentHint(hint)
-      val gpuAppliedMaxConcurrentTasks = endpoint.taskStarted(key, hint)
-      onTaskCompletion(taskCtx, _ => endpoint.taskCompleted(key))
+      val taskAttemptId = taskCtx.taskAttemptId()
+      val gpuAppliedMaxConcurrentTasks = endpoint.taskStarted(key, taskAttemptId, hint)
+      onTaskCompletion(taskCtx, _ => endpoint.taskCompleted(key, taskAttemptId))
       endpoint.recordAppliedHint(
         key,
         taskCtx.taskAttemptId(),
@@ -944,7 +945,8 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
             hint.version,
             taskMetrics.getSemWaitTime(),
             taskMetrics.getSemaphoreHoldingTime,
-            taskMetrics.getMaxHostBytesAllocated)
+            taskMetrics.getMaxHostBytesAllocated,
+            taskMetrics.getSpillBytes)
         } catch {
           case scala.util.control.NonFatal(e) =>
             logWarning("Failed to record RAPIDS graph autotune observation; continuing", e)

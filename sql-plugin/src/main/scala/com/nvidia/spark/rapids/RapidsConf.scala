@@ -1882,6 +1882,25 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValues(AutotuneGraphMode.values.map(_.toString))
       .createWithDefault(AutotuneGraphMode.OBSERVE.toString)
 
+  val AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS =
+    conf("spark.rapids.sql.autotune.graph.minSampleTasks")
+      .doc("Minimum number of completed-task observations a stage must report before the graph " +
+        "autotune closed-loop model will republish an adjusted hint for it. Hysteresis control: " +
+        "avoids retuning on a few noisy samples. Only used in GRAPH mode.")
+      .integerConf
+      .checkValue(v => v > 0, "The autotune graph min sample tasks must be greater than 0.")
+      .createWithDefault(8)
+
+  val AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS =
+    conf("spark.rapids.sql.autotune.graph.updateIntervalMs")
+      .doc("Minimum interval, in milliseconds, between graph autotune hint updates for a stage " +
+        "(debounce), and the executor hint-cache refresh TTL so later tasks pick up a " +
+        "republished hint. The cooldown that suppresses an increase right after a decrease is " +
+        "twice this. Only used in GRAPH mode.")
+      .integerConf
+      .checkValue(v => v >= 0, "The autotune graph update interval must be non-negative.")
+      .createWithDefault(500)
+
   val AUTOTUNE_SCAN_MAX_READ_WINDOW =
     conf("spark.rapids.sql.autotune.scan.maxReadWindow")
       .doc("Hard cap for the executor-local autotune scan read window. The effective read " +
@@ -3954,6 +3973,14 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val isAutotuneLocalMode: Boolean =
     autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.LOCAL
+
+  /** True when the driver should run the closed-loop model and republish hints (GRAPH mode). */
+  lazy val isAutotuneGraphMode: Boolean =
+    autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.GRAPH
+
+  lazy val autotuneGraphMinSampleTasks: Int = get(AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS)
+
+  lazy val autotuneGraphUpdateIntervalMs: Int = get(AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS)
 
   lazy val autotuneScanMaxReadWindow: Int = get(AUTOTUNE_SCAN_MAX_READ_WINDOW)
 

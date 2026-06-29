@@ -410,6 +410,10 @@ class GpuTaskMetrics extends Serializable with Logging {
 
   def getSemWaitTime(): Long = semWaitTimeNs.value.value
 
+  /** Total bytes spilled (host + disk) by this task. A pressure signal for the graph autotuner. */
+  def getSpillBytes: Long =
+    spillToHostBytes.value.value.longValue() + spillToDiskBytes.value.value.longValue()
+
   def semWaitTime[A](f: => A): A = timeIt(semWaitTimeNs, NvtxRegistry.ACQUIRE_GPU, f)
 
   def spillToHostTime[A](f: => A): A = {

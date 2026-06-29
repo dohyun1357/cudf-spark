@@ -20,7 +20,7 @@ import scala.collection.mutable
 
 private case class ActiveGpuAdmissionHint(
     var maxConcurrentTasks: Int,
-    var activeTasks: Int)
+    activeTasks: mutable.Set[Long])
 
 /**
  * Executor-local GPU admission controller driven by graph autotune hints.
@@ -33,11 +33,20 @@ private case class ActiveGpuAdmissionHint(
  * Conservatism by design: a key's cap only ratchets down for the life of its active window (until
  * its in-flight tasks drain). A newer hint that *raises* the cap is ignored while tasks admitted
  * under the stricter cap are still running, so admission never loosens out from under them.
+ *
+ * Active membership is tracked by `taskAttemptId`, not a bare counter, so a completion only ever
+ * releases a task that actually registered. This matters once hints can change mid-stage (the
+ * Slice-2 fetch TTL): a task that started under no hint (cap 0, never registered) must NOT release
+ * an entry created by a sibling task that started under a positive cap, or the runtime cap could
+ * loosen out from under a still-running capped task.
  */
 private[rapids] class RapidsAutotuneGpuAdmissionController(applyLimit: Int => Int) {
   private val activeHints = mutable.HashMap.empty[AutotuneStageKey, ActiveGpuAdmissionHint]
 
-  def taskStarted(key: AutotuneStageKey, cachedHint: AutotuneCachedHint): Int = synchronized {
+  def taskStarted(
+      key: AutotuneStageKey,
+      taskAttemptId: Long,
+      cachedHint: AutotuneCachedHint): Int = synchronized {
     val maxConcurrentTasks =
       if (cachedHint.hasHint) math.max(0, cachedHint.hint.gpu.maxConcurrentTasks) else 0
     if (maxConcurrentTasks > 0) {
@@ -45,9 +54,10 @@ private[rapids] class RapidsAutotuneGpuAdmissionController(applyLimit: Int => In
         case Some(active) =>
           // Ratchet to the tightest cap seen during this key's active window (see class doc).
           active.maxConcurrentTasks = math.min(active.maxConcurrentTasks, maxConcurrentTasks)
-          active.activeTasks += 1
+          active.activeTasks += taskAttemptId
         case None =>
-          activeHints.put(key, ActiveGpuAdmissionHint(maxConcurrentTasks, activeTasks = 1))
+          activeHints.put(key,
+            ActiveGpuAdmissionHint(maxConcurrentTasks, mutable.Set(taskAttemptId)))
       }
       applyCurrentLimit()
     } else {
@@ -55,15 +65,15 @@ private[rapids] class RapidsAutotuneGpuAdmissionController(applyLimit: Int => In
     }
   }
 
-  def taskCompleted(key: AutotuneStageKey): Int = synchronized {
+  def taskCompleted(key: AutotuneStageKey, taskAttemptId: Long): Int = synchronized {
     activeHints.get(key) match {
-      case Some(active) =>
-        active.activeTasks -= 1
-        if (active.activeTasks <= 0) {
+      // Only release a task that actually registered under a positive cap for this key.
+      case Some(active) if active.activeTasks.remove(taskAttemptId) =>
+        if (active.activeTasks.isEmpty) {
           activeHints.remove(key)
         }
         applyCurrentLimit()
-      case None =>
+      case _ =>
         currentLimit
     }
   }
@@ -93,10 +103,11 @@ object RapidsAutotuneGpuAdmission {
   private val controller =
     new RapidsAutotuneGpuAdmissionController(GpuSemaphore.setRuntimeMaxConcurrentGpuTasksLimit)
 
-  def taskStarted(key: AutotuneStageKey, cachedHint: AutotuneCachedHint): Int =
-    controller.taskStarted(key, cachedHint)
+  def taskStarted(key: AutotuneStageKey, taskAttemptId: Long, cachedHint: AutotuneCachedHint): Int =
+    controller.taskStarted(key, taskAttemptId, cachedHint)
 
-  def taskCompleted(key: AutotuneStageKey): Int = controller.taskCompleted(key)
+  def taskCompleted(key: AutotuneStageKey, taskAttemptId: Long): Int =
+    controller.taskCompleted(key, taskAttemptId)
 
   def reset(): Int = controller.reset()
 }

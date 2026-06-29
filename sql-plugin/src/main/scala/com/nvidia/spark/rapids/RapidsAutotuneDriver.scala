@@ -20,6 +20,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 import scala.util.Try
+import scala.util.control.NonFatal
 
 import org.apache.spark.SparkContext
 import org.apache.spark.internal.Logging
@@ -38,17 +39,58 @@ import org.apache.spark.sql.rapids.execution.TrampolineUtil
  */
 object RapidsAutotuneDriverEndpoint extends Logging {
   private val hints = new ConcurrentHashMap[AutotuneStageKey, StageRuntimeHint]()
+  // Cumulative per-stage aggregate -- feeds the eventlog observation record and `observationFor`.
+  // Monotonic by design (lifetime totals/high-water), so it is NOT the model's input.
   private val observations = new ConcurrentHashMap[AutotuneStageKey, StageObservationAgg]()
+  // Recent-window aggregate the closed-loop model actually consumes: it accumulates observations
+  // since the model last evaluated this key and is reset on consumption. A windowed view (rather
+  // than the cumulative one) is required so transient pressure does not latch -- otherwise a single
+  // spilled byte or host-memory high-water mark would pin the pressure signals forever and the AIMD
+  // restore could never fire.
+  private val modelWindows = new ConcurrentHashMap[AutotuneStageKey, StageObservationAgg]()
+  // Per-key debounce/cooldown timestamps for the closed-loop model (Slice 2). Separate from the
+  // hint map so the model's stateful oscillation controls do not leak into the wire hint.
+  private val modelTiming = new ConcurrentHashMap[AutotuneStageKey, ModelTiming]()
   private val nextHintVersion = new AtomicLong(1L)
 
   @volatile private var sparkContext: SparkContext = _
   @volatile private var enabled = false
+  // The closed-loop model only runs in GRAPH mode; OBSERVE/LOCAL never republish.
+  @volatile private var modelEnabled = false
+  @volatile private var caps: AutotuneModelCaps = AutotuneModelCaps(0, 0L, 0, Long.MaxValue)
+  @volatile private var updateIntervalNanos = 0L
+  @volatile private var cooldownNanos = 0L
+  // Injectable monotonic clock so the debounce/cooldown logic is deterministically testable.
+  @volatile private var nanoSource: () => Long = () => System.nanoTime()
+
+  /**
+   * Per-key model timing: when the model last evaluated the key (debounce) and when it last
+   * *lowered* a knob (cooldown). `lastDecreaseNanos == Long.MinValue` means "no decrease yet" and
+   * is checked before any subtraction so the cooldown comparison is safe even when the monotonic
+   * clock is negative.
+   */
+  private case class ModelTiming(lastEvalNanos: Long, lastDecreaseNanos: Long)
+
+  private val NoDecrease: Long = Long.MinValue
 
   def init(sc: SparkContext, conf: RapidsConf): Unit = synchronized {
     enabled = conf.autotuneGraphEnabled
+    modelEnabled = conf.isAutotuneGraphMode
     sparkContext = if (enabled) sc else null
+    caps = AutotuneModelCaps(
+      scanMaxReadWindow = conf.autotuneScanReadWindowCap,
+      scanMaxReadyBytes = conf.autotuneScanMaxReadyBytes,
+      gpuMaxConcurrentTasks = conf.autotuneGpuMaxConcurrentTasks,
+      minSampleTasks = conf.autotuneGraphMinSampleTasks.toLong)
+    updateIntervalNanos = conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L
+    // Cooldown after a decrease is two debounce intervals, so a knob is not raised the very next
+    // interval after it was lowered (anti-flap hysteresis).
+    cooldownNanos = updateIntervalNanos * 2L
+    nanoSource = () => System.nanoTime()
     hints.clear()
     observations.clear()
+    modelWindows.clear()
+    modelTiming.clear()
     nextHintVersion.set(1L)
     if (enabled) {
       logInfo(s"Initialized RAPIDS graph autotune driver endpoint in " +
@@ -58,10 +100,19 @@ object RapidsAutotuneDriverEndpoint extends Logging {
 
   def shutdown(): Unit = synchronized {
     enabled = false
+    modelEnabled = false
     sparkContext = null
+    nanoSource = () => System.nanoTime()
     hints.clear()
     observations.clear()
+    modelWindows.clear()
+    modelTiming.clear()
     nextHintVersion.set(1L)
+  }
+
+  /** Test-only: inject a deterministic monotonic clock for the debounce/cooldown logic. */
+  private[rapids] def setNanoSourceForTest(source: () => Long): Unit = synchronized {
+    nanoSource = source
   }
 
   def publishDefaultNoopHint(key: AutotuneStageKey): StageRuntimeHint = synchronized {
@@ -100,6 +151,31 @@ object RapidsAutotuneDriverEndpoint extends Logging {
         }
     }
   }
+
+  /**
+   * Republish an adjusted hint for a key, bumping its version so executors that re-fetch (after
+   * their cache TTL) see the newer hint. Unlike [[publishStageHint]] (first-publication-wins), this
+   * overwrites the existing entry -- it is the closed-loop model's update path. The supplied
+   * `content` carries the new knob values; this stamps a fresh version and keeps the stage-attempt
+   * expiry unchanged (`Long.MaxValue`), so the wire-level expiry semantics are untouched and the
+   * executor fetch-TTL is what drives pickup. Stays within the static caps by construction (the
+   * model never produces a value above them).
+   */
+  def republishStageHint(key: AutotuneStageKey, content: StageRuntimeHint): StageRuntimeHint =
+    synchronized {
+      if (!enabled) {
+        StageRuntimeHint.empty(key)
+      } else {
+        val hint = content.copy(
+          executionId = key.executionId,
+          stageId = key.stageId,
+          stageAttemptId = key.stageAttemptId,
+          version = nextHintVersion.getAndIncrement(),
+          expiresAtNanos = Long.MaxValue)
+        hints.put(key, hint)
+        hint
+      }
+    }
 
   def handleHintRequest(msg: RapidsAutotuneHintRequestMsg): RapidsAutotuneHintResponseMsg = {
     val hint = if (enabled) {
@@ -145,19 +221,84 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       batchMaxBatchBytes = msg.batch.maxBatchBytes,
       batchSplitUntilSize = msg.batch.splitUntilSize)
 
-  /** Ingest a runtime observation: update the per-stage aggregate and post an eventlog record. */
+  /**
+   * Ingest a runtime observation: update the per-stage aggregate, post an eventlog record, and (in
+   * GRAPH mode) run the closed-loop model, possibly republishing an adjusted hint for the stage.
+   */
   def handleObservation(msg: RapidsAutotuneObservationMsg): Unit = {
     if (!enabled) {
       return
     }
     val agg = observations.compute(msg.key, (_, prev) =>
       (if (prev == null) StageObservationAgg.empty else prev).merge(msg))
+    if (modelEnabled) {
+      modelWindows.compute(msg.key, (_, prev) =>
+        (if (prev == null) StageObservationAgg.empty else prev).merge(msg))
+    }
     if (sparkContext != null) {
       TrampolineUtil.postEvent(sparkContext, toObservationEvent(msg, agg))
     }
+    maybeRetune(msg.key)
   }
 
-  /** Current aggregated observations for a stage key, if any have been reported (model input). */
+  /**
+   * Closed-loop model trigger (Slice 2). Runs on the observation path -- no extra thread -- and is
+   * the only place that calls [[republishStageHint]]. Reads the RECENT-WINDOW aggregate (reset on
+   * consumption) so transient pressure does not latch. Stateful oscillation controls live here:
+   * a min-sample gate on the window, debounce (at most one evaluation per `updateIntervalNanos` per
+   * key), and cooldown after a decrease (an increase is suppressed for `cooldownNanos` after the
+   * last knob reduction). The model ([[AutotuneGraphModel.decide]]) contributes the stateless
+   * controls (per-step clamp, prefer-reduce) and only ever returns hints within the static caps.
+   *
+   * Fully guarded: a model exception is swallowed (advisory path) so it can never break observation
+   * handling for other stages or the driver RPC dispatcher.
+   */
+  private def maybeRetune(key: AutotuneStageKey): Unit = synchronized {
+    if (!modelEnabled) {
+      return
+    }
+    try {
+      val current = hints.get(key)
+      val window = modelWindows.get(key)
+      // No published hint to adjust, or not enough fresh samples in the window yet.
+      if (current == null || window == null || window.taskCount < caps.minSampleTasks) {
+        return
+      }
+      val now = nanoSource()
+      val timing = modelTiming.get(key)
+      // Debounce: at most one evaluation per interval per key.
+      if (timing != null && (now - timing.lastEvalNanos) < updateIntervalNanos) {
+        return
+      }
+      // Consume the window: reset it so the next evaluation sees only newer observations.
+      modelWindows.put(key, StageObservationAgg.empty)
+      val priorDecrease = if (timing != null) timing.lastDecreaseNanos else NoDecrease
+      var lastDecrease = priorDecrease
+      AutotuneGraphModel.decide(window, current, caps).foreach { decision =>
+        val inCooldown =
+          priorDecrease != NoDecrease && (now - priorDecrease) < cooldownNanos
+        // Decreases always allowed (subject to debounce); an increase waits out the cooldown.
+        if (decision.isDecrease || !inCooldown) {
+          val published = republishStageHint(key, decision.hint)
+          if (decision.isDecrease) {
+            lastDecrease = now
+          }
+          logDebug(s"RAPIDS graph autotune re-hinted stage ${key.stageId}.${key.stageAttemptId} " +
+            s"to version ${published.version} (decrease=${decision.isDecrease}), " +
+            s"scan ${published.scan}, GPU ${published.gpu}")
+        }
+      }
+      modelTiming.put(key, ModelTiming(now, lastDecrease))
+    } catch {
+      case NonFatal(e) =>
+        logWarning("RAPIDS graph autotune model evaluation failed; leaving hint unchanged", e)
+    }
+  }
+
+  /**
+   * Cumulative per-stage observation aggregate for a key (eventlog/inspection view). NOTE: this is
+   * the lifetime aggregate, not the recent window the closed-loop model consumes.
+   */
   def observationFor(key: AutotuneStageKey): Option[StageObservationAgg] =
     Option(observations.get(key))
 
@@ -176,7 +317,9 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       gpuHoldingNanos = msg.gpuHoldingNanos,
       hostMemoryBytes = msg.hostMemoryBytes,
       stageTaskCount = agg.taskCount,
-      stageMaxHostMemoryBytes = agg.maxHostMemoryBytes)
+      stageMaxHostMemoryBytes = agg.maxHostMemoryBytes,
+      spillBytes = msg.spillBytes,
+      stageTotalSpillBytes = agg.totalSpillBytes)
 }
 
 /**
@@ -187,12 +330,14 @@ case class StageObservationAgg(
     taskCount: Long,
     totalGpuSemaphoreWaitNanos: Long,
     totalGpuHoldingNanos: Long,
-    maxHostMemoryBytes: Long) {
+    maxHostMemoryBytes: Long,
+    totalSpillBytes: Long) {
   def merge(msg: RapidsAutotuneObservationMsg): StageObservationAgg = StageObservationAgg(
     taskCount = taskCount + 1L,
     totalGpuSemaphoreWaitNanos = totalGpuSemaphoreWaitNanos + msg.gpuSemaphoreWaitNanos,
     totalGpuHoldingNanos = totalGpuHoldingNanos + msg.gpuHoldingNanos,
-    maxHostMemoryBytes = math.max(maxHostMemoryBytes, msg.hostMemoryBytes))
+    maxHostMemoryBytes = math.max(maxHostMemoryBytes, msg.hostMemoryBytes),
+    totalSpillBytes = totalSpillBytes + msg.spillBytes)
 
   /**
    * GPU wait ratio = sum(semaphore wait) / sum(holding) across the stage's reported tasks -- a
@@ -207,7 +352,7 @@ case class StageObservationAgg(
 }
 
 object StageObservationAgg {
-  val empty: StageObservationAgg = StageObservationAgg(0L, 0L, 0L, 0L)
+  val empty: StageObservationAgg = StageObservationAgg(0L, 0L, 0L, 0L, 0L)
 }
 
 /**

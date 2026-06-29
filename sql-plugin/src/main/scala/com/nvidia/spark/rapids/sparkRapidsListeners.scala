@@ -87,5 +87,7 @@ case class SparkRapidsAutotuneObservationEvent(
   gpuHoldingNanos: Long,
   hostMemoryBytes: Long,
   stageTaskCount: Long,
-  stageMaxHostMemoryBytes: Long
+  stageMaxHostMemoryBytes: Long,
+  spillBytes: Long = 0L,
+  stageTotalSpillBytes: Long = 0L
 ) extends SparkListenerEvent
