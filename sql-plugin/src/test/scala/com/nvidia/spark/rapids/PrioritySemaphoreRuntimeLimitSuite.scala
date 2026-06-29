@@ -62,4 +62,33 @@ class PrioritySemaphoreRuntimeLimitSuite extends AnyFunSuite {
     semaphore.release(10)
     semaphore.release(10)
   }
+
+  test("runtime limit may exceed the static limit when allowAboveStatic (OPTIMIZE)") {
+    val semaphore = new TestPrioritySemaphore(100, 2) // static cap 2, ample permits
+
+    assert(semaphore.setRuntimeMaxConcurrentGpuTasksLimit(4, allowAboveStatic = true) == 4)
+    assert(semaphore.getEffectiveMaxConcurrentGpuTasksLimit == 4)
+
+    assert(semaphore.tryAcquire(10, 0, () => false, 0))
+    assert(semaphore.tryAcquire(10, 0, () => false, 1))
+    assert(semaphore.tryAcquire(10, 0, () => false, 2)) // above the static cap of 2 -> allowed
+    assert(semaphore.tryAcquire(10, 0, () => false, 3))
+    assert(!semaphore.tryAcquire(10, 0, () => false, 4)) // 5th blocked by the runtime task limit 4
+
+    (0 until 4).foreach(_ => semaphore.release(10))
+  }
+
+  test("permit pool still gates an above-static runtime limit (cannot OOM)") {
+    // Task-count limit raised well above static, but only 25 permits in the pool.
+    val semaphore = new TestPrioritySemaphore(25, 2)
+
+    assert(semaphore.setRuntimeMaxConcurrentGpuTasksLimit(8, allowAboveStatic = true) == 8)
+    assert(semaphore.tryAcquire(10, 0, () => false, 0)) // 10/25 permits used
+    assert(semaphore.tryAcquire(10, 0, () => false, 1)) // 20/25 permits used
+    // Task limit is 8, but a 3rd 10-permit task needs 30 > 25 -> blocked by PERMITS, not the cap.
+    assert(!semaphore.tryAcquire(10, 0, () => false, 2))
+
+    semaphore.release(10)
+    semaphore.release(10)
+  }
 }

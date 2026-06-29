@@ -33,6 +33,12 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
   private var occupiedSlots: Long = 0
   private var currentConcurrentGpuTasksNum: Long = 0
   private var runtimeMaxConcurrentGpuTasksLimit: Int = 0
+  // When true, the runtime cap may EXCEED the static `maxConcurrentGpuTasksLimit` (autotune
+  // OPTIMIZE mode). This is memory-safe by construction: `canAcquire` still gates every admission
+  // on the permit pool (`occupiedSlots + numPermits <= maxPermits`), so a higher task-count cap
+  // only lets more tasks attempt -- permits still throttle and cannot be exceeded. Default false
+  // keeps the historical tighten-only `min(static, runtime)` behavior.
+  private var runtimeMaxCanExceedStatic: Boolean = false
 
   private case class ThreadInfo(priority: T,
                                 condition: Condition,
@@ -128,10 +134,13 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
     }
   }
 
-  def setRuntimeMaxConcurrentGpuTasksLimit(maxTasks: Int): Int = {
+  def setRuntimeMaxConcurrentGpuTasksLimit(
+      maxTasks: Int,
+      allowAboveStatic: Boolean = false): Int = {
     lock.lock()
     try {
       runtimeMaxConcurrentGpuTasksLimit = math.max(0, maxTasks)
+      runtimeMaxCanExceedStatic = allowAboveStatic
       wakeEligibleWaiters()
       effectiveMaxConcurrentGpuTasksLimit
     } finally {
@@ -171,6 +180,9 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
     if (runtimeMaxConcurrentGpuTasksLimit <= 0) {
       maxConcurrentGpuTasksLimit
     } else if (maxConcurrentGpuTasksLimit <= 0) {
+      runtimeMaxConcurrentGpuTasksLimit
+    } else if (runtimeMaxCanExceedStatic) {
+      // OPTIMIZE: the runtime cap fully governs (may exceed static); the permit pool still gates.
       runtimeMaxConcurrentGpuTasksLimit
     } else {
       math.min(maxConcurrentGpuTasksLimit, runtimeMaxConcurrentGpuTasksLimit)

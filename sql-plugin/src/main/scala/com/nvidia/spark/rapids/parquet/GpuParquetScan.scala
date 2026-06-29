@@ -1179,8 +1179,10 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
         deprecatedVal
       }.getOrElse(rapidsConf.getMultithreadedReaderKeepOrder)
   protected val compressCfg = CpuCompressionConfig.forParquet(rapidsConf)
-  protected val graphScanHintsEnabled =
-    rapidsConf.autotuneGraphEnabled && rapidsConf.autotuneGraphMode == AutotuneGraphMode.GRAPH
+  // Consume driver scan-prefetch hints in any closed-loop mode (GRAPH or OPTIMIZE); the driver
+  // GraphScanHintPolicy publishes them in both. The hinted window stays bounded by the static
+  // read-window cap here -- above-static scan is a later slice.
+  protected val graphScanHintsEnabled = rapidsConf.isAutotuneClosedLoopMode
   protected val graphScanReadWindowCap = rapidsConf.autotuneScanReadWindowCap
 
   protected def currentGraphScanHint: Option[ScanRuntimeHint] = {

@@ -252,12 +252,14 @@ object GpuSemaphore {
     }
   }
 
-  def setRuntimeMaxConcurrentGpuTasksLimit(maxTasks: Int): Int = {
+  def setRuntimeMaxConcurrentGpuTasksLimit(
+      maxTasks: Int,
+      allowAboveStatic: Boolean = false): Int = {
     val current = instance
     if (current == null) {
       0
     } else {
-      current.setRuntimeMaxConcurrentGpuTasksLimit(maxTasks)
+      current.setRuntimeMaxConcurrentGpuTasksLimit(maxTasks, allowAboveStatic)
     }
   }
 
@@ -618,8 +620,10 @@ private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int) extends Lo
     }
   }
 
-  def setRuntimeMaxConcurrentGpuTasksLimit(maxTasks: Int): Int = {
-    semaphore.setRuntimeMaxConcurrentGpuTasksLimit(maxTasks)
+  def setRuntimeMaxConcurrentGpuTasksLimit(
+      maxTasks: Int,
+      allowAboveStatic: Boolean = false): Int = {
+    semaphore.setRuntimeMaxConcurrentGpuTasksLimit(maxTasks, allowAboveStatic)
   }
 
   def completeTask(context: TaskContext): Unit = {

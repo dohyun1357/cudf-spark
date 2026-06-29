@@ -1016,4 +1016,73 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Slice 3a: OPTIMIZE mode -- above-static GPU concurrency
+  // ---------------------------------------------------------------------------
+
+  // ceiling 8 (> static start of 4), optimizeGpu = aggressive above-static raise gate.
+  private val optimizeCaps = AutotuneModelCaps(
+    scanMaxReadWindow = 8, scanMaxReadyBytes = 1000L, gpuMaxConcurrentTasks = 8,
+    minSampleTasks = 2L, optimizeGpu = true)
+
+  test("OPTIMIZE: model raises the GPU cap above static toward the optimize ceiling") {
+    val relaxed = agg(tasks = 50L, wait = 1L, hold = 100L, host = 0L, spill = 0L) // ratio 0.01
+    val d = AutotuneGraphModel.decide(relaxed, stageHint(0, 4), optimizeCaps).get
+    assert(!d.isDecrease)
+    assert(d.hint.gpu.maxConcurrentTasks == 5)  // 4 (== static) -> 5, above static, toward ceiling
+    // At the ceiling -> no further raise.
+    assert(AutotuneGraphModel.decide(relaxed, stageHint(0, 8), optimizeCaps).isEmpty)
+  }
+
+  test("OPTIMIZE: GPU raise is decoupled from host-memory pressure") {
+    // Host pressure present (950 >= 0.9*1000) but GPU uncontended, no spill. GRAPH would block the
+    // GPU restore; OPTIMIZE raises GPU anyway (host memory bounds the scan window, not GPU).
+    val obs = agg(tasks = 50L, wait = 1L, hold = 100L, host = 950L, spill = 0L)
+    val d = AutotuneGraphModel.decide(obs, stageHint(0, 4), optimizeCaps).get
+    assert(!d.isDecrease && d.hint.gpu.maxConcurrentTasks == 5)
+  }
+
+  test("OPTIMIZE: model backs off the GPU cap on contention or spill") {
+    val contended = agg(tasks = 50L, wait = 1000L, hold = 100L, host = 0L, spill = 0L) // ratio 10
+    val d1 = AutotuneGraphModel.decide(contended, stageHint(0, 6), optimizeCaps).get
+    assert(d1.isDecrease && d1.hint.gpu.maxConcurrentTasks == 3) // 6 -> 3
+    val spilling = agg(tasks = 50L, wait = 1L, hold = 100L, host = 0L, spill = 1L)
+    val d2 = AutotuneGraphModel.decide(spilling, stageHint(0, 6), optimizeCaps).get
+    assert(d2.isDecrease && d2.hint.gpu.maxConcurrentTasks == 3) // spill forces back-off
+  }
+
+  test("driver OPTIMIZE loop raises the GPU cap above the static cap") {
+    val conf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
+      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",          // starting cap (== static)
+      RapidsConf.AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS.key -> "8", // above-static ceiling
+      RapidsConf.AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS.key -> "2",
+      RapidsConf.AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS.key -> "0"))
+    RapidsAutotuneDriverEndpoint.init(null, conf)
+    try {
+      val listener = new RapidsAutotuneStageHintListener(conf)
+      val shape =
+        AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 50)
+      val initial = listener.publishHintForStage(
+        key.executionId, key.stageId, key.stageAttemptId, shape)
+      assert(initial.gpu.maxConcurrentTasks == 4) // starts at the static cap
+
+      // Low-wait, no-spill observations -> the model raises the GPU cap ABOVE static toward 8.
+      def feed(n: Int): Unit = (1 to n).foreach(_ =>
+        RapidsAutotuneDriverEndpoint.handleObservation(RapidsAutotuneObservationMsg(
+          "exec-1", key, 1L, 0, 1L, gpuSemaphoreWaitNanos = 1L, gpuHoldingNanos = 100L,
+          hostMemoryBytes = 0L, spillBytes = 0L)))
+      def served = RapidsAutotuneDriverEndpoint.handleHintRequest(
+        RapidsAutotuneHintRequestMsg("exec-1", key)).hint.get
+
+      feed(2)
+      assert(served.gpu.maxConcurrentTasks == 5) // 4 -> 5, above the static cap of 4
+      feed(2)
+      assert(served.gpu.maxConcurrentTasks == 6) // 5 -> 6, still climbing toward the ceiling
+    } finally {
+      RapidsAutotuneDriverEndpoint.shutdown()
+    }
+  }
 }

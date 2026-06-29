@@ -93,11 +93,14 @@ class RapidsAutotuneExecutorEndpoint(
     conf: RapidsConf) extends Logging {
   private val executorId = pluginContext.executorID()
   private val failOpen = conf.autotuneFailOpen
-  // Only GRAPH mode republishes hints mid-query, so only there does the cache need a refresh TTL;
-  // OBSERVE/LOCAL keep the pre-Slice-2 "refresh on expiry only" behavior (TTL disabled).
+  // Only the closed-loop modes (GRAPH, OPTIMIZE) republish hints mid-query, so only there does the
+  // cache need a refresh TTL; OBSERVE/LOCAL keep the pre-Slice-2 "refresh on expiry only" behavior.
   private val fetchTtlNanos =
-    if (conf.isAutotuneGraphMode) conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L else 0L
+    if (conf.isAutotuneClosedLoopMode) conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L else 0L
   private val cache = new AutotuneHintCache(fetchHintFromDriver, fetchTtlNanos)
+
+  // OPTIMIZE mode is the only mode in which the runtime GPU cap may exceed the static cap.
+  RapidsAutotuneGpuAdmission.setAllowAboveStatic(conf.isAutotuneOptimizeMode)
 
   def hintFor(key: AutotuneStageKey): AutotuneCachedHint = cache.get(key)
 

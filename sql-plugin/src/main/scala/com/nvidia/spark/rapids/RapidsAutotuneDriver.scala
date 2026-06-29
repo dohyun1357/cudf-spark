@@ -75,13 +75,22 @@ object RapidsAutotuneDriverEndpoint extends Logging {
 
   def init(sc: SparkContext, conf: RapidsConf): Unit = synchronized {
     enabled = conf.autotuneGraphEnabled
-    modelEnabled = conf.isAutotuneGraphMode
+    modelEnabled = conf.isAutotuneClosedLoopMode
     sparkContext = if (enabled) sc else null
+    // GPU ceiling the model may raise toward. GRAPH bounds it at the static autotune cap; OPTIMIZE
+    // raises it to the (higher) OPTIMIZE ceiling, so above-static increase is gated on a config the
+    // operator set. If the OPTIMIZE ceiling is unset (0) it degrades to the static cap.
+    val gpuCeiling = if (conf.isAutotuneOptimizeMode) {
+      math.max(conf.autotuneGpuMaxConcurrentTasks, conf.autotuneOptimizeGpuMaxConcurrentTasks)
+    } else {
+      conf.autotuneGpuMaxConcurrentTasks
+    }
     caps = AutotuneModelCaps(
       scanMaxReadWindow = conf.autotuneScanReadWindowCap,
       scanMaxReadyBytes = conf.autotuneScanMaxReadyBytes,
-      gpuMaxConcurrentTasks = conf.autotuneGpuMaxConcurrentTasks,
-      minSampleTasks = conf.autotuneGraphMinSampleTasks.toLong)
+      gpuMaxConcurrentTasks = gpuCeiling,
+      minSampleTasks = conf.autotuneGraphMinSampleTasks.toLong,
+      optimizeGpu = conf.isAutotuneOptimizeMode)
     updateIntervalNanos = conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L
     // Cooldown after a decrease is two debounce intervals, so a knob is not raised the very next
     // interval after it was lowered (anti-flap hysteresis).
@@ -420,7 +429,8 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
 
 /**
  * Driver policy that emits a bounded scan-prefetch hint for stages classified as scan-prefetch
- * candidates, only in GRAPH mode. The hinted window never exceeds the static read-window cap.
+ * candidates, in the closed-loop modes (GRAPH or OPTIMIZE). The hinted window never exceeds the
+ * static read-window cap (above-static scan is a later slice).
  */
 case class GraphScanHintPolicy(
     enabled: Boolean,
@@ -442,16 +452,17 @@ case class GraphScanHintPolicy(
 object GraphScanHintPolicy {
   def fromConf(conf: RapidsConf): GraphScanHintPolicy = {
     GraphScanHintPolicy(
-      enabled = conf.autotuneGraphEnabled && conf.autotuneGraphMode == AutotuneGraphMode.GRAPH,
+      enabled = conf.isAutotuneClosedLoopMode,
       maxReadWindow = conf.autotuneScanReadWindowCap,
       maxReadyBytes = conf.autotuneScanMaxReadyBytes)
   }
 }
 
 /**
- * Driver policy that emits a GPU admission hint (a per-stage max-concurrent-tasks cap), only in
- * GRAPH mode and only when a positive cap is configured. The executor admission controller can
- * only tighten the static GPU concurrency limit with it.
+ * Driver policy that emits a GPU admission hint (a per-stage max-concurrent-tasks cap), in the
+ * closed-loop modes (GRAPH or OPTIMIZE) and only when a positive cap is configured. In GRAPH the
+ * executor admission controller can only tighten the static GPU concurrency limit; in OPTIMIZE the
+ * model may raise it above static (the semaphore permit pool remains the hard memory bound).
  */
 case class GraphGpuHintPolicy(
     enabled: Boolean,
@@ -468,16 +479,15 @@ case class GraphGpuHintPolicy(
 object GraphGpuHintPolicy {
   def fromConf(conf: RapidsConf): GraphGpuHintPolicy = {
     GraphGpuHintPolicy(
-      enabled = conf.autotuneGraphEnabled && conf.autotuneGraphMode == AutotuneGraphMode.GRAPH,
+      enabled = conf.isAutotuneClosedLoopMode,
       maxConcurrentTasks = conf.autotuneGpuMaxConcurrentTasks)
   }
 }
 
 /**
- * Driver policy that emits a shuffle read/coalesce hint for shuffle-bearing stages, only in GRAPH
- * mode and only when explicitly enabled. The hint is currently observe-only: it is published and
- * recorded in the eventlog but no shuffle reader/coalesce actuator consumes it yet, so it never
- * changes execution. Default-off (the enable flag) keeps the published hint empty.
+ * Driver policy that emits a shuffle read/coalesce hint for shuffle-bearing stages, in the
+ * closed-loop modes (GRAPH or OPTIMIZE) and only when explicitly enabled. Default-off (the enable
+ * flag) keeps the published hint empty.
  */
 case class GraphShuffleHintPolicy(
     enabled: Boolean,
@@ -499,8 +509,7 @@ case class GraphShuffleHintPolicy(
 object GraphShuffleHintPolicy {
   def fromConf(conf: RapidsConf): GraphShuffleHintPolicy = {
     GraphShuffleHintPolicy(
-      enabled = conf.autotuneGraphEnabled && conf.autotuneGraphMode == AutotuneGraphMode.GRAPH &&
-        conf.autotuneShuffleEnabled,
+      enabled = conf.isAutotuneClosedLoopMode && conf.autotuneShuffleEnabled,
       maxPrefetchWindow = conf.autotuneShuffleMaxPrefetchWindow,
       maxReadyBytes = conf.autotuneShuffleMaxReadyBytes,
       coalesceTargetBytes = conf.autotuneShuffleCoalesceTargetBytes)
@@ -508,9 +517,9 @@ object GraphShuffleHintPolicy {
 }
 
 /**
- * Driver policy that emits a batch-sizing hint for stages doing GPU work, only in GRAPH mode and
- * only when explicitly enabled. Observe-only like [[GraphShuffleHintPolicy]]: no coalesce/batch
- * actuator consumes it yet, so it never changes execution. Default-off keeps the hint empty.
+ * Driver policy that emits a batch-sizing hint for stages doing GPU work, in the closed-loop modes
+ * (GRAPH or OPTIMIZE) and only when explicitly enabled. Observe-only: no coalesce/batch actuator
+ * consumes it yet, so it never changes execution. Default-off keeps the hint empty.
  */
 case class GraphBatchHintPolicy(
     enabled: Boolean,
@@ -532,8 +541,7 @@ case class GraphBatchHintPolicy(
 object GraphBatchHintPolicy {
   def fromConf(conf: RapidsConf): GraphBatchHintPolicy = {
     GraphBatchHintPolicy(
-      enabled = conf.autotuneGraphEnabled && conf.autotuneGraphMode == AutotuneGraphMode.GRAPH &&
-        conf.autotuneBatchEnabled,
+      enabled = conf.isAutotuneClosedLoopMode && conf.autotuneBatchEnabled,
       targetBatchBytes = conf.autotuneBatchTargetBytes,
       maxBatchBytes = conf.autotuneBatchMaxBytes,
       splitUntilSize = conf.autotuneBatchSplitUntilSize)

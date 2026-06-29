@@ -28,12 +28,18 @@ package com.nvidia.spark.rapids
  *                               hint was published at); restores never exceed it.
  * @param minSampleTasks         minimum reported-task observations for a stage before the model
  *                               acts (hysteresis: do not retune on a handful of noisy samples).
+ * @param optimizeGpu            OPTIMIZE mode: the GPU cap may be raised ABOVE static (up to
+ *                               `gpuMaxConcurrentTasks`, which is then the higher OPTIMIZE ceiling)
+ *                               using an aggressive raise gate decoupled from host-memory pressure.
+ *                               When false (GRAPH) the GPU restore stays bounded by the static cap
+ *                               and coupled to the global "no pressure" gate.
  */
 case class AutotuneModelCaps(
     scanMaxReadWindow: Int,
     scanMaxReadyBytes: Long,
     gpuMaxConcurrentTasks: Int,
-    minSampleTasks: Long)
+    minSampleTasks: Long,
+    optimizeGpu: Boolean = false)
 
 /**
  * A model decision: the updated stage hint content plus whether it lowered any knob. `isDecrease`
@@ -89,10 +95,17 @@ object AutotuneGraphModel {
         (caps.scanMaxReadyBytes <= 0L ||
           obs.maxHostMemoryBytes.toDouble <= caps.scanMaxReadyBytes.toDouble * HostLowFraction)
 
+      // GPU raise gate. GRAPH: coupled to the global relaxed gate, bounded by the static cap.
+      // OPTIMIZE: aggressive AIMD-up decoupled from host-memory pressure (host memory bounds the
+      // scan window, not GPU concurrency) -- raise toward the OPTIMIZE ceiling whenever the GPU is
+      // not contended and there is no spill. The permit pool remains the hard memory backstop.
+      val gpuRaiseGate =
+        if (caps.optimizeGpu) !spillPressure && obs.gpuWaitRatio <= GpuWaitRatioLow else relaxed
+
       val (newScan, scanDown) =
         decideScan(current.scan, caps, reduce = hostPressure || spillPressure, restore = relaxed)
       val (newGpu, gpuDown) =
-        decideGpu(current.gpu, caps, reduce = gpuPressure || spillPressure, restore = relaxed)
+        decideGpu(current.gpu, caps, reduce = gpuPressure || spillPressure, restore = gpuRaiseGate)
 
       if (newScan == current.scan && newGpu == current.gpu) {
         None

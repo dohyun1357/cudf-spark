@@ -100,8 +100,19 @@ private[rapids] class RapidsAutotuneGpuAdmissionController(applyLimit: Int => In
  * cap. `reset()` is called on plugin shutdown to drop the runtime cap back to the static limit.
  */
 object RapidsAutotuneGpuAdmission {
-  private val controller =
-    new RapidsAutotuneGpuAdmissionController(GpuSemaphore.setRuntimeMaxConcurrentGpuTasksLimit)
+  // OPTIMIZE mode lets the runtime GPU cap EXCEED the static `concurrentGpuTasks` limit; this is
+  // memory-safe because the GpuSemaphore permit pool still gates every admission (see
+  // PrioritySemaphore.canAcquire). Set per-executor from the autotune mode and read when the
+  // controller pushes the limit into the semaphore. Other modes leave it false (tighten-only).
+  @volatile private var allowAboveStatic: Boolean = false
+
+  private val controller = new RapidsAutotuneGpuAdmissionController(
+    limit => GpuSemaphore.setRuntimeMaxConcurrentGpuTasksLimit(limit, allowAboveStatic))
+
+  /** Set whether the runtime cap may exceed the static cap (true only in OPTIMIZE mode). */
+  def setAllowAboveStatic(allow: Boolean): Unit = {
+    allowAboveStatic = allow
+  }
 
   def taskStarted(key: AutotuneStageKey, taskAttemptId: Long, cachedHint: AutotuneCachedHint): Int =
     controller.taskStarted(key, taskAttemptId, cachedHint)
@@ -109,5 +120,8 @@ object RapidsAutotuneGpuAdmission {
   def taskCompleted(key: AutotuneStageKey, taskAttemptId: Long): Int =
     controller.taskCompleted(key, taskAttemptId)
 
-  def reset(): Int = controller.reset()
+  def reset(): Int = {
+    allowAboveStatic = false
+    controller.reset()
+  }
 }

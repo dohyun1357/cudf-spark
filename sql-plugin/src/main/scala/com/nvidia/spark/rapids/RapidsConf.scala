@@ -328,7 +328,10 @@ object AutotuneGraphMode extends Enumeration {
   type AutotuneGraphMode = Value
   // OBSERVE is intentionally inert (telemetry only) and is the documented default; the feature is
   // turned off entirely via autotune.graph.enabled=false. LOCAL/GRAPH activate the controllers.
-  val OBSERVE, LOCAL, GRAPH = Value
+  // GRAPH keeps every runtime knob <= its static cap. OPTIMIZE additionally lets the closed-loop
+  // model raise knobs ABOVE the static cap, bounded by the hard memory-safety envelope (the GPU
+  // semaphore's allocFraction-sized permit pool); it is the "autotuner owns the perf knobs" switch.
+  val OBSERVE, LOCAL, GRAPH, OPTIMIZE = Value
 }
 
 object RapidsConf extends Logging {
@@ -1876,7 +1879,9 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .doc("Autotuning mode. OBSERVE is the default no-op/telemetry mode: it emits applied-hint " +
         "eventlog records and publishes only empty (no-op) stage hints, leaving execution " +
         "unchanged. LOCAL enables executor-local controllers under static caps. GRAPH enables " +
-        "driver-published graph hints (scan prefetch and GPU admission).")
+        "driver-published graph hints (scan prefetch and GPU admission), every knob bounded by " +
+        "its static cap. OPTIMIZE additionally lets the closed-loop model raise GPU concurrency " +
+        "ABOVE the static cap, bounded by the GPU semaphore memory-permit pool.")
       .stringConf
       .transform(_.toUpperCase(java.util.Locale.ROOT))
       .checkValues(AutotuneGraphMode.values.map(_.toString))
@@ -1928,6 +1933,18 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .integerConf
       .checkValue(v => v >= 0,
         "The autotune GPU max concurrent tasks value must be non-negative.")
+      .createWithDefault(0)
+
+  val AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS =
+    conf("spark.rapids.sql.autotune.optimize.gpu.maxConcurrentTasks")
+      .doc("OPTIMIZE-mode ceiling the closed-loop model may raise the GPU admission cap to, " +
+        s"ABOVE the static '${MAX_CONCURRENT_GPU_TASKS.key}'. Only used in OPTIMIZE mode, only " +
+        s"when above '${AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key}'. Raising the cap cannot " +
+        "OOM: the GPU semaphore memory-permit pool (sized by gpu.allocFraction at startup) gates " +
+        "every admission regardless of the task-count cap. 0 (default) means no increase.")
+      .integerConf
+      .checkValue(v => v >= 0,
+        "The autotune optimize GPU max concurrent tasks value must be non-negative.")
       .createWithDefault(0)
 
   val AUTOTUNE_FAIL_OPEN =
@@ -3974,9 +3991,20 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val isAutotuneLocalMode: Boolean =
     autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.LOCAL
 
-  /** True when the driver should run the closed-loop model and republish hints (GRAPH mode). */
+  /** True in GRAPH mode (driver graph hints, every knob bounded by its static cap). */
   lazy val isAutotuneGraphMode: Boolean =
     autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.GRAPH
+
+  /** True in OPTIMIZE mode (GRAPH behavior plus above-static GPU concurrency increase). */
+  lazy val isAutotuneOptimizeMode: Boolean =
+    autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.OPTIMIZE
+
+  /**
+   * True when the driver should run the closed-loop model and republish hints, and the executor
+   * hint cache should refresh on a TTL. Both GRAPH and OPTIMIZE drive the loop; they differ only in
+   * whether a knob may exceed its static cap (OPTIMIZE) or not (GRAPH).
+   */
+  lazy val isAutotuneClosedLoopMode: Boolean = isAutotuneGraphMode || isAutotuneOptimizeMode
 
   lazy val autotuneGraphMinSampleTasks: Int = get(AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS)
 
@@ -3996,13 +4024,16 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val autotuneGpuMaxConcurrentTasks: Int = get(AUTOTUNE_GPU_MAX_CONCURRENT_TASKS)
 
+  lazy val autotuneOptimizeGpuMaxConcurrentTasks: Int =
+    get(AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS)
+
   lazy val autotuneFailOpen: Boolean = get(AUTOTUNE_FAIL_OPEN)
 
   lazy val autotuneShuffleEnabled: Boolean = get(AUTOTUNE_SHUFFLE_ENABLED)
 
-  /** True when the executor should consume graph-mode shuffle hints (mirrors the driver policy). */
+  /** True when the executor should consume graph shuffle hints (mirrors the driver policy). */
   lazy val isAutotuneGraphShuffleEnabled: Boolean =
-    autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.GRAPH && autotuneShuffleEnabled
+    isAutotuneClosedLoopMode && autotuneShuffleEnabled
 
   lazy val autotuneShuffleMaxPrefetchWindow: Int = get(AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW)
 
