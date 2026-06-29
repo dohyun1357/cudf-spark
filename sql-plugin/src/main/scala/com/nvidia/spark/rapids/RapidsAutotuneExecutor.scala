@@ -134,7 +134,7 @@ class RapidsAutotuneExecutorEndpoint(
 
   /**
    * Report a runtime observation for a completed task back to the driver (fire-and-forget). Feeds
-   * the driver closed-loop model; advisory, so a dropped report never affects correctness.
+   * the driver graph optimizer; advisory, so a dropped report never affects correctness.
    */
   def reportObservation(
       key: AutotuneStageKey,
@@ -144,7 +144,19 @@ class RapidsAutotuneExecutorEndpoint(
       gpuSemaphoreWaitNanos: Long,
       gpuHoldingNanos: Long,
       hostMemoryBytes: Long,
-      spillBytes: Long): Unit = {
+      spillBytes: Long,
+      shuffleReadLimiterAcquireCount: Long = 0L,
+      shuffleReadLimiterAcquireFailCount: Long = 0L,
+      taskDurationNanos: Long = 0L,
+      inputBytes: Long = 0L,
+      outputBytes: Long = 0L,
+      shuffleReadBytes: Long = 0L,
+      shuffleWriteBytes: Long = 0L,
+      inputRows: Long = 0L,
+      outputRows: Long = 0L,
+      pinnedMemoryBytes: Long = 0L,
+      deviceMemoryBytes: Long = 0L,
+      retryOrLostTimeNanos: Long = 0L): Unit = {
     try {
       pluginContext.send(RapidsAutotuneObservationMsg(
         executorId = executorId,
@@ -155,7 +167,19 @@ class RapidsAutotuneExecutorEndpoint(
         gpuSemaphoreWaitNanos = gpuSemaphoreWaitNanos,
         gpuHoldingNanos = gpuHoldingNanos,
         hostMemoryBytes = hostMemoryBytes,
-        spillBytes = spillBytes))
+        spillBytes = spillBytes,
+        shuffleReadLimiterAcquireCount = shuffleReadLimiterAcquireCount,
+        shuffleReadLimiterAcquireFailCount = shuffleReadLimiterAcquireFailCount,
+        taskDurationNanos = taskDurationNanos,
+        inputBytes = inputBytes,
+        outputBytes = outputBytes,
+        shuffleReadBytes = shuffleReadBytes,
+        shuffleWriteBytes = shuffleWriteBytes,
+        inputRows = inputRows,
+        outputRows = outputRows,
+        pinnedMemoryBytes = pinnedMemoryBytes,
+        deviceMemoryBytes = deviceMemoryBytes,
+        retryOrLostTimeNanos = retryOrLostTimeNanos))
     } catch {
       case NonFatal(e) if failOpen =>
         logWarning("Failed to report RAPIDS graph autotune observation; continuing", e)

@@ -914,6 +914,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
     if (endpoint == null) {
       return
     }
+    val taskStartNanos = System.nanoTime()
     val executionId = Option(taskCtx.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
       .flatMap(v => Try(v.toLong).toOption)
     executionId.foreach { id =>
@@ -932,12 +933,17 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
         taskCtx.partitionId(),
         hint,
         gpuAppliedMaxConcurrentTasks)
-      // Report a runtime observation at task completion to feed the driver closed-loop model.
+      // Report raw work/resource observations at task completion to feed the driver optimizer.
       // Fully fail-open: a completion listener that threw could fail the task, so reading the
       // metrics and reporting must never propagate an exception.
       onTaskCompletion(taskCtx, _ => {
         try {
           val taskMetrics = GpuTaskMetrics.get
+          val sparkMetrics = taskCtx.taskMetrics()
+          val inputMetrics = sparkMetrics.inputMetrics
+          val outputMetrics = sparkMetrics.outputMetrics
+          val shuffleReadMetrics = sparkMetrics.shuffleReadMetrics
+          val shuffleWriteMetrics = sparkMetrics.shuffleWriteMetrics
           endpoint.reportObservation(
             key,
             taskCtx.taskAttemptId(),
@@ -946,7 +952,19 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
             taskMetrics.getSemWaitTime(),
             taskMetrics.getSemaphoreHoldingTime,
             taskMetrics.getMaxHostBytesAllocated,
-            taskMetrics.getSpillBytes)
+            taskMetrics.getSpillBytes,
+            taskMetrics.getShuffleReadLimiterAcquireCount,
+            taskMetrics.getShuffleReadLimiterAcquireFailCount,
+            taskDurationNanos = math.max(0L, System.nanoTime() - taskStartNanos),
+            inputBytes = inputMetrics.bytesRead + shuffleReadMetrics.totalBytesRead,
+            outputBytes = outputMetrics.bytesWritten + shuffleWriteMetrics.bytesWritten,
+            shuffleReadBytes = shuffleReadMetrics.totalBytesRead,
+            shuffleWriteBytes = shuffleWriteMetrics.bytesWritten,
+            inputRows = inputMetrics.recordsRead,
+            outputRows = outputMetrics.recordsWritten,
+            pinnedMemoryBytes = taskMetrics.getMaxPinnedBytesAllocated,
+            deviceMemoryBytes = taskMetrics.getMaxDeviceMemoryBytes,
+            retryOrLostTimeNanos = taskMetrics.getRetryOrLostTimeNanos)
         } catch {
           case scala.util.control.NonFatal(e) =>
             logWarning("Failed to record RAPIDS graph autotune observation; continuing", e)

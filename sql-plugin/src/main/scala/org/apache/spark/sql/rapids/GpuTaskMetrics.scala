@@ -294,6 +294,12 @@ class GpuTaskMetrics extends Serializable with Logging {
 
   private var maxDiskBytesAllocated: Long = 0
 
+  // Slice 3c graph-autotune signal. The multithreaded shuffle reader captures this task's
+  // GpuTaskMetrics instance before dispatching background work, so worker threads can safely
+  // update these counters without depending on a TaskContext ThreadLocal.
+  private val shuffleReadLimiterAcquireCount = new AtomicLong(0L)
+  private val shuffleReadLimiterAcquireFailCount = new AtomicLong(0L)
+
   def getDiskBytesAllocated: Long = GpuTaskMetrics.diskBytesAllocated.get()
 
   def getMaxDiskBytesAllocated: Long = maxDiskBytesAllocated
@@ -301,6 +307,10 @@ class GpuTaskMetrics extends Serializable with Logging {
   def getHostBytesAllocated: Long = GpuTaskMetrics.hostBytesAllocated.get()
 
   def getMaxHostBytesAllocated: Long = maxHostBytesAllocated
+
+  def getMaxPinnedBytesAllocated: Long = maxPinnedBytesAllocated
+
+  def getMaxDeviceMemoryBytes: Long = maxDeviceMemoryBytes.value.value.longValue()
 
   def incHostBytesAllocated(bytes: Long, isPinned: Boolean): Unit = {
     GpuTaskMetrics.incHostBytesAllocated(bytes, isPinned)
@@ -326,6 +336,17 @@ class GpuTaskMetrics extends Serializable with Logging {
   def decDiskBytesAllocated(bytes: Long): Unit = {
     GpuTaskMetrics.decDiskBytesAllocated(bytes)
   }
+
+  def recordShuffleReadLimiterAcquire(didFit: Boolean): Unit = {
+    shuffleReadLimiterAcquireCount.incrementAndGet()
+    if (!didFit) {
+      shuffleReadLimiterAcquireFailCount.incrementAndGet()
+    }
+  }
+
+  def getShuffleReadLimiterAcquireCount: Long = shuffleReadLimiterAcquireCount.get()
+
+  def getShuffleReadLimiterAcquireFailCount: Long = shuffleReadLimiterAcquireFailCount.get()
 
   private val metrics = Map[String, AccumulatorV2[_, _]](
     "gpuTime" -> semaphoreHoldingTime,
@@ -413,6 +434,10 @@ class GpuTaskMetrics extends Serializable with Logging {
   /** Total bytes spilled (host + disk) by this task. A pressure signal for the graph autotuner. */
   def getSpillBytes: Long =
     spillToHostBytes.value.value.longValue() + spillToDiskBytes.value.value.longValue()
+
+  /** GPU retry blocking plus recomputation time observed for this task. */
+  def getRetryOrLostTimeNanos: Long =
+    retryBlockTime.value.value.longValue() + retryComputationTime.value.value.longValue()
 
   def semWaitTime[A](f: => A): A = timeIt(semWaitTimeNs, NvtxRegistry.ACQUIRE_GPU, f)
 

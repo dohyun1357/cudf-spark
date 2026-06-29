@@ -155,4 +155,22 @@ case class RapidsAutotuneObservationMsg(
     // Total bytes spilled (host + disk) by the task. A spill pressure signal for the closed-loop
     // model: when positive, the model reduces a knob (read window / GPU concurrency) to relieve
     // memory pressure. Defaulted so older positional constructions keep compiling.
-    spillBytes: Long = 0L)
+    spillBytes: Long = 0L,
+    // Multithreaded shuffle-reader limiter attempts/failures for this task. A failure means the
+    // current bytes-in-flight bound deferred useful read/deserialization work. Defaults preserve
+    // wire construction compatibility for callers that predate Slice 3c.
+    shuffleReadLimiterAcquireCount: Long = 0L,
+    shuffleReadLimiterAcquireFailCount: Long = 0L,
+    // Work and elapsed-time measurements used by the graph optimizer's stage cost model. These
+    // are deliberately raw observations, not preclassified "pressure" booleans: the optimizer
+    // evaluates the complete joint hint against one critical-path objective.
+    taskDurationNanos: Long = 0L,
+    inputBytes: Long = 0L,
+    outputBytes: Long = 0L,
+    shuffleReadBytes: Long = 0L,
+    shuffleWriteBytes: Long = 0L,
+    inputRows: Long = 0L,
+    outputRows: Long = 0L,
+    pinnedMemoryBytes: Long = 0L,
+    deviceMemoryBytes: Long = 0L,
+    retryOrLostTimeNanos: Long = 0L)

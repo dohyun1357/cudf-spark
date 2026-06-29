@@ -56,7 +56,7 @@ object AutotuneStageShape {
     "GpuHashJoin")
 
   // Scopes that mark a stage as shuffle-bearing: a shuffled join or a shuffle-read coalesce on the
-  // read side, or a columnar exchange on the write side. Used to pick stages for (observe-only)
+  // read side, or a columnar exchange on the write side. Used to pick stages for optimizer-owned
   // shuffle/batch hints; "GpuShuffled" overlaps with GpuConsumerPrefixes by design.
   private val GpuShufflePrefixes = Seq(
     "GpuShuffled",
