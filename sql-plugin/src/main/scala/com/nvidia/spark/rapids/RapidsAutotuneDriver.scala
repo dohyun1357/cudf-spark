@@ -19,15 +19,17 @@ package com.nvidia.spark.rapids
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
+import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.util.Try
 import scala.util.control.NonFatal
 
 import org.apache.spark.SparkContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart, SparkListenerStageCompleted,
-  SparkListenerStageSubmitted}
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent, SparkListenerJobStart,
+  SparkListenerStageCompleted, SparkListenerStageSubmitted}
 import org.apache.spark.sql.execution.SQLExecution
+import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 
 /**
@@ -45,7 +47,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   // Monotonic by design (lifetime totals/high-water), so it is not the optimizer's window input.
   private val observations = new ConcurrentHashMap[AutotuneStageKey, StageObservationAgg]()
   private val nextHintVersion = new AtomicLong(1L)
-
   @volatile private var sparkContext: SparkContext = _
   @volatile private var enabled = false
   // The graph optimizer only runs in GRAPH/OPTIMIZE modes; OBSERVE/LOCAL never republish.
@@ -59,7 +60,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     optimizerEnabled = conf.isAutotuneClosedLoopMode
     sparkContext = if (enabled) sc else null
     val nativeGpuTaskSlots = if (sc == null) 0 else {
-      RapidsPluginUtils.estimateCoresOnExec(sc.getConf)
+      RapidsPluginUtils.estimateGpuTaskSlotsOnExec(sc.getConf)
     }
     optimizer = new AnalyticalGraphWideAutotuneOptimizer(
       GraphOptimizerConstraints.fromConf(conf, nativeGpuTaskSlots))
@@ -127,6 +128,14 @@ object RapidsAutotuneDriverEndpoint extends Logging {
         case NonFatal(e) =>
           logWarning("RAPIDS graph optimizer stage-completion update failed", e)
       }
+    }
+  }
+
+  def executionCompleted(executionId: Long): Unit = synchronized {
+    hints.keySet().asScala.filter(_.executionId == executionId).foreach(hints.remove)
+    observations.keySet().asScala.filter(_.executionId == executionId).foreach(observations.remove)
+    if (optimizer != null) {
+      optimizer.executionCompleted(executionId)
     }
   }
 
@@ -448,6 +457,16 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
     val info = stageCompleted.stageInfo
     stageKeys.get((info.stageId, info.attemptNumber())).foreach(
       RapidsAutotuneDriverEndpoint.stageCompleted)
+  }
+
+  override def onOtherEvent(event: SparkListenerEvent): Unit = {
+    event match {
+      case sqlEnd: SparkListenerSQLExecutionEnd => synchronized {
+        stageKeys.retain { case (_, key) => key.executionId != sqlEnd.executionId }
+        RapidsAutotuneDriverEndpoint.executionCompleted(sqlEnd.executionId)
+      }
+      case _ =>
+    }
   }
 
   private[rapids] def publishDefaultHint(
