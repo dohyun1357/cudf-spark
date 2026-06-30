@@ -280,6 +280,17 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(noTasks.hasShuffle && !noTasks.isShuffleStage && !noTasks.hasGpuWork)
   }
 
+  test("stage shape identifies broadcast work for AQE calibration") {
+    val broadcast = AutotuneStageShape.fromRddScopeNames(
+      Seq("GpuBroadcastExchange", "GpuHashJoin"), numTasks = 8)
+    val shuffle = AutotuneStageShape.fromRddScopeNames(
+      Seq("GpuColumnarExchange", "GpuHashJoin"), numTasks = 8)
+
+    assert(broadcast.hasBroadcast && broadcast.hasGpuWork)
+    assert(!broadcast.hasShuffle)
+    assert(shuffle.hasShuffle && !shuffle.hasBroadcast)
+  }
+
   test("one graph optimizer owns the complete initial joint hint") {
     val conf = new RapidsConf(Map(
       RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
@@ -320,6 +331,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val conf = new RapidsConf(Map(
       RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
       RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
+      RapidsConf.CONCURRENT_GPU_TASKS.key -> "4",
       RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",
       RapidsConf.AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS.key -> "8",
       RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true",
@@ -331,6 +343,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsConf.AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE.key -> "128m"))
 
     val constraints = GraphOptimizerConstraints.fromConf(conf, nativeGpuTaskSlots = 16)
+    // concurrentGpuTasks seeds dynamic memory permits; it is not a hard scheduling envelope.
     assert(constraints.gpu.initialConcurrentTasks == 16)
     assert(constraints.gpu.maxConcurrentTasks == 16)
     assert(constraints.batch.initialTargetBytes == oneGiB)
@@ -1034,6 +1047,45 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val updated = changed.head.hint
     assert(optimizer.observe(first, updated, nowNanos = 1050L).isEmpty)
     assert(optimizer.observe(second, updated, nowNanos = 1050L).isEmpty)
+  }
+
+  test("graph decision epochs expose replay-complete sensitivities and freeze reasons") {
+    val optimizer = new AnalyticalGraphWideAutotuneOptimizer(
+      optimizerConstraints(minSamples = 2L, intervalNanos = 0L))
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
+    val initial = optimizer.initialHint(
+      key, AutotuneStageDescriptor(shape, parentStageIds = Seq(1))).copy(version = 1L)
+    optimizer.hintPublished(initial)
+    optimizer.stageSubmitted(key)
+
+    val cold = optimizer.drainDecisionRecords()
+    assert(cold.size == 1)
+    assert(cold.head.trigger == "stage-submitted")
+    assert(cold.head.freezeReasons.gpuTasks == "no-current-version-calibration")
+
+    val first = optimizerObservation(key, 1L, wait = 1000L, holding = 100L,
+      duration = 1100L, input = 0L, output = 0L)
+    val second = first.copy(taskAttemptId = 2L)
+    assert(optimizer.observe(first, initial, nowNanos = 1000L).isEmpty)
+    assert(optimizer.observe(second, initial, nowNanos = 1000L).nonEmpty)
+
+    val calibrated = optimizer.drainDecisionRecords()
+    assert(calibrated.size == 1)
+    val record = calibrated.head
+    assert(record.trigger == "feedback")
+    assert(record.graphSelectedObjectiveNanos < record.graphCurrentObjectiveNanos)
+    assert(record.durationAdjoint == 1.0)
+    assert(record.selectedControl.gpuTasks > record.currentControl.gpuTasks)
+    assert(record.endToEndGradient.gpuTasks < 0.0)
+    assert(record.freezeReasons.gpuTasks == "downward-response-unidentified")
+
+    val event = RapidsAutotuneDriverEndpoint.toDecisionEvent(record)
+    assert(event.epochId == record.epochId)
+    assert(event.parentStageIds == Seq(1))
+    assert(event.selectedGpuTasks == record.selectedControl.gpuTasks)
+    assert(event.gpuTasksGradient == record.endToEndGradient.gpuTasks)
+    assert(event.gpuTasksFreezeReason == "downward-response-unidentified")
   }
 
   test("optimizer calibrates only observations from the current complete hint version") {
