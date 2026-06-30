@@ -18,7 +18,7 @@ package com.nvidia.spark.rapids
 
 import scala.collection.mutable
 
-/** Hard envelopes for the four actuator families controlled by the graph optimizer. */
+/** Hard envelopes for the runtime actuator families controlled by the graph optimizer. */
 case class GraphOptimizerConstraints(
     minSampleTasks: Long,
     updateIntervalNanos: Long,
@@ -103,7 +103,9 @@ object GraphOptimizerConstraints {
         maxConcurrentTasks = gpuMaximum),
       shuffle = ShuffleOptimizerBounds(
         enabled = conf.isAutotuneClosedLoopMode && conf.autotuneShuffleEnabled,
-        initialPrefetchWindow = 1,
+        // A cold stage begins at the configured feasible envelope. Window 1 was an unevidenced
+        // policy choice and could serialize a short stage before the first feedback epoch.
+        initialPrefetchWindow = conf.autotuneShuffleMaxPrefetchWindow,
         maxPrefetchWindow = conf.autotuneShuffleMaxPrefetchWindow,
         initialReadyBytes = conf.autotuneInitialShuffleMaxReadyBytes,
         maxReadyBytes = conf.autotuneEffectiveShuffleMaxBytesInFlight,
@@ -160,17 +162,19 @@ trait GraphWideAutotuneOptimizer {
 
   /** Feed back the version-stamped hint published by the driver endpoint. */
   def hintPublished(hint: StageRuntimeHint): Unit
+
+  /** Release graph state after a SQL execution ends. */
+  def executionCompleted(executionId: Long): Unit
 }
 
 /**
  * Driver graph optimizer backed by a constrained analytical stage-cost model.
  *
- * The optimizer uses discrete coordinate descent over one joint objective. Small integer domains
- * are enumerated exactly; large integer and byte domains use a logarithmic representation plus
- * every configured/current endpoint. The objective is predicted critical-path service time,
- * calibrated from measured task elapsed time and resource work. Spill and retry are costs in that
- * same objective, not fixed pressure thresholds. User configuration and executor clamps define
- * feasibility, not policy.
+ * The optimizer uses a projected-gradient inner solve for continuous controls and an exact
+ * discrete outer solve for shared GPU quotas. The objective is predicted end-to-end completion of
+ * the remaining max-plus Spark DAG, calibrated from measured task elapsed time and resource work.
+ * A reverse pass supplies stage criticality and control gradients. User configuration and executor
+ * clamps define feasibility, not policy; unidentifiable counterfactual controls remain ineligible.
  */
 class AnalyticalGraphWideAutotuneOptimizer(
     constraints: GraphOptimizerConstraints) extends GraphWideAutotuneOptimizer {
@@ -255,6 +259,10 @@ class AnalyticalGraphWideAutotuneOptimizer(
 
   override def hintPublished(hint: StageRuntimeHint): Unit = synchronized {
     stages.get(hint.key).foreach(_.currentHint = hint)
+  }
+
+  override def executionCompleted(executionId: Long): Unit = synchronized {
+    stages.retain { case (key, _) => key.executionId != executionId }
   }
 
   private def recomputeAllocations(): Seq[GraphOptimizerDecision] = {
@@ -379,9 +387,9 @@ private[rapids] object GraphCriticalPathAllocator {
     val gpuStageCount = tunable.count { case (_, curve) =>
       curve.alternatives.exists(_.gpuTasks > 0)
     }
-    // When more stages are active than there are shared slots, every stage keeps a quota of one
-    // while the lower shared cap and model-derived queue priority decide who runs. This avoids a
-    // zero quota that could strand already-launched tasks; it does not raise the shared cap.
+    // A positive quota keeps a stage runnable while the lower shared semaphore cap and
+    // model-derived priority decide who runs. If the minimum eligible quotas cannot fit this
+    // enumeration budget, the solve defers instead of inventing an unsupported lower quota.
     val quotaBudget = math.max(math.max(0, sharedGpuBudget), gpuStageCount)
     val choices = tunable.map { case (input, curve) =>
       val byGpuTasks = curve.alternatives
@@ -435,10 +443,15 @@ private[rapids] object GraphCriticalPathAllocator {
       val (input, curve) = tunableByKey(key)
       key -> remainingNanos(input, alternative.predictedNanos, curve.sampleTasks)
     }
-    val priorities = pathThroughNanos(graph, selectedCosts)
+    val flow = evaluateGraph(graph, selectedCosts)
     tunable.flatMap { case (input, curve) =>
       best.get(input.key).map { alternative =>
-        val priority = toPriority(priorities.getOrElse(input.key, 0.0))
+        // Reverse-mode criticality is the marginal change in the end-to-end objective caused by
+        // one additional nanosecond in this stage. Multiplying by its remaining duration gives
+        // the amount of query completion time currently exposed through this node.
+        val priority = toPriority(
+          flow.durationAdjoints.getOrElse(input.key, 0.0) *
+            selectedCosts.getOrElse(input.key, 0.0))
         val allocatedGpu = if (alternative.hint.gpu.maxConcurrentTasks > 0) {
           alternative.hint.gpu.copy(
             maxConcurrentTasks = alternative.gpuTasks,
@@ -487,59 +500,24 @@ private[rapids] object GraphCriticalPathAllocator {
   private def graphObjective(
       graph: Seq[GraphStageAllocationInput],
       costs: Map[AutotuneStageKey, Double]): Double = {
-    graph.groupBy(_.key.executionId).values.map { execution =>
-      val parents = parentKeys(execution)
-      val memo = mutable.HashMap.empty[AutotuneStageKey, Double]
-      def longestTo(key: AutotuneStageKey, visiting: Set[AutotuneStageKey]): Double = {
-        if (visiting.contains(key)) {
-          costs.getOrElse(key, 0.0)
-        } else {
-          memo.getOrElseUpdate(key, {
-            val upstream = parents.getOrElse(key, Seq.empty)
-              .map(parent => longestTo(parent, visiting + key))
-            costs.getOrElse(key, 0.0) + (if (upstream.isEmpty) 0.0 else upstream.max)
-          })
-        }
-      }
-      execution.map(node => longestTo(node.key, Set.empty)).foldLeft(0.0)(math.max)
-    }.sum
+    evaluateGraph(graph, costs).objectiveNanos
   }
 
-  private def pathThroughNanos(
+  private def evaluateGraph(
       graph: Seq[GraphStageAllocationInput],
-      costs: Map[AutotuneStageKey, Double]): Map[AutotuneStageKey, Double] = {
-    graph.groupBy(_.key.executionId).values.flatMap { execution =>
+      costs: Map[AutotuneStageKey, Double]): GpuFlowGraphEvaluation = {
+    val nodes = graph.groupBy(_.key.executionId).values.flatMap { execution =>
       val parents = parentKeys(execution)
-      val children = mutable.HashMap.empty[AutotuneStageKey, Seq[AutotuneStageKey]]
-        .withDefaultValue(Seq.empty)
-      parents.foreach { case (child, stageParents) =>
-        stageParents.foreach(parent => children.update(parent, children(parent) :+ child))
-      }
-      val toMemo = mutable.HashMap.empty[AutotuneStageKey, Double]
-      val fromMemo = mutable.HashMap.empty[AutotuneStageKey, Double]
-      def longestTo(key: AutotuneStageKey, visiting: Set[AutotuneStageKey]): Double = {
-        if (visiting.contains(key)) costs.getOrElse(key, 0.0) else {
-          toMemo.getOrElseUpdate(key, {
-            val upstream = parents.getOrElse(key, Seq.empty)
-              .map(parent => longestTo(parent, visiting + key))
-            costs.getOrElse(key, 0.0) + (if (upstream.isEmpty) 0.0 else upstream.max)
-          })
-        }
-      }
-      def longestFrom(key: AutotuneStageKey, visiting: Set[AutotuneStageKey]): Double = {
-        if (visiting.contains(key)) costs.getOrElse(key, 0.0) else {
-          fromMemo.getOrElseUpdate(key, {
-            val downstream = children(key).map(child => longestFrom(child, visiting + key))
-            costs.getOrElse(key, 0.0) + (if (downstream.isEmpty) 0.0 else downstream.max)
-          })
-        }
-      }
       execution.map { node =>
-        val own = costs.getOrElse(node.key, 0.0)
-        node.key -> math.max(0.0,
-          longestTo(node.key, Set.empty) + longestFrom(node.key, Set.empty) - own)
+        GpuFlowGraphNode(
+          key = node.key,
+          parents = parents.getOrElse(node.key, Seq.empty),
+          evaluation = GpuFlowStageEvaluation(
+            predictedNanos = costs.getOrElse(node.key, 0.0),
+            gradient = GpuFlowGradient()))
       }
-    }.toMap
+    }.toSeq
+    GpuFlowModel.evaluate(nodes)
   }
 
   private def parentKeys(
@@ -561,29 +539,6 @@ private[rapids] object GraphCriticalPathAllocator {
 
 /** Pure constrained optimizer used by [[AnalyticalGraphWideAutotuneOptimizer]]. */
 object AnalyticalStageCostModel {
-  private case class Candidate(
-      scanWindow: Int,
-      gpuTasks: Int,
-      shuffleWindow: Int,
-      shuffleBytes: Long,
-      batchBytes: Long)
-
-  private case class CalibratedWork(
-      scanNanosAtCurrent: Double,
-      gpuHoldingNanos: Double,
-      gpuWaitNanos: Double,
-      shuffleNanosAtCurrent: Double,
-      batchOverheadNanosAtCurrent: Double,
-      fixedNanos: Double,
-      retryNanos: Double,
-      spillNanosAtCurrent: Double,
-      currentScanWindow: Int,
-      currentGpuTasks: Int,
-      currentShuffleWindow: Int,
-      currentShuffleBytes: Long,
-      currentBatchBytes: Long,
-      processedBytes: Long)
-
   def optimize(
       observation: StageObservationAgg,
       current: StageRuntimeHint,
@@ -622,124 +577,57 @@ object AnalyticalStageCostModel {
     }
 
     val work = calibrate(observation, current, shape)
-    val currentCandidate = Candidate(
-      activeScanWindow(current), activeGpuTasks(current), activeShuffleWindow(current),
-      activeShuffleBytes(current), activeBatchBytes(current))
-    val scanValues = intDomain(
-      currentCandidate.scanWindow,
-      if (current.scan.maxReadWindow > 0 && work.scanNanosAtCurrent > 0.0) {
-        constraints.scan.maxReadWindow
-      } else 0)
+    val currentControl = controlFor(current)
     val gpuValues = intDomain(
-      currentCandidate.gpuTasks,
+      currentControl.gpuTasks.toInt,
       if (current.gpu.maxConcurrentTasks > 0 &&
-          work.gpuHoldingNanos + work.gpuWaitNanos > 0.0) {
+          work.gpuNanos > 0.0) {
         constraints.gpu.maxConcurrentTasks
       } else 0)
-    val shuffleValues = byteDomain(
-      constraints.shuffle.initialReadyBytes,
-      currentCandidate.shuffleBytes,
-      if (isActiveShuffle(current) && work.shuffleNanosAtCurrent > 0.0) {
-        constraints.shuffle.maxReadyBytes
-      } else 0L)
-    val shuffleWindowValues = intDomain(
-      currentCandidate.shuffleWindow,
-      if (isActiveShuffle(current) && work.shuffleNanosAtCurrent > 0.0) {
-        constraints.shuffle.maxPrefetchWindow
-      } else 0)
-    val batchValues = byteDomain(
-      if (constraints.batch.minimumTargetBytes > 0L) {
-        constraints.batch.minimumTargetBytes
-      } else {
-        constraints.batch.initialTargetBytes
-      },
-      currentCandidate.batchBytes,
-      if (current.batch.targetBatchBytes > 0L && work.batchOverheadNanosAtCurrent > 0.0) {
-        constraints.batch.maxBatchBytes
-      } else 0L)
+    val bounds = controlBounds(work, currentControl, constraints)
 
     val alternatives = gpuValues.map { gpuTasks =>
-      val selected = optimizeForGpu(
-        work,
-        currentCandidate.copy(gpuTasks = gpuTasks),
-        scanValues,
-        shuffleWindowValues,
-        shuffleValues,
-        batchValues)
+      val fixedGpu = gpuTasks.toDouble
+      val fixedBounds = bounds.copy(
+        minimum = bounds.minimum.copy(gpuTasks = fixedGpu),
+        maximum = bounds.maximum.copy(gpuTasks = fixedGpu))
+      val selected = GpuFlowProjectedOptimizer.optimize(
+        work, currentControl.copy(gpuTasks = fixedGpu), fixedBounds)
       GraphStageCostAlternative(
         gpuTasks = gpuTasks,
         hint = hintForCandidate(
-          current, currentCandidate, selected, constraints.batch.initialSplitUntilSize),
-        predictedNanos = predictedNanos(work, selected))
+          current, currentControl, selected, constraints.batch.initialSplitUntilSize),
+        predictedNanos = GpuFlowStageModel.evaluate(work, selected).predictedNanos)
     }
     Some(GraphStageCostCurve(
-      predictedCurrentNanos = predictedNanos(work, currentCandidate),
+      predictedCurrentNanos = GpuFlowStageModel.evaluate(work, currentControl).predictedNanos,
       sampleTasks = observation.taskCount,
       alternatives = alternatives))
   }
 
-  private def optimizeForGpu(
-      work: CalibratedWork,
-      initial: Candidate,
-      scanValues: Seq[Int],
-      shuffleWindowValues: Seq[Int],
-      shuffleValues: Seq[Long],
-      batchValues: Seq[Long]): Candidate = {
-    var selected = initial
-    var selectedCost = predictedNanos(work, initial)
-    def descend(preferMoreOnTie: Boolean): Unit = {
-      var changed = true
-      while (changed) {
-        changed = false
-        def choose(candidates: Seq[Candidate]): Unit = candidates.foreach { candidate =>
-          val cost = predictedNanos(work, candidate)
-          val preferredTie = cost == selectedCost &&
-            (if (preferMoreOnTie) lessResource(selected, candidate)
-            else lessResource(candidate, selected))
-          if (cost < selectedCost || preferredTie) {
-            selected = candidate
-            selectedCost = cost
-            changed = true
-          }
-        }
-        choose(scanValues.map(value => selected.copy(scanWindow = value)))
-        choose(shuffleWindowValues.map(value => selected.copy(shuffleWindow = value)))
-        choose(shuffleValues.map(value => selected.copy(shuffleBytes = value)))
-        choose(for {
-          window <- shuffleWindowValues
-          bytes <- shuffleValues
-        } yield selected.copy(shuffleWindow = window, shuffleBytes = bytes))
-        choose(batchValues.map(value => selected.copy(batchBytes = value)))
-      }
-    }
-    descend(preferMoreOnTie = true)
-    descend(preferMoreOnTie = false)
-    selected
-  }
-
   private def hintForCandidate(
       current: StageRuntimeHint,
-      currentCandidate: Candidate,
-      selected: Candidate,
+      currentControl: GpuFlowControl,
+      selected: GpuFlowControl,
       configuredSplitUntilSize: Long): StageRuntimeHint = current.copy(
     scan = if (current.scan.maxReadWindow > 0) {
-      current.scan.copy(maxReadWindow = selected.scanWindow)
+      current.scan.copy(maxReadWindow = selected.scanWindow.toInt)
     } else current.scan,
     gpu = if (current.gpu.maxConcurrentTasks > 0) {
-      current.gpu.copy(maxConcurrentTasks = selected.gpuTasks)
+      current.gpu.copy(maxConcurrentTasks = selected.gpuTasks.toInt)
     } else current.gpu,
     shuffle = if (isActiveShuffle(current)) {
       current.shuffle.copy(
-        prefetchWindow = selected.shuffleWindow,
-        maxReadyBytes = selected.shuffleBytes,
+        prefetchWindow = selected.shuffleWindow.toInt,
+        maxReadyBytes = selected.shuffleBytes.toLong,
         coalesceTargetBytes = selectedCoalesceBytes(current, selected))
     } else current.shuffle,
     batch = if (current.batch.targetBatchBytes > 0L &&
-        selected.batchBytes != currentCandidate.batchBytes) {
+        selected.batchBytes != currentControl.batchBytes) {
       current.batch.copy(
-        targetBatchBytes = selected.batchBytes,
+        targetBatchBytes = selected.batchBytes.toLong,
         splitUntilSize = selectedSplitSize(
-          current, selected.batchBytes, configuredSplitUntilSize))
+          current, selected.batchBytes.toLong, configuredSplitUntilSize))
     } else current.batch)
 
   private def sameHintContent(left: StageRuntimeHint, right: StageRuntimeHint): Boolean =
@@ -758,7 +646,7 @@ object AnalyticalStageCostModel {
   private def calibrate(
       obs: StageObservationAgg,
       current: StageRuntimeHint,
-      shape: AutotuneStageShape): CalibratedWork = {
+      shape: AutotuneStageShape): GpuFlowStageWork = {
     val elapsed = math.max(obs.totalTaskDurationNanos.toDouble,
       (obs.totalGpuHoldingNanos + obs.totalGpuSemaphoreWaitNanos +
         obs.totalRetryOrLostTimeNanos).toDouble)
@@ -796,143 +684,79 @@ object AnalyticalStageCostModel {
     } else {
       0.0
     }
-    CalibratedWork(
-      scanNanosAtCurrent = scanNanos,
-      gpuHoldingNanos = obs.totalGpuHoldingNanos.toDouble,
-      gpuWaitNanos = obs.totalGpuSemaphoreWaitNanos.toDouble,
-      shuffleNanosAtCurrent = shuffleNanos,
-      batchOverheadNanosAtCurrent = batchOverhead,
+    GpuFlowStageWork(
+      scanNanos = scanNanos,
+      gpuNanos = obs.totalGpuHoldingNanos.toDouble +
+        obs.totalGpuSemaphoreWaitNanos.toDouble,
+      shuffleNanos = shuffleNanos,
+      batchNanos = batchOverhead,
       fixedNanos = math.max(0.0, unclassifiedNanos - batchOverhead),
       retryNanos = retry,
-      spillNanosAtCurrent = spillTimeEquivalent(obs, availableNonGpu),
-      currentScanWindow = activeScanWindow(current),
-      currentGpuTasks = activeGpuTasks(current),
-      currentShuffleWindow = activeShuffleWindow(current),
-      currentShuffleBytes = activeShuffleBytes(current),
-      currentBatchBytes = currentBatch,
-      processedBytes = processedBytes)
+      baseline = controlFor(current))
   }
 
-  private def predictedNanos(work: CalibratedWork, candidate: Candidate): Double = {
-    val scan = scaleInverse(
-      work.scanNanosAtCurrent, work.currentScanWindow, candidate.scanWindow)
-    val gpuHolding = scaleInverse(
-      work.gpuHoldingNanos, work.currentGpuTasks, candidate.gpuTasks)
-    // Semaphore wait is admission queueing caused by the current task-count cap. Increasing the
-    // cap drains that queue; device-memory permits remain the independent hard safety constraint.
-    // Any real cost of additional load is represented by measured spill/retry below rather than by
-    // treating queueing itself as contention in the opposite direction.
-    val gpuWait = scaleInverse(
-      work.gpuWaitNanos, work.currentGpuTasks, candidate.gpuTasks)
-    val shuffle = scaleInverse(
-      scaleInverse(work.shuffleNanosAtCurrent,
-        work.currentShuffleBytes, candidate.shuffleBytes),
-      work.currentShuffleWindow, candidate.shuffleWindow)
-    val batch = batchOverhead(work, candidate.batchBytes)
-    val loadScale = resourceLoadScale(work, candidate)
-    val pressure = work.retryNanos + work.spillNanosAtCurrent * loadScale
-    math.max(math.max(scan, gpuHolding + gpuWait), shuffle) + batch + work.fixedNanos + pressure
-  }
+  private def controlFor(hint: StageRuntimeHint): GpuFlowControl = GpuFlowControl(
+    scanWindow = activeScanWindow(hint).toDouble,
+    gpuTasks = activeGpuTasks(hint).toDouble,
+    shuffleWindow = activeShuffleWindow(hint).toDouble,
+    shuffleBytes = activeShuffleBytes(hint).toDouble,
+    batchBytes = activeBatchBytes(hint).toDouble)
 
-  private def spillTimeEquivalent(obs: StageObservationAgg, nonGpuNanos: Double): Double = {
-    val ioBytes = obs.totalInputBytes + obs.totalOutputBytes +
-      obs.totalShuffleReadBytes + obs.totalShuffleWriteBytes
-    if (obs.totalSpillBytes > 0L && ioBytes > 0L && nonGpuNanos > 0.0) {
-      nonGpuNanos * obs.totalSpillBytes.toDouble / ioBytes.toDouble
-    } else if (obs.totalSpillBytes > 0L) {
-      obs.totalTaskDurationNanos.toDouble
-    } else {
-      0.0
+  private def controlBounds(
+      work: GpuFlowStageWork,
+      current: GpuFlowControl,
+      constraints: GraphOptimizerConstraints): GpuFlowControlBounds = {
+    def range(
+        value: Double,
+        hasWork: Boolean,
+        minimum: Double,
+        maximum: Double): (Double, Double) = {
+      if (value <= 0.0 || !hasWork || maximum <= 0.0) (value, value)
+      else (math.min(minimum, maximum), math.max(value, maximum))
     }
-  }
-
-  private def batchOverhead(work: CalibratedWork, candidateBatchBytes: Long): Double = {
-    if (work.batchOverheadNanosAtCurrent <= 0.0 || work.currentBatchBytes <= 0L ||
-        candidateBatchBytes <= 0L || work.processedBytes <= 0L) {
-      work.batchOverheadNanosAtCurrent
+    val scan = range(current.scanWindow, work.scanNanos > 0.0,
+      1.0, constraints.scan.maxReadWindow.toDouble)
+    val gpu = range(current.gpuTasks, work.gpuNanos > 0.0,
+      1.0, constraints.gpu.maxConcurrentTasks.toDouble)
+    val shuffleWindow = range(current.shuffleWindow, work.shuffleNanos > 0.0,
+      1.0, constraints.shuffle.maxPrefetchWindow.toDouble)
+    val shuffleBytes = range(current.shuffleBytes, work.shuffleNanos > 0.0,
+      constraints.shuffle.initialReadyBytes.toDouble,
+      constraints.shuffle.maxReadyBytes.toDouble)
+    val minimumBatch = if (constraints.batch.minimumTargetBytes > 0L) {
+      constraints.batch.minimumTargetBytes
     } else {
-      val currentBatches = ceilDiv(work.processedBytes, work.currentBatchBytes)
-      val candidateBatches = ceilDiv(work.processedBytes, candidateBatchBytes)
-      work.batchOverheadNanosAtCurrent * candidateBatches.toDouble / currentBatches.toDouble
+      constraints.batch.initialTargetBytes
     }
-  }
-
-  private def ceilDiv(value: Long, divisor: Long): Long = {
-    if (value <= 0L) 1L else 1L + (value - 1L) / math.max(1L, divisor)
+    val batch = range(current.batchBytes, work.batchNanos > 0.0,
+      minimumBatch.toDouble, constraints.batch.maxBatchBytes.toDouble)
+    GpuFlowControlBounds(
+      minimum = GpuFlowControl(scan._1, gpu._1, shuffleWindow._1,
+        shuffleBytes._1, batch._1),
+      maximum = GpuFlowControl(scan._2, gpu._2, shuffleWindow._2,
+        shuffleBytes._2, batch._2))
   }
 
   private def intDomain(current: Int, maximum: Int): Seq[Int] = {
     if (current <= 0 || maximum <= 0) {
       Seq(current)
     } else if (maximum <= 64) {
-      (1 to maximum).toSeq
+      // A GPU-admission quota gates the complete task, not only the measured GPU-holding lane.
+      // One observation at `current` cannot identify the counterfactual response below it. Keep
+      // lower quotas ineligible until replay/history supplies that response; online queueing can
+      // still support retaining or raising the quota within the hard envelope.
+      (math.min(current, maximum) to maximum).toSeq
     } else {
       val values = mutable.TreeSet.empty[Int]
-      values += 1
       values += math.min(current, maximum)
       values += maximum
-      var value = 1
+      var value = math.max(1, current)
       while (value < maximum && value <= Integer.MAX_VALUE / 2) {
         value = math.min(maximum, value * 2)
         values += value
       }
       values.toSeq
     }
-  }
-
-  private def byteDomain(minimum: Long, current: Long, maximum: Long): Seq[Long] = {
-    if (minimum <= 0L || current <= 0L || maximum <= 0L || maximum == Long.MaxValue) {
-      Seq(current)
-    } else {
-      val lower = math.min(minimum, maximum)
-      val values = mutable.TreeSet.empty[Long]
-      values += lower
-      values += math.min(current, maximum)
-      values += maximum
-      var value = lower
-      while (value < maximum && value <= Long.MaxValue / 2L) {
-        value = math.min(maximum, value * 2L)
-        values += value
-      }
-      values.toSeq
-    }
-  }
-
-  private def scaleInverse(value: Double, current: Long, candidate: Long): Double = {
-    if (value <= 0.0 || current <= 0L || candidate <= 0L) value
-    else value * current.toDouble / candidate.toDouble
-  }
-
-  private def ratio(candidate: Long, current: Long): Double = {
-    if (candidate <= 0L || current <= 0L) 1.0 else candidate.toDouble / current.toDouble
-  }
-
-  private def resourceLoadScale(work: CalibratedWork, candidate: Candidate): Double = {
-    val ratios = Seq(
-      if (work.currentScanWindow > 0) {
-        Some(ratio(candidate.scanWindow, work.currentScanWindow))
-      } else None,
-      if (work.currentGpuTasks > 0) {
-        Some(ratio(candidate.gpuTasks, work.currentGpuTasks))
-      } else None,
-      if (work.currentShuffleWindow > 0) {
-        Some(ratio(candidate.shuffleWindow, work.currentShuffleWindow))
-      } else None,
-      if (work.currentShuffleBytes > 0L) {
-        Some(ratio(candidate.shuffleBytes, work.currentShuffleBytes))
-      } else None,
-      if (work.currentBatchBytes > 0L) {
-        Some(ratio(candidate.batchBytes, work.currentBatchBytes))
-      } else None).flatten
-    if (ratios.isEmpty) 1.0 else ratios.sum / ratios.size.toDouble
-  }
-
-  private def lessResource(left: Candidate, right: Candidate): Boolean = {
-    val leftTotal = left.scanWindow.toDouble + left.gpuTasks.toDouble +
-      left.shuffleWindow.toDouble + left.shuffleBytes.toDouble + left.batchBytes.toDouble
-    val rightTotal = right.scanWindow.toDouble + right.gpuTasks.toDouble +
-      right.shuffleWindow.toDouble + right.shuffleBytes.toDouble + right.batchBytes.toDouble
-    leftTotal < rightTotal
   }
 
   private def activeScanWindow(hint: StageRuntimeHint): Int =
@@ -953,9 +777,11 @@ object AnalyticalStageCostModel {
   private def activeBatchBytes(hint: StageRuntimeHint): Long =
     if (hint.batch.targetBatchBytes > 0L) hint.batch.targetBatchBytes else 0L
 
-  private def selectedCoalesceBytes(current: StageRuntimeHint, selected: Candidate): Long = {
+  private def selectedCoalesceBytes(
+      current: StageRuntimeHint,
+      selected: GpuFlowControl): Long = {
     if (current.shuffle.coalesceTargetBytes > 0L && selected.batchBytes > 0L) {
-      selected.batchBytes
+      selected.batchBytes.toLong
     } else {
       current.shuffle.coalesceTargetBytes
     }

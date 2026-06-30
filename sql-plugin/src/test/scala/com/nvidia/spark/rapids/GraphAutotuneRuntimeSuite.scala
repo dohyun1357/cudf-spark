@@ -306,12 +306,12 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50, hasShuffle = true)
     val hint = optimizer.initialHint(key, AutotuneStageDescriptor(shape, Seq(1, 2)))
 
-    // Cold hints preserve native execution. Configured smaller values are model candidates, not
-    // an unconditional pre-observation policy.
+    // Cold hints begin at deployed/native settings or the configured feasible envelope, not at
+    // an unevidenced low-resource point.
     assert(hint.scan == ScanRuntimeHint(true, 1, 8, 1024L))
     assert(hint.gpu == GpuRuntimeHint(
       maxConcurrentTasks = 16, sharedMaxConcurrentTasks = 16))
-    assert(hint.shuffle == ShuffleRuntimeHint(1, 2048L, 8192L))
+    assert(hint.shuffle == ShuffleRuntimeHint(6, 2048L, 8192L))
     assert(hint.batch == BatchRuntimeHint(8192L, 16384L, 0L))
   }
 
@@ -692,7 +692,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
 
       assert(hint.version == 1L)
       assert(hint.shuffle ==
-        ShuffleRuntimeHint(prefetchWindow = 1, maxReadyBytes = 2048L,
+        ShuffleRuntimeHint(prefetchWindow = 6, maxReadyBytes = 2048L,
           coalesceTargetBytes = 4096L))
       assert(hint.batch ==
         BatchRuntimeHint(targetBatchBytes = 4096L, maxBatchBytes = 8192L, splitUntilSize = 0L))
@@ -957,9 +957,11 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     // Four GPU tasks are sufficient once scan/shuffle become the max-resource bottleneck; the
     // joint optimizer therefore does not spend the remaining GPU envelope with no path benefit.
     assert(decision.hint.gpu.maxConcurrentTasks == 4)
-    assert(decision.hint.shuffle.prefetchWindow == 4)
-    // The byte search never crosses below the configured safe starting point merely to win a
-    // resource tie. Window and ready bytes remain one jointly optimized service capacity.
+    // Shuffle window and ready bytes are one multiplicative service capacity. The differentiable
+    // solve may distribute the same gain differently than a discrete coordinate enumeration.
+    assert(decision.hint.shuffle.prefetchWindow.toLong *
+      decision.hint.shuffle.maxReadyBytes >
+      current.shuffle.prefetchWindow.toLong * current.shuffle.maxReadyBytes)
     assert(decision.hint.shuffle.maxReadyBytes >= constraints.shuffle.initialReadyBytes)
   }
 
@@ -976,6 +978,24 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
 
     val decision = AnalyticalStageCostModel.optimize(observation, current, shape, constraints).get
     assert(decision.hint.gpu.maxConcurrentTasks == 8)
+  }
+
+  test("online flow solve does not invent an unobserved lower GPU quota") {
+    val constraints = optimizerConstraints()
+    val shape = AutotuneStageShape(
+      hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50)
+    val current = StageRuntimeHint.empty(key).copy(
+      scan = ScanRuntimeHint(true, 1, 2, 4096L),
+      gpu = GpuRuntimeHint(4))
+    val observation = StageObservationAgg.empty
+      .merge(optimizerObservation(key, 1L, wait = 0L, holding = 100L,
+        duration = 10000L, input = 1000L, output = 500L))
+      .merge(optimizerObservation(key, 2L, wait = 0L, holding = 100L,
+        duration = 10000L, input = 1000L, output = 500L))
+
+    val curve = AnalyticalStageCostModel.costCurve(
+      observation, current, shape, constraints).get
+    assert(curve.alternatives.forall(_.gpuTasks >= current.gpu.maxConcurrentTasks))
   }
 
   test("analytical optimizer owns batch and split targets") {
