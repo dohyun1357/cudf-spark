@@ -115,3 +115,69 @@ case class SparkRapidsAutotuneObservationEvent(
   stageMaxDeviceMemoryBytes: Long = 0L,
   stageTotalRetryOrLostTimeNanos: Long = 0L
 ) extends SparkListenerEvent
+
+/**
+ * One stage row from a graph-wide analytical decision epoch. Together, rows with the same
+ * `epochId` are a replay-complete snapshot of the remaining graph, selected controls, objective,
+ * reverse-mode sensitivity, and controls frozen because their response was not identifiable.
+ */
+case class SparkRapidsAutotuneGraphDecisionEvent(
+  epochId: Long,
+  trigger: String,
+  executionId: Long,
+  stageId: Int,
+  stageAttemptId: Int,
+  active: Boolean,
+  completed: Boolean,
+  parentStageIds: Seq[Int],
+  observedTasks: Long,
+  sampleTasks: Long,
+  currentHintVersion: Long,
+  graphCurrentObjectiveNanos: Double,
+  graphSelectedObjectiveNanos: Double,
+  predictedCurrentNanos: Double,
+  predictedSelectedNanos: Double,
+  durationAdjoint: Double,
+  currentScanWindow: Double,
+  currentGpuTasks: Double,
+  currentShuffleWindow: Double,
+  currentShuffleBytes: Double,
+  currentBatchBytes: Double,
+  selectedScanWindow: Double,
+  selectedGpuTasks: Double,
+  selectedShuffleWindow: Double,
+  selectedShuffleBytes: Double,
+  selectedBatchBytes: Double,
+  scanWindowGradient: Double,
+  gpuTasksGradient: Double,
+  shuffleWindowGradient: Double,
+  shuffleBytesGradient: Double,
+  batchBytesGradient: Double,
+  scanWindowFreezeReason: String,
+  gpuTasksFreezeReason: String,
+  shuffleWindowFreezeReason: String,
+  shuffleBytesFreezeReason: String,
+  batchBytesFreezeReason: String
+) extends SparkListenerEvent
+
+/** One complete physical-plan evaluation at Spark's pre-materialization AQE cost boundary. */
+case class SparkRapidsAutotuneAqeCostEvent(
+  evaluationId: Long,
+  executionId: Long,
+  identifiable: Boolean,
+  reason: String,
+  objectiveNanos: Double,
+  operatorFingerprint: String,
+  topologyFingerprint: String,
+  scanBytes: Double,
+  gpuBytes: Double,
+  shuffleBytes: Double,
+  broadcastBytes: Double,
+  batchBytes: Double,
+  selectedScanWindow: Double,
+  selectedGpuTasks: Double,
+  selectedShuffleWindow: Double,
+  selectedShuffleBytes: Double,
+  selectedBatchBytes: Double,
+  calibrationSampleWindows: Long
+) extends SparkListenerEvent

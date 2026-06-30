@@ -47,6 +47,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   // Monotonic by design (lifetime totals/high-water), so it is not the optimizer's window input.
   private val observations = new ConcurrentHashMap[AutotuneStageKey, StageObservationAgg]()
   private val nextHintVersion = new AtomicLong(1L)
+  private val nextAqeEvaluationId = new AtomicLong(1L)
   @volatile private var sparkContext: SparkContext = _
   @volatile private var enabled = false
   // The graph optimizer only runs in GRAPH/OPTIMIZE modes; OBSERVE/LOCAL never republish.
@@ -68,6 +69,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     hints.clear()
     observations.clear()
     nextHintVersion.set(1L)
+    nextAqeEvaluationId.set(1L)
     if (enabled) {
       logInfo(s"Initialized RAPIDS graph autotune driver endpoint in " +
         s"${conf.autotuneGraphMode} mode")
@@ -83,6 +85,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     hints.clear()
     observations.clear()
     nextHintVersion.set(1L)
+    nextAqeEvaluationId.set(1L)
   }
 
   /** Test-only: inject a deterministic monotonic clock for optimizer update cadence. */
@@ -295,7 +298,57 @@ object RapidsAutotuneDriverEndpoint extends Logging {
         s"scan ${published.scan}, GPU ${published.gpu}, shuffle ${published.shuffle}, " +
         s"batch ${published.batch}")
     }
+    publishDecisionRecords()
   }
+
+  private def publishDecisionRecords(): Unit = {
+    if (optimizer != null) {
+      val records = optimizer.drainDecisionRecords()
+      if (sparkContext != null) {
+        records.foreach(record => TrampolineUtil.postEvent(sparkContext, toDecisionEvent(record)))
+      }
+    }
+  }
+
+  private[rapids] def toDecisionEvent(
+      record: GraphStageDecisionRecord): SparkRapidsAutotuneGraphDecisionEvent =
+    SparkRapidsAutotuneGraphDecisionEvent(
+      epochId = record.epochId,
+      trigger = record.trigger,
+      executionId = record.key.executionId,
+      stageId = record.key.stageId,
+      stageAttemptId = record.key.stageAttemptId,
+      active = record.active,
+      completed = record.completed,
+      parentStageIds = record.parentStageIds,
+      observedTasks = record.observedTasks,
+      sampleTasks = record.sampleTasks,
+      currentHintVersion = record.currentHintVersion,
+      graphCurrentObjectiveNanos = record.graphCurrentObjectiveNanos,
+      graphSelectedObjectiveNanos = record.graphSelectedObjectiveNanos,
+      predictedCurrentNanos = record.predictedCurrentNanos,
+      predictedSelectedNanos = record.predictedSelectedNanos,
+      durationAdjoint = record.durationAdjoint,
+      currentScanWindow = record.currentControl.scanWindow,
+      currentGpuTasks = record.currentControl.gpuTasks,
+      currentShuffleWindow = record.currentControl.shuffleWindow,
+      currentShuffleBytes = record.currentControl.shuffleBytes,
+      currentBatchBytes = record.currentControl.batchBytes,
+      selectedScanWindow = record.selectedControl.scanWindow,
+      selectedGpuTasks = record.selectedControl.gpuTasks,
+      selectedShuffleWindow = record.selectedControl.shuffleWindow,
+      selectedShuffleBytes = record.selectedControl.shuffleBytes,
+      selectedBatchBytes = record.selectedControl.batchBytes,
+      scanWindowGradient = record.endToEndGradient.scanWindow,
+      gpuTasksGradient = record.endToEndGradient.gpuTasks,
+      shuffleWindowGradient = record.endToEndGradient.shuffleWindow,
+      shuffleBytesGradient = record.endToEndGradient.shuffleBytes,
+      batchBytesGradient = record.endToEndGradient.batchBytes,
+      scanWindowFreezeReason = record.freezeReasons.scanWindow,
+      gpuTasksFreezeReason = record.freezeReasons.gpuTasks,
+      shuffleWindowFreezeReason = record.freezeReasons.shuffleWindow,
+      shuffleBytesFreezeReason = record.freezeReasons.shuffleBytes,
+      batchBytesFreezeReason = record.freezeReasons.batchBytes)
 
   /**
    * Cumulative per-stage observation aggregate for a key (eventlog/inspection view). NOTE: this is
@@ -303,6 +356,44 @@ object RapidsAutotuneDriverEndpoint extends Logging {
    */
   def observationFor(key: AutotuneStageKey): Option[StageObservationAgg] =
     Option(observations.get(key))
+
+  private[rapids] def aqeCalibrationSnapshot: Option[GpuFlowAqeCalibration] = synchronized {
+    Option(optimizer).flatMap(_.aqeCalibrationSnapshot)
+  }
+
+  private[rapids] def recordAqeCostEvaluation(evaluation: GpuFlowAqePlanEvaluation): Unit = {
+    val sc = sparkContext
+    if (enabled && sc != null) {
+      val executionId = Option(sc.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
+        .flatMap(value => Try(value.toLong).toOption).getOrElse(-1L)
+      val evaluationId = nextAqeEvaluationId.getAndIncrement()
+      TrampolineUtil.postEvent(sc, toAqeCostEvent(evaluationId, executionId, evaluation))
+    }
+  }
+
+  private[rapids] def toAqeCostEvent(
+      evaluationId: Long,
+      executionId: Long,
+      evaluation: GpuFlowAqePlanEvaluation): SparkRapidsAutotuneAqeCostEvent =
+    SparkRapidsAutotuneAqeCostEvent(
+      evaluationId = evaluationId,
+      executionId = executionId,
+      identifiable = evaluation.identifiable,
+      reason = evaluation.reason,
+      objectiveNanos = evaluation.objectiveNanos,
+      operatorFingerprint = evaluation.operatorFingerprint,
+      topologyFingerprint = evaluation.topologyFingerprint,
+      scanBytes = evaluation.scanBytes,
+      gpuBytes = evaluation.gpuBytes,
+      shuffleBytes = evaluation.shuffleBytes,
+      broadcastBytes = evaluation.broadcastBytes,
+      batchBytes = evaluation.batchBytes,
+      selectedScanWindow = evaluation.selectedControl.scanWindow,
+      selectedGpuTasks = evaluation.selectedControl.gpuTasks,
+      selectedShuffleWindow = evaluation.selectedControl.shuffleWindow,
+      selectedShuffleBytes = evaluation.selectedControl.shuffleBytes,
+      selectedBatchBytes = evaluation.selectedControl.batchBytes,
+      calibrationSampleWindows = evaluation.sampleWindows)
 
   private[rapids] def toObservationEvent(
       msg: RapidsAutotuneObservationMsg,

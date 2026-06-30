@@ -66,10 +66,8 @@ object GraphOptimizerConstraints {
     // concurrentGpuTasks seeds RAPIDS' dynamic memory-permit estimator; it is not a hard task
     // limit. A cold graph hint must therefore allow every Spark task slot that stock RAPIDS could
     // admit. The existing permit pool remains the authoritative memory-safety boundary.
-    val staticGpuLimit = conf.maxConcurrentGpuTasks.intValue()
     val nativeGpuMaximum = if (nativeGpuTaskSlots > 0) {
-      if (staticGpuLimit > 0) math.min(nativeGpuTaskSlots, staticGpuLimit)
-      else nativeGpuTaskSlots
+      nativeGpuTaskSlots
     } else {
       conf.autotuneGpuMaxConcurrentTasks
     }
@@ -130,17 +128,163 @@ case class GraphOptimizerDecision(
     predictedCurrentNanos: Double,
     predictedSelectedNanos: Double)
 
+private[rapids] case class GraphControlFreezeReasons(
+    scanWindow: String = "",
+    gpuTasks: String = "",
+    shuffleWindow: String = "",
+    shuffleBytes: String = "",
+    batchBytes: String = "")
+
+private[rapids] case class GraphStageAnalyticalState(
+    currentControl: GpuFlowControl,
+    currentGradient: GpuFlowGradient,
+    bounds: GpuFlowControlBounds,
+    freezeReasons: GraphControlFreezeReasons)
+
+private[rapids] case class GpuFlowCalibrationSample(
+    scanUnitNanos: Double,
+    scanBytes: Long,
+    gpuUnitNanos: Double,
+    gpuBytes: Long,
+    shuffleUnitNanos: Double,
+    shuffleBytes: Long,
+    broadcastNanos: Double,
+    broadcastBytes: Long,
+    batchUnitNanos: Double,
+    batchBytes: Long)
+
+private[rapids] case class GpuFlowAqeCalibration(
+    scanUnitNanosPerByte: Option[Double],
+    gpuUnitNanosPerByte: Option[Double],
+    shuffleUnitNanosPerByte: Option[Double],
+    broadcastNanosPerByte: Option[Double],
+    batchUnitNanosPerByte: Option[Double],
+    referenceControl: GpuFlowControl,
+    bounds: GpuFlowControlBounds,
+    sampleWindows: Long)
+
+private[rapids] object GpuFlowAqeCalibration {
+  def empty(constraints: GraphOptimizerConstraints): GpuFlowAqeCalibration = {
+    val reference = GpuFlowControl(
+      scanWindow = if (constraints.scan.enabled) constraints.scan.initialReadWindow else 0.0,
+      gpuTasks = if (constraints.gpu.enabled) constraints.gpu.initialConcurrentTasks else 0.0,
+      shuffleWindow = if (constraints.shuffle.enabled) {
+        constraints.shuffle.initialPrefetchWindow
+      } else 0.0,
+      shuffleBytes = if (constraints.shuffle.enabled) {
+        constraints.shuffle.initialReadyBytes
+      } else 0.0,
+      batchBytes = if (constraints.batch.enabled) constraints.batch.initialTargetBytes else 0.0)
+    val minimum = GpuFlowControl(
+      scanWindow = if (reference.scanWindow > 0.0) 1.0 else 0.0,
+      gpuTasks = reference.gpuTasks,
+      shuffleWindow = if (reference.shuffleWindow > 0.0) 1.0 else 0.0,
+      shuffleBytes = reference.shuffleBytes,
+      batchBytes = if (reference.batchBytes > 0.0 &&
+          constraints.batch.minimumTargetBytes > 0L) {
+        constraints.batch.minimumTargetBytes
+      } else reference.batchBytes)
+    val maximum = GpuFlowControl(
+      scanWindow = math.max(reference.scanWindow, constraints.scan.maxReadWindow.toDouble),
+      gpuTasks = math.max(reference.gpuTasks, constraints.gpu.maxConcurrentTasks.toDouble),
+      shuffleWindow = math.max(reference.shuffleWindow,
+        constraints.shuffle.maxPrefetchWindow.toDouble),
+      shuffleBytes = math.max(reference.shuffleBytes, constraints.shuffle.maxReadyBytes.toDouble),
+      batchBytes = math.max(reference.batchBytes, constraints.batch.maxBatchBytes.toDouble))
+    GpuFlowAqeCalibration(None, None, None, None, None, reference,
+      GpuFlowControlBounds(minimum, maximum), sampleWindows = 0L)
+  }
+}
+
+private[rapids] class GpuFlowAqeCalibrationAccumulator(
+    constraints: GraphOptimizerConstraints) {
+  private var scanUnitNanos = 0.0
+  private var scanBytes = 0L
+  private var gpuUnitNanos = 0.0
+  private var gpuBytes = 0L
+  private var shuffleUnitNanos = 0.0
+  private var shuffleBytes = 0L
+  private var broadcastNanos = 0.0
+  private var broadcastBytes = 0L
+  private var batchUnitNanos = 0.0
+  private var batchBytes = 0L
+  private var windows = 0L
+
+  def add(sample: GpuFlowCalibrationSample): Unit = {
+    if (sample.scanUnitNanos > 0.0 && sample.scanBytes > 0L) {
+      scanUnitNanos += sample.scanUnitNanos
+      scanBytes += sample.scanBytes
+    }
+    if (sample.gpuUnitNanos > 0.0 && sample.gpuBytes > 0L) {
+      gpuUnitNanos += sample.gpuUnitNanos
+      gpuBytes += sample.gpuBytes
+    }
+    if (sample.shuffleUnitNanos > 0.0 && sample.shuffleBytes > 0L) {
+      shuffleUnitNanos += sample.shuffleUnitNanos
+      shuffleBytes += sample.shuffleBytes
+    }
+    if (sample.broadcastNanos > 0.0 && sample.broadcastBytes > 0L) {
+      broadcastNanos += sample.broadcastNanos
+      broadcastBytes += sample.broadcastBytes
+    }
+    if (sample.batchUnitNanos > 0.0 && sample.batchBytes > 0L) {
+      batchUnitNanos += sample.batchUnitNanos
+      batchBytes += sample.batchBytes
+    }
+    windows += 1L
+  }
+
+  def snapshot: GpuFlowAqeCalibration = {
+    val empty = GpuFlowAqeCalibration.empty(constraints)
+    empty.copy(
+      scanUnitNanosPerByte = rate(scanUnitNanos, scanBytes),
+      gpuUnitNanosPerByte = rate(gpuUnitNanos, gpuBytes),
+      shuffleUnitNanosPerByte = rate(shuffleUnitNanos, shuffleBytes),
+      broadcastNanosPerByte = rate(broadcastNanos, broadcastBytes),
+      batchUnitNanosPerByte = rate(batchUnitNanos, batchBytes),
+      sampleWindows = windows)
+  }
+
+  private def rate(unitNanos: Double, bytes: Long): Option[Double] =
+    if (unitNanos > 0.0 && bytes > 0L) Some(unitNanos / bytes.toDouble) else None
+}
+
+/** Replay-complete record for one stage at one graph decision epoch. */
+private[rapids] case class GraphStageDecisionRecord(
+    epochId: Long,
+    trigger: String,
+    key: AutotuneStageKey,
+    active: Boolean,
+    completed: Boolean,
+    parentStageIds: Seq[Int],
+    observedTasks: Long,
+    sampleTasks: Long,
+    currentHintVersion: Long,
+    graphCurrentObjectiveNanos: Double,
+    graphSelectedObjectiveNanos: Double,
+    predictedCurrentNanos: Double,
+    predictedSelectedNanos: Double,
+    durationAdjoint: Double,
+    currentControl: GpuFlowControl,
+    selectedControl: GpuFlowControl,
+    endToEndGradient: GpuFlowGradient,
+    freezeReasons: GraphControlFreezeReasons)
+
 /** Best locally feasible complete hint for one fixed GPU-stage quota. */
-case class GraphStageCostAlternative(
+private[rapids] case class GraphStageCostAlternative(
     gpuTasks: Int,
     hint: StageRuntimeHint,
-    predictedNanos: Double)
+    predictedNanos: Double,
+    control: Option[GpuFlowControl] = None,
+    localGradient: GpuFlowGradient = GpuFlowGradient())
 
 /** Model-calibrated stage cost curve consumed by the graph-wide shared allocator. */
-case class GraphStageCostCurve(
+private[rapids] case class GraphStageCostCurve(
     predictedCurrentNanos: Double,
     sampleTasks: Long,
-    alternatives: Seq[GraphStageCostAlternative])
+    alternatives: Seq[GraphStageCostAlternative],
+    analyticalState: Option[GraphStageAnalyticalState] = None,
+    calibrationSample: Option[GpuFlowCalibrationSample] = None)
 
 /**
  * Single owner of initial and updated joint [[StageRuntimeHint]] values.
@@ -165,6 +309,12 @@ trait GraphWideAutotuneOptimizer {
 
   /** Release graph state after a SQL execution ends. */
   def executionCompleted(executionId: Long): Unit
+
+  /** Drain replay-complete records produced by graph decision epochs. */
+  def drainDecisionRecords(): Seq[GraphStageDecisionRecord] = Seq.empty
+
+  /** Calibrated resource-demand rates consumed by complete AQE plan evaluation. */
+  def aqeCalibrationSnapshot: Option[GpuFlowAqeCalibration] = None
 }
 
 /**
@@ -191,6 +341,9 @@ class AnalyticalGraphWideAutotuneOptimizer(
       var costCurve: Option[GraphStageCostCurve])
 
   private val stages = mutable.HashMap.empty[AutotuneStageKey, StageState]
+  private val pendingDecisionRecords = mutable.ArrayBuffer.empty[GraphStageDecisionRecord]
+  private val aqeCalibration = new GpuFlowAqeCalibrationAccumulator(constraints)
+  private var nextEpochId = 1L
 
   override def initialHint(
       key: AutotuneStageKey,
@@ -236,7 +389,8 @@ class AnalyticalGraphWideAutotuneOptimizer(
         state.lastEvaluationNanos = nowNanos
         state.costCurve = AnalyticalStageCostModel.costCurve(
           observation, current, state.descriptor.shape, constraints)
-        recomputeAllocations()
+        state.costCurve.flatMap(_.calibrationSample).foreach(aqeCalibration.add)
+        recomputeAllocations("feedback")
       }
     }.getOrElse(Seq.empty)
   }
@@ -246,7 +400,7 @@ class AnalyticalGraphWideAutotuneOptimizer(
       state.active = true
       state.completed = false
     }
-    recomputeAllocations()
+    recomputeAllocations("stage-submitted")
   }
 
   override def stageCompleted(key: AutotuneStageKey): Seq[GraphOptimizerDecision] = synchronized {
@@ -254,7 +408,7 @@ class AnalyticalGraphWideAutotuneOptimizer(
       state.active = false
       state.completed = true
     }
-    recomputeAllocations()
+    recomputeAllocations("stage-completed")
   }
 
   override def hintPublished(hint: StageRuntimeHint): Unit = synchronized {
@@ -265,17 +419,31 @@ class AnalyticalGraphWideAutotuneOptimizer(
     stages.retain { case (key, _) => key.executionId != executionId }
   }
 
-  private def recomputeAllocations(): Seq[GraphOptimizerDecision] = {
+  override def drainDecisionRecords(): Seq[GraphStageDecisionRecord] = synchronized {
+    val drained = pendingDecisionRecords.toVector
+    pendingDecisionRecords.clear()
+    drained
+  }
+
+  override def aqeCalibrationSnapshot: Option[GpuFlowAqeCalibration] = synchronized {
+    val snapshot = aqeCalibration.snapshot
+    if (snapshot.sampleWindows > 0L) Some(snapshot) else None
+  }
+
+  private def recomputeAllocations(trigger: String): Seq[GraphOptimizerDecision] = {
     val inputs = stages.iterator.map { case (key, state) =>
       GraphStageAllocationInput(
         key = key,
         descriptor = state.descriptor,
         active = state.active,
+        completed = state.completed,
         observedTasks = state.observedTasks,
         currentHint = state.currentHint,
         costCurve = state.costCurve)
     }.toSeq
-    GraphCriticalPathAllocator.allocate(inputs, constraints.gpu.maxConcurrentTasks).flatMap {
+    val solution = GraphCriticalPathAllocator.solve(inputs, constraints.gpu.maxConcurrentTasks)
+    recordDecisionEpoch(trigger, inputs, solution)
+    solution.toSeq.flatMap(_.allocations).flatMap {
       allocation =>
         stages.get(allocation.key).flatMap { state =>
           if (sameHintContent(state.currentHint, allocation.hint)) {
@@ -289,6 +457,54 @@ class AnalyticalGraphWideAutotuneOptimizer(
           }
         }
     }
+  }
+
+  private def recordDecisionEpoch(
+      trigger: String,
+      inputs: Seq[GraphStageAllocationInput],
+      solution: Option[GraphAllocationSolution]): Unit = {
+    val epochId = nextEpochId
+    nextEpochId += 1L
+    val allocationByKey = solution.toSeq.flatMap(_.allocations).map(a => a.key -> a).toMap
+    val selectedAdjoints = solution.map(_.selectedFlow.durationAdjoints).getOrElse(Map.empty)
+    inputs.sortBy(input => (input.key.executionId, input.key.stageId, input.key.stageAttemptId))
+      .foreach { input =>
+        val curve = input.costCurve
+        val analytical = curve.flatMap(_.analyticalState)
+        val allocation = allocationByKey.get(input.key)
+        val currentControl = analytical.map(_.currentControl)
+          .getOrElse(AnalyticalStageCostModel.controlFor(input.currentHint))
+        val selectedControl = allocation.flatMap(_.control).getOrElse(currentControl)
+        val localGradient = allocation.map(_.localGradient)
+          .orElse(analytical.map(_.currentGradient)).getOrElse(GpuFlowGradient())
+        val adjoint = selectedAdjoints.getOrElse(input.key, 0.0)
+        val reasons = analytical.map(_.freezeReasons).getOrElse {
+          val reason = if (input.completed) "completed-work-is-sunk"
+          else if (!input.active) "stage-not-active"
+          else "no-current-version-calibration"
+          GraphControlFreezeReasons(reason, reason, reason, reason, reason)
+        }
+        pendingDecisionRecords += GraphStageDecisionRecord(
+          epochId = epochId,
+          trigger = trigger,
+          key = input.key,
+          active = input.active,
+          completed = input.completed,
+          parentStageIds = input.descriptor.parentStageIds,
+          observedTasks = input.observedTasks,
+          sampleTasks = curve.map(_.sampleTasks).getOrElse(0L),
+          currentHintVersion = input.currentHint.version,
+          graphCurrentObjectiveNanos = solution.map(_.currentFlow.objectiveNanos).getOrElse(0.0),
+          graphSelectedObjectiveNanos = solution.map(_.selectedFlow.objectiveNanos).getOrElse(0.0),
+          predictedCurrentNanos = curve.map(_.predictedCurrentNanos).getOrElse(0.0),
+          predictedSelectedNanos = allocation.map(_.predictedSelectedNanos)
+            .getOrElse(curve.map(_.predictedCurrentNanos).getOrElse(0.0)),
+          durationAdjoint = adjoint,
+          currentControl = currentControl,
+          selectedControl = selectedControl,
+          endToEndGradient = localGradient.scale(adjoint),
+          freezeReasons = reasons)
+      }
   }
 
   private def sameHintContent(left: StageRuntimeHint, right: StageRuntimeHint): Boolean =
@@ -345,6 +561,7 @@ private[rapids] case class GraphStageAllocationInput(
     key: AutotuneStageKey,
     descriptor: AutotuneStageDescriptor,
     active: Boolean,
+    completed: Boolean = false,
     observedTasks: Long,
     currentHint: StageRuntimeHint,
     costCurve: Option[GraphStageCostCurve])
@@ -353,7 +570,14 @@ private[rapids] case class GraphStageAllocation(
     key: AutotuneStageKey,
     hint: StageRuntimeHint,
     predictedCurrentNanos: Double,
-    predictedSelectedNanos: Double)
+    predictedSelectedNanos: Double,
+    control: Option[GpuFlowControl] = None,
+    localGradient: GpuFlowGradient = GpuFlowGradient())
+
+private[rapids] case class GraphAllocationSolution(
+    allocations: Seq[GraphStageAllocation],
+    currentFlow: GpuFlowGraphEvaluation,
+    selectedFlow: GpuFlowGraphEvaluation)
 
 /**
  * Pure shared-resource solver. It enumerates legal stage GPU quotas under one shared budget and
@@ -364,11 +588,16 @@ private[rapids] case class GraphStageAllocation(
 private[rapids] object GraphCriticalPathAllocator {
   def allocate(
       graph: Seq[GraphStageAllocationInput],
-      sharedGpuBudget: Int): Seq[GraphStageAllocation] = {
+      sharedGpuBudget: Int): Seq[GraphStageAllocation] =
+    solve(graph, sharedGpuBudget).map(_.allocations).getOrElse(Seq.empty)
+
+  def solve(
+      graph: Seq[GraphStageAllocationInput],
+      sharedGpuBudget: Int): Option[GraphAllocationSolution] = {
     val hasCalibratedStage = graph.exists(input =>
       input.active && input.costCurve.exists(_.alternatives.nonEmpty))
     if (!hasCalibratedStage) {
-      return Seq.empty
+      return None
     }
     val tunable = graph.filter(_.active).flatMap { input =>
       input.costCurve.filter(_.alternatives.nonEmpty)
@@ -378,7 +607,7 @@ private[rapids] object GraphCriticalPathAllocator {
       (input.key.executionId, input.key.stageId, input.key.stageAttemptId)
     }
     if (tunable.isEmpty) {
-      return Seq.empty
+      return None
     }
     val tunableByKey = tunable.map { case (input, curve) =>
       (input.key, (input, curve))
@@ -436,21 +665,25 @@ private[rapids] object GraphCriticalPathAllocator {
 
     search(0, 0, Map.empty)
     if (best.isEmpty) {
-      return Seq.empty
+      return None
     }
 
+    val currentCosts = tunable.map { case (input, curve) =>
+      input.key -> remainingNanos(input, curve.predictedCurrentNanos, curve.sampleTasks)
+    }.toMap
     val selectedCosts = best.map { case (key, alternative) =>
       val (input, curve) = tunableByKey(key)
       key -> remainingNanos(input, alternative.predictedNanos, curve.sampleTasks)
     }
-    val flow = evaluateGraph(graph, selectedCosts)
-    tunable.flatMap { case (input, curve) =>
+    val currentFlow = evaluateGraph(graph, currentCosts)
+    val selectedFlow = evaluateGraph(graph, selectedCosts)
+    val allocations = tunable.flatMap { case (input, curve) =>
       best.get(input.key).map { alternative =>
         // Reverse-mode criticality is the marginal change in the end-to-end objective caused by
         // one additional nanosecond in this stage. Multiplying by its remaining duration gives
         // the amount of query completion time currently exposed through this node.
         val priority = toPriority(
-          flow.durationAdjoints.getOrElse(input.key, 0.0) *
+          selectedFlow.durationAdjoints.getOrElse(input.key, 0.0) *
             selectedCosts.getOrElse(input.key, 0.0))
         val allocatedGpu = if (alternative.hint.gpu.maxConcurrentTasks > 0) {
           alternative.hint.gpu.copy(
@@ -464,9 +697,12 @@ private[rapids] object GraphCriticalPathAllocator {
           key = input.key,
           hint = alternative.hint.copy(gpu = allocatedGpu),
           predictedCurrentNanos = curve.predictedCurrentNanos,
-          predictedSelectedNanos = alternative.predictedNanos)
+          predictedSelectedNanos = alternative.predictedNanos,
+          control = alternative.control,
+          localGradient = alternative.localGradient)
       }
     }
+    Some(GraphAllocationSolution(allocations, currentFlow, selectedFlow))
   }
 
   /** Keep an uncalibrated active GPU stage at its native allocation. */
@@ -585,6 +821,7 @@ object AnalyticalStageCostModel {
         constraints.gpu.maxConcurrentTasks
       } else 0)
     val bounds = controlBounds(work, currentControl, constraints)
+    val currentEvaluation = GpuFlowStageModel.evaluate(work, currentControl)
 
     val alternatives = gpuValues.map { gpuTasks =>
       val fixedGpu = gpuTasks.toDouble
@@ -593,16 +830,25 @@ object AnalyticalStageCostModel {
         maximum = bounds.maximum.copy(gpuTasks = fixedGpu))
       val selected = GpuFlowProjectedOptimizer.optimize(
         work, currentControl.copy(gpuTasks = fixedGpu), fixedBounds)
+      val selectedEvaluation = GpuFlowStageModel.evaluate(work, selected)
       GraphStageCostAlternative(
         gpuTasks = gpuTasks,
         hint = hintForCandidate(
           current, currentControl, selected, constraints.batch.initialSplitUntilSize),
-        predictedNanos = GpuFlowStageModel.evaluate(work, selected).predictedNanos)
+        predictedNanos = selectedEvaluation.predictedNanos,
+        control = Some(selected),
+        localGradient = selectedEvaluation.gradient)
     }
     Some(GraphStageCostCurve(
-      predictedCurrentNanos = GpuFlowStageModel.evaluate(work, currentControl).predictedNanos,
+      predictedCurrentNanos = currentEvaluation.predictedNanos,
       sampleTasks = observation.taskCount,
-      alternatives = alternatives))
+      alternatives = alternatives,
+      analyticalState = Some(GraphStageAnalyticalState(
+        currentControl = currentControl,
+        currentGradient = currentEvaluation.gradient,
+        bounds = bounds,
+        freezeReasons = freezeReasons(work, currentControl, bounds))),
+      calibrationSample = Some(calibrationSample(observation, shape, work))))
   }
 
   private def hintForCandidate(
@@ -647,55 +893,75 @@ object AnalyticalStageCostModel {
       obs: StageObservationAgg,
       current: StageRuntimeHint,
       shape: AutotuneStageShape): GpuFlowStageWork = {
-    val elapsed = math.max(obs.totalTaskDurationNanos.toDouble,
-      (obs.totalGpuHoldingNanos + obs.totalGpuSemaphoreWaitNanos +
-        obs.totalRetryOrLostTimeNanos).toDouble)
+    val classified = classifyNonGpuWork(obs, shape)
     val retry = obs.totalRetryOrLostTimeNanos.toDouble
-    val availableNonGpu = math.max(0.0,
-      elapsed - obs.totalGpuHoldingNanos - obs.totalGpuSemaphoreWaitNanos - retry)
-    val scanBytes = if (shape.hasGpuScan) {
-      math.max(0L, obs.totalInputBytes - obs.totalShuffleReadBytes)
-    } else {
-      0L
-    }
-    val shuffleBytes = if (shape.hasShuffle) {
-      obs.totalShuffleReadBytes + obs.totalShuffleWriteBytes
-    } else {
-      0L
-    }
-    val classifiedBytes = scanBytes + shuffleBytes
-    val scanShare = if (classifiedBytes > 0L) scanBytes.toDouble / classifiedBytes else 0.0
-    val shuffleShare = if (classifiedBytes > 0L) {
-      shuffleBytes.toDouble / classifiedBytes
-    } else {
-      0.0
-    }
-    val classifiedNanos = if (classifiedBytes > 0L) availableNonGpu else 0.0
-    val scanNanos = classifiedNanos * scanShare
-    val shuffleNanos = classifiedNanos * shuffleShare
-    val unclassifiedNanos = math.max(0.0, availableNonGpu - scanNanos - shuffleNanos)
     val processedBytes = math.max(obs.totalInputBytes, obs.totalOutputBytes)
     val currentBatch = activeBatchBytes(current)
     // If batch sizing is active, the unclassified per-task overhead is modeled by the number of
     // target-sized batches. This is identifiable from measured elapsed work and bytes; no fixed
     // "good batch size" or tuning threshold is embedded in the optimizer.
     val batchOverhead = if (currentBatch > 0L && processedBytes > 0L) {
-      unclassifiedNanos
+      classified.unclassifiedNanos
     } else {
       0.0
     }
     GpuFlowStageWork(
-      scanNanos = scanNanos,
+      scanNanos = classified.scanNanos,
       gpuNanos = obs.totalGpuHoldingNanos.toDouble +
         obs.totalGpuSemaphoreWaitNanos.toDouble,
-      shuffleNanos = shuffleNanos,
+      shuffleNanos = classified.shuffleNanos,
       batchNanos = batchOverhead,
-      fixedNanos = math.max(0.0, unclassifiedNanos - batchOverhead),
+      fixedNanos = classified.broadcastNanos +
+        math.max(0.0, classified.unclassifiedNanos - batchOverhead),
       retryNanos = retry,
       baseline = controlFor(current))
   }
 
-  private def controlFor(hint: StageRuntimeHint): GpuFlowControl = GpuFlowControl(
+  private case class NonGpuClassification(
+      scanNanos: Double,
+      scanBytes: Long,
+      shuffleNanos: Double,
+      shuffleBytes: Long,
+      broadcastNanos: Double,
+      broadcastBytes: Long,
+      unclassifiedNanos: Double)
+
+  private def classifyNonGpuWork(
+      observation: StageObservationAgg,
+      shape: AutotuneStageShape): NonGpuClassification = {
+    val elapsed = math.max(observation.totalTaskDurationNanos.toDouble,
+      (observation.totalGpuHoldingNanos + observation.totalGpuSemaphoreWaitNanos +
+        observation.totalRetryOrLostTimeNanos).toDouble)
+    val available = math.max(0.0,
+      elapsed - observation.totalGpuHoldingNanos - observation.totalGpuSemaphoreWaitNanos -
+        observation.totalRetryOrLostTimeNanos)
+    val scanBytes = if (shape.hasGpuScan) {
+      math.max(0L, observation.totalInputBytes - observation.totalShuffleReadBytes)
+    } else 0L
+    val shuffleBytes = if (shape.hasShuffle) {
+      observation.totalShuffleReadBytes + observation.totalShuffleWriteBytes
+    } else 0L
+    val broadcastBytes = if (shape.hasBroadcast) {
+      math.max(observation.totalInputBytes, observation.totalOutputBytes)
+    } else 0L
+    val classifiedBytes = scanBytes + shuffleBytes + broadcastBytes
+    def nanos(bytes: Long): Double = {
+      if (classifiedBytes > 0L) available * bytes.toDouble / classifiedBytes.toDouble else 0.0
+    }
+    val scanNanos = nanos(scanBytes)
+    val shuffleNanos = nanos(shuffleBytes)
+    val broadcastNanos = nanos(broadcastBytes)
+    NonGpuClassification(
+      scanNanos,
+      scanBytes,
+      shuffleNanos,
+      shuffleBytes,
+      broadcastNanos,
+      broadcastBytes,
+      math.max(0.0, available - scanNanos - shuffleNanos - broadcastNanos))
+  }
+
+  private[rapids] def controlFor(hint: StageRuntimeHint): GpuFlowControl = GpuFlowControl(
     scanWindow = activeScanWindow(hint).toDouble,
     gpuTasks = activeGpuTasks(hint).toDouble,
     shuffleWindow = activeShuffleWindow(hint).toDouble,
@@ -735,6 +1001,56 @@ object AnalyticalStageCostModel {
         shuffleBytes._1, batch._1),
       maximum = GpuFlowControl(scan._2, gpu._2, shuffleWindow._2,
         shuffleBytes._2, batch._2))
+  }
+
+  private def freezeReasons(
+      work: GpuFlowStageWork,
+      current: GpuFlowControl,
+      bounds: GpuFlowControlBounds): GraphControlFreezeReasons = {
+    def reason(value: Double, measuredWork: Double, minimum: Double, maximum: Double): String = {
+      if (value <= 0.0) "actuator-not-present"
+      else if (measuredWork <= 0.0) "no-measured-work"
+      else if (maximum <= minimum) "fixed-by-feasibility-bounds"
+      else ""
+    }
+    val gpuReason = reason(current.gpuTasks, work.gpuNanos,
+      bounds.minimum.gpuTasks, bounds.maximum.gpuTasks) match {
+      case "" => "downward-response-unidentified"
+      case other => other
+    }
+    GraphControlFreezeReasons(
+      scanWindow = reason(current.scanWindow, work.scanNanos,
+        bounds.minimum.scanWindow, bounds.maximum.scanWindow),
+      gpuTasks = gpuReason,
+      shuffleWindow = reason(current.shuffleWindow, work.shuffleNanos,
+        bounds.minimum.shuffleWindow, bounds.maximum.shuffleWindow),
+      shuffleBytes = reason(current.shuffleBytes, work.shuffleNanos,
+        bounds.minimum.shuffleBytes, bounds.maximum.shuffleBytes),
+      batchBytes = reason(current.batchBytes, work.batchNanos,
+        bounds.minimum.batchBytes, bounds.maximum.batchBytes))
+  }
+
+  private def calibrationSample(
+      observation: StageObservationAgg,
+      shape: AutotuneStageShape,
+      work: GpuFlowStageWork): GpuFlowCalibrationSample = {
+    val classified = classifyNonGpuWork(observation, shape)
+    val processedBytes = Seq(
+      observation.totalInputBytes,
+      observation.totalOutputBytes,
+      classified.shuffleBytes).max
+    GpuFlowCalibrationSample(
+      scanUnitNanos = work.scanNanos * work.baseline.scanWindow,
+      scanBytes = classified.scanBytes,
+      gpuUnitNanos = work.gpuNanos * work.baseline.gpuTasks,
+      gpuBytes = processedBytes,
+      shuffleUnitNanos = work.shuffleNanos * work.baseline.shuffleWindow *
+        work.baseline.shuffleBytes,
+      shuffleBytes = classified.shuffleBytes,
+      broadcastNanos = classified.broadcastNanos,
+      broadcastBytes = classified.broadcastBytes,
+      batchUnitNanos = work.batchNanos * work.baseline.batchBytes,
+      batchBytes = processedBytes)
   }
 
   private def intDomain(current: Int, maximum: Int): Seq[Int] = {

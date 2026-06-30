@@ -27,7 +27,8 @@ case class AutotuneStageShape(
     hasGpuScan: Boolean,
     hasGpuPrefetchConsumer: Boolean,
     numTasks: Int,
-    hasShuffle: Boolean = false) {
+    hasShuffle: Boolean = false,
+    hasBroadcast: Boolean = false) {
   def isScanPrefetchCandidate: Boolean =
     hasGpuScan && hasGpuPrefetchConsumer && numTasks > 0
 
@@ -36,7 +37,7 @@ case class AutotuneStageShape(
 
   /** True for an executed stage that performs any GPU work the autotuner can hint. */
   def hasGpuWork: Boolean =
-    (hasGpuScan || hasGpuPrefetchConsumer || hasShuffle) && numTasks > 0
+    (hasGpuScan || hasGpuPrefetchConsumer || hasShuffle || hasBroadcast) && numTasks > 0
 }
 
 object AutotuneStageShape {
@@ -63,6 +64,8 @@ object AutotuneStageShape {
     "GpuShuffleCoalesce",
     "GpuColumnarExchange")
 
+  private val GpuBroadcastPrefixes = Seq("GpuBroadcastExchange")
+
   def fromStageInfo(stageInfo: StageInfo): AutotuneStageShape = {
     fromRddScopeNames(stageInfo.rddInfos.flatMap(scopeName), stageInfo.numTasks)
   }
@@ -76,6 +79,9 @@ object AutotuneStageShape {
       numTasks = numTasks,
       hasShuffle = scopeNames.exists { name =>
         GpuShufflePrefixes.exists(name.startsWith)
+      },
+      hasBroadcast = scopeNames.exists { name =>
+        GpuBroadcastPrefixes.exists(name.startsWith)
       })
   }
 
