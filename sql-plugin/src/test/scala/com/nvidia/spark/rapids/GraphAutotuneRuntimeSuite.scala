@@ -296,24 +296,57 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsConf.AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW.key -> "6",
       RapidsConf.AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES.key -> "4096",
       RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true",
+      RapidsConf.GPU_BATCH_SIZE_BYTES.key -> "8192",
       RapidsConf.AUTOTUNE_BATCH_TARGET_BYTES.key -> "4096",
       RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "16384",
       RapidsConf.AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE.key -> "512"))
     val optimizer = new AnalyticalGraphWideAutotuneOptimizer(
-      GraphOptimizerConstraints.fromConf(conf))
+      GraphOptimizerConstraints.fromConf(conf, nativeGpuTaskSlots = 16))
     val shape = AutotuneStageShape(
       hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50, hasShuffle = true)
     val hint = optimizer.initialHint(key, AutotuneStageDescriptor(shape, Seq(1, 2)))
 
-    // OPTIMIZE starts from static values. The larger values are feasible constraints selected only
-    // by the joint objective after observations arrive.
+    // Cold hints preserve native execution. Configured smaller values are model candidates, not
+    // an unconditional pre-observation policy.
     assert(hint.scan == ScanRuntimeHint(true, 1, 8, 1024L))
-    assert(hint.gpu == GpuRuntimeHint(4))
-    assert(hint.shuffle == ShuffleRuntimeHint(1, 2048L, 4096L))
-    assert(hint.batch == BatchRuntimeHint(4096L, 16384L, 512L))
+    assert(hint.gpu == GpuRuntimeHint(
+      maxConcurrentTasks = 16, sharedMaxConcurrentTasks = 16))
+    assert(hint.shuffle == ShuffleRuntimeHint(1, 2048L, 8192L))
+    assert(hint.batch == BatchRuntimeHint(8192L, 16384L, 0L))
   }
 
-  test("GPU admission controller applies the minimum active positive stage cap") {
+  test("native GPU slots and batch size remain in the optimizer domain") {
+    val oneGiB = 1024L * 1024L * 1024L
+    val conf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
+      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",
+      RapidsConf.AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS.key -> "8",
+      RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES.key -> "128m",
+      RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true",
+      RapidsConf.GPU_BATCH_SIZE_BYTES.key -> "1g",
+      RapidsConf.AUTOTUNE_BATCH_TARGET_BYTES.key -> "128m",
+      RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "512m",
+      RapidsConf.AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE.key -> "128m"))
+
+    val constraints = GraphOptimizerConstraints.fromConf(conf, nativeGpuTaskSlots = 16)
+    assert(constraints.gpu.initialConcurrentTasks == 16)
+    assert(constraints.gpu.maxConcurrentTasks == 16)
+    assert(constraints.batch.initialTargetBytes == oneGiB)
+    assert(constraints.batch.minimumTargetBytes == 128L * 1024L * 1024L)
+    assert(constraints.batch.maxBatchBytes == oneGiB)
+
+    val optimizer = new AnalyticalGraphWideAutotuneOptimizer(constraints)
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 200, hasShuffle = true)
+    val hint = optimizer.initialHint(key, AutotuneStageDescriptor(shape))
+    assert(hint.gpu == GpuRuntimeHint(16, sharedMaxConcurrentTasks = 16))
+    assert(hint.shuffle.coalesceTargetBytes == oneGiB)
+    assert(hint.batch == BatchRuntimeHint(oneGiB, oneGiB, splitUntilSize = 0L))
+  }
+
+  test("legacy GPU admission hints retain the minimum active positive stage cap") {
     val appliedLimits = mutable.ArrayBuffer.empty[Int]
     val controller = new RapidsAutotuneGpuAdmissionController(limit => {
       appliedLimits += limit
@@ -336,6 +369,45 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(controller.reset() == 0)
 
     assert(appliedLimits == Seq(4, 4, 2, 4, 4, 0, 0))
+  }
+
+  test("GPU admission installs shared graph budget stage quotas and priorities") {
+    val allocations = mutable.ArrayBuffer.empty[
+      (Int, Map[Long, Int], Map[Long, Long])]
+    val controller = new RapidsAutotuneGpuAdmissionController(
+      applyLimit = identity,
+      applyStageAllocation = Some((shared, limits, priorities) => {
+        allocations += ((shared, limits, priorities))
+        shared
+      }),
+      initialMaxSharedConcurrentTasks = 3)
+    val secondKey = key.copy(stageId = 4, stageAttemptId = 1)
+    val critical = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
+      version = 1L,
+      gpu = GpuRuntimeHint(
+        maxConcurrentTasks = 2,
+        sharedMaxConcurrentTasks = 3,
+        schedulingPriority = 100L)), hasHint = true)
+    val sibling = AutotuneCachedHint(StageRuntimeHint.empty(secondKey).copy(
+      version = 2L,
+      gpu = GpuRuntimeHint(
+        maxConcurrentTasks = 1,
+        sharedMaxConcurrentTasks = 3,
+        schedulingPriority = 40L)), hasHint = true)
+
+    assert(controller.taskStarted(key, 100L, critical) == 3)
+    assert(controller.taskStarted(secondKey, 200L, sibling) == 3)
+    val (_, limits, priorities) = allocations.last
+    assert(limits == Map(
+      GpuAdmissionStageGroup(key) -> 2,
+      GpuAdmissionStageGroup(secondKey) -> 1))
+    assert(priorities == Map(
+      GpuAdmissionStageGroup(key) -> 100L,
+      GpuAdmissionStageGroup(secondKey) -> 40L))
+
+    assert(controller.taskCompleted(key, 100L) == 3)
+    assert(allocations.last._2 == Map(GpuAdmissionStageGroup(secondKey) -> 1))
+    assert(controller.taskCompleted(secondKey, 200L) == 0)
   }
 
   test("driver endpoint publishes stable positive default no-op hints") {
@@ -414,7 +486,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
         minReadWindow = 1,
         maxReadWindow = 4,
         maxReadyBytes = 1024L))
-      assert(hint.gpu == GpuRuntimeHint(maxConcurrentTasks = 4))
+      assert(hint.gpu == GpuRuntimeHint(
+        maxConcurrentTasks = 4, sharedMaxConcurrentTasks = 4))
 
       val response = RapidsAutotuneDriverEndpoint.handleHintRequest(
         RapidsAutotuneHintRequestMsg("exec-1", key))
@@ -517,7 +590,10 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val endpoint = new RapidsAutotuneExecutorEndpoint(ctx, conf)
     val scanHint = ScanRuntimeHint(
       eagerPrefetch = true, minReadWindow = 1, maxReadWindow = 4, maxReadyBytes = 2048L)
-    val gpuHint = GpuRuntimeHint(maxConcurrentTasks = 3)
+    val gpuHint = GpuRuntimeHint(
+      maxConcurrentTasks = 3,
+      sharedMaxConcurrentTasks = 5,
+      schedulingPriority = 700L)
     val shuffleHint = ShuffleRuntimeHint(
       prefetchWindow = 6, maxReadyBytes = 4096L, coalesceTargetBytes = 1024L)
     val batchHint = BatchRuntimeHint(
@@ -557,7 +633,10 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       hasHint = true,
       scan = ScanRuntimeHint(
         eagerPrefetch = true, minReadWindow = 1, maxReadWindow = 4, maxReadyBytes = 2048L),
-      gpu = GpuRuntimeHint(maxConcurrentTasks = 3),
+      gpu = GpuRuntimeHint(
+        maxConcurrentTasks = 3,
+        sharedMaxConcurrentTasks = 5,
+        schedulingPriority = 700L),
       shuffle = ShuffleRuntimeHint(
         prefetchWindow = 6, maxReadyBytes = 4096L, coalesceTargetBytes = 1024L),
       batch = BatchRuntimeHint(
@@ -580,6 +659,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(event.scanMaxReadyBytes == 2048L)
     assert(event.gpuMaxConcurrentTasks == 3)
     assert(event.gpuAppliedMaxConcurrentTasks == 2)
+    assert(event.gpuSharedMaxConcurrentTasks == 5)
+    assert(event.gpuSchedulingPriority == 700L)
     assert(event.shufflePrefetchWindow == 6)
     assert(event.shuffleMaxReadyBytes == 4096L)
     assert(event.shuffleCoalesceTargetBytes == 1024L)
@@ -597,6 +678,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsConf.AUTOTUNE_SHUFFLE_MAX_READY_BYTES.key -> "2048",
       RapidsConf.AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES.key -> "1024",
       RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true",
+      RapidsConf.GPU_BATCH_SIZE_BYTES.key -> "4096",
       RapidsConf.AUTOTUNE_BATCH_TARGET_BYTES.key -> "4096",
       RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "8192",
       RapidsConf.AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE.key -> "512"))
@@ -611,9 +693,9 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(hint.version == 1L)
       assert(hint.shuffle ==
         ShuffleRuntimeHint(prefetchWindow = 1, maxReadyBytes = 2048L,
-          coalesceTargetBytes = 1024L))
+          coalesceTargetBytes = 4096L))
       assert(hint.batch ==
-        BatchRuntimeHint(targetBatchBytes = 4096L, maxBatchBytes = 8192L, splitUntilSize = 512L))
+        BatchRuntimeHint(targetBatchBytes = 4096L, maxBatchBytes = 8192L, splitUntilSize = 0L))
       // A shuffle-only stage is not a scan-prefetch candidate, so the scan slot stays empty.
       assert(hint.scan == ScanRuntimeHint.empty)
 
@@ -757,6 +839,104 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     shuffleWriteBytes = shuffleWrite,
     retryOrLostTimeNanos = retry)
 
+  test("critical-path allocator spends a shared GPU budget on the longest active branch") {
+    val leftKey = key.copy(stageId = 10)
+    val rightKey = key.copy(stageId = 11)
+    val joinKey = key.copy(stageId = 12)
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 1)
+    def hint(stageKey: AutotuneStageKey, gpuTasks: Int): StageRuntimeHint =
+      StageRuntimeHint.empty(stageKey).copy(gpu = GpuRuntimeHint(gpuTasks))
+    def curve(
+        stageKey: AutotuneStageKey,
+        costs: Seq[Double]): GraphStageCostCurve = GraphStageCostCurve(
+      predictedCurrentNanos = costs.head,
+      sampleTasks = 1L,
+      alternatives = costs.zipWithIndex.map { case (cost, index) =>
+        val gpuTasks = index + 1
+        GraphStageCostAlternative(gpuTasks, hint(stageKey, gpuTasks), cost)
+      })
+    val graph = Seq(
+      GraphStageAllocationInput(leftKey, AutotuneStageDescriptor(shape), active = true,
+        observedTasks = 0L, currentHint = hint(leftKey, 1),
+        costCurve = Some(curve(leftKey, Seq(100.0, 50.0, 34.0)))),
+      GraphStageAllocationInput(rightKey, AutotuneStageDescriptor(shape), active = true,
+        observedTasks = 0L, currentHint = hint(rightKey, 1),
+        costCurve = Some(curve(rightKey, Seq(40.0, 25.0, 20.0)))),
+      GraphStageAllocationInput(joinKey, AutotuneStageDescriptor(shape, Seq(10, 11)),
+        active = false, observedTasks = 0L, currentHint = hint(joinKey, 1), costCurve = None))
+
+    val allocations = GraphCriticalPathAllocator.allocate(graph, sharedGpuBudget = 3)
+      .map(allocation => allocation.key -> allocation.hint.gpu).toMap
+
+    assert(allocations(leftKey).maxConcurrentTasks == 2)
+    assert(allocations(rightKey).maxConcurrentTasks == 1)
+    assert(allocations.values.map(_.maxConcurrentTasks).sum == 3)
+    assert(allocations.values.forall(_.sharedMaxConcurrentTasks == 3))
+    assert(allocations(leftKey).schedulingPriority > allocations(rightKey).schedulingPriority)
+  }
+
+  test("oversubscribed graph keeps every active stage runnable under the lower shared cap") {
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 1)
+    val graph = (1 to 3).map { stageId =>
+      val stageKey = key.copy(stageId = stageId)
+      val stageHint = StageRuntimeHint.empty(stageKey).copy(gpu = GpuRuntimeHint(1))
+      GraphStageAllocationInput(
+        stageKey,
+        AutotuneStageDescriptor(shape),
+        active = true,
+        observedTasks = 0L,
+        currentHint = stageHint,
+        costCurve = Some(GraphStageCostCurve(
+          predictedCurrentNanos = stageId.toDouble,
+          sampleTasks = 1L,
+          alternatives = Seq(GraphStageCostAlternative(1, stageHint, stageId.toDouble)))))
+    }
+
+    val allocations = GraphCriticalPathAllocator.allocate(graph, sharedGpuBudget = 2)
+    assert(allocations.size == 3)
+    assert(allocations.forall(_.hint.gpu.maxConcurrentTasks == 1))
+    assert(allocations.forall(_.hint.gpu.sharedMaxConcurrentTasks == 2))
+  }
+
+  test("shared allocator preserves the native quota for an uncalibrated sibling") {
+    val calibratedKey = key.copy(stageId = 20)
+    val coldKey = key.copy(stageId = 21)
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 10)
+    def hint(stageKey: AutotuneStageKey, gpuTasks: Int): StageRuntimeHint =
+      StageRuntimeHint.empty(stageKey).copy(gpu = GpuRuntimeHint(gpuTasks))
+    val calibratedHint = hint(calibratedKey, 1)
+    val graph = Seq(
+      GraphStageAllocationInput(
+        calibratedKey,
+        AutotuneStageDescriptor(shape),
+        active = true,
+        observedTasks = 2L,
+        currentHint = calibratedHint,
+        costCurve = Some(GraphStageCostCurve(
+          predictedCurrentNanos = 100.0,
+          sampleTasks = 2L,
+          alternatives = Seq(
+            GraphStageCostAlternative(1, calibratedHint, 100.0),
+            GraphStageCostAlternative(2, hint(calibratedKey, 2), 50.0),
+            GraphStageCostAlternative(3, hint(calibratedKey, 3), 34.0))))),
+      GraphStageAllocationInput(
+        coldKey,
+        AutotuneStageDescriptor(shape),
+        active = true,
+        observedTasks = 0L,
+        currentHint = hint(coldKey, 2),
+        costCurve = None))
+
+    val allocations = GraphCriticalPathAllocator.allocate(graph, sharedGpuBudget = 3)
+      .map(allocation => allocation.key -> allocation.hint.gpu).toMap
+    assert(allocations(calibratedKey).maxConcurrentTasks == 1)
+    assert(allocations(coldKey).maxConcurrentTasks == 2)
+    assert(allocations.values.map(_.maxConcurrentTasks).sum == 3)
+  }
+
   test("analytical optimizer solves scan GPU and shuffle controls as one joint candidate") {
     val constraints = optimizerConstraints()
     val shape = AutotuneStageShape(
@@ -831,8 +1011,9 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val changed = optimizer.observe(second, initial, nowNanos = 1000L)
     assert(changed.exists(_.hint.gpu.maxConcurrentTasks == 8))
     // A fresh two-sample window inside the interval remains queued, not evaluated.
-    assert(optimizer.observe(first, changed.get.hint, nowNanos = 1050L).isEmpty)
-    assert(optimizer.observe(second, changed.get.hint, nowNanos = 1050L).isEmpty)
+    val updated = changed.head.hint
+    assert(optimizer.observe(first, updated, nowNanos = 1050L).isEmpty)
+    assert(optimizer.observe(second, updated, nowNanos = 1050L).isEmpty)
   }
 
   test("optimizer calibrates only observations from the current complete hint version") {
@@ -849,6 +1030,23 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(optimizer.observe(stale, initial, nowNanos = 1000L).isEmpty)
     assert(optimizer.observe(current1, initial, nowNanos = 1000L).isEmpty)
     assert(optimizer.observe(current2, initial, nowNanos = 1000L).nonEmpty)
+  }
+
+  test("late observations do not reactivate a completed stage") {
+    val optimizer = new AnalyticalGraphWideAutotuneOptimizer(
+      optimizerConstraints(minSamples = 2L, intervalNanos = 0L))
+    val shape = AutotuneStageShape(
+      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
+    val initial = optimizer.initialHint(key, AutotuneStageDescriptor(shape)).copy(version = 1L)
+    optimizer.hintPublished(initial)
+    optimizer.stageSubmitted(key)
+    optimizer.stageCompleted(key)
+    val first = optimizerObservation(key, 1L, wait = 0L, holding = 1000L,
+      duration = 1000L, input = 0L, output = 0L)
+    val second = first.copy(taskAttemptId = 2L)
+
+    assert(optimizer.observe(first, initial, nowNanos = 1000L).isEmpty)
+    assert(optimizer.observe(second, initial, nowNanos = 1000L).isEmpty)
   }
 
   test("optimizer retains unidentifiable batch control instead of minimizing it to one byte") {
