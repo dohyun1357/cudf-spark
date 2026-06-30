@@ -20,15 +20,25 @@ import scala.collection.mutable
 
 private case class ActiveGpuAdmissionHint(
     var maxConcurrentTasks: Int,
+    var sharedMaxConcurrentTasks: Int,
+    var schedulingPriority: Long,
     var hintVersion: Long,
     activeTasks: mutable.Set[Long])
+
+/** Stable semaphore admission-group id available from both the wire key and Spark TaskContext. */
+private[rapids] object GpuAdmissionStageGroup {
+  def apply(key: AutotuneStageKey): Long = apply(key.stageId, key.stageAttemptId)
+
+  def apply(stageId: Int, stageAttemptId: Int): Long =
+    (stageId.toLong << 32) | (stageAttemptId.toLong & 0xffffffffL)
+}
 
 /**
  * Executor-local GPU admission controller driven by graph autotune hints.
  *
- * It tracks, per active stage key, the GPU-concurrency cap requested for that stage and pushes the
- * executor-wide effective cap (the minimum across active stages) into the `GpuSemaphore` via
- * `applyLimit`. The semaphore's memory-permit pool remains the hard safety layer in every mode.
+ * It tracks the graph optimizer's per-stage quotas, shared executor-wide cap, and critical-path
+ * priorities, then installs the complete active allocation atomically in `GpuSemaphore`. The
+ * semaphore's memory-permit pool remains the hard safety layer in every mode.
  *
  * The cap tracks the highest-version optimizer hint seen for each key, in both GRAPH and OPTIMIZE.
  * GRAPH is still bounded by its static envelope; OPTIMIZE may use its explicit larger envelope.
@@ -41,8 +51,19 @@ private case class ActiveGpuAdmissionHint(
  * created by a sibling task that started under a positive cap.
  */
 private[rapids] class RapidsAutotuneGpuAdmissionController(
-    applyLimit: Int => Int) {
+    applyLimit: Int => Int,
+    applyStageAllocation: Option[(Int, Map[Long, Int], Map[Long, Long]) => Int] = None,
+    initialMaxSharedConcurrentTasks: Int = 0) {
   private val activeHints = mutable.HashMap.empty[AutotuneStageKey, ActiveGpuAdmissionHint]
+  private var maxSharedConcurrentTasks = math.max(0, initialMaxSharedConcurrentTasks)
+  private var appliedLimit = 0
+
+  def configureMaxSharedConcurrentTasks(maxTasks: Int): Unit = synchronized {
+    maxSharedConcurrentTasks = math.max(0, maxTasks)
+    if (activeHints.nonEmpty) {
+      applyCurrentAllocation()
+    }
+  }
 
   def taskStarted(
       key: AutotuneStageKey,
@@ -52,20 +73,26 @@ private[rapids] class RapidsAutotuneGpuAdmissionController(
       if (cachedHint.hasHint) math.max(0, cachedHint.hint.gpu.maxConcurrentTasks) else 0
     if (maxConcurrentTasks > 0) {
       val version = cachedHint.version
+      val sharedMaxConcurrentTasks = math.max(0,
+        cachedHint.hint.gpu.sharedMaxConcurrentTasks)
+      val schedulingPriority = cachedHint.hint.gpu.schedulingPriority
       activeHints.get(key) match {
         case Some(active) =>
           if (version >= active.hintVersion) {
             active.maxConcurrentTasks = maxConcurrentTasks
+            active.sharedMaxConcurrentTasks = sharedMaxConcurrentTasks
+            active.schedulingPriority = schedulingPriority
             active.hintVersion = version
           }
           active.activeTasks += taskAttemptId
         case None =>
           activeHints.put(key,
-            ActiveGpuAdmissionHint(maxConcurrentTasks, version, mutable.Set(taskAttemptId)))
+            ActiveGpuAdmissionHint(maxConcurrentTasks, sharedMaxConcurrentTasks,
+              schedulingPriority, version, mutable.Set(taskAttemptId)))
       }
-      applyCurrentLimit()
+      applyCurrentAllocation()
     } else {
-      currentLimit
+      appliedLimit
     }
   }
 
@@ -76,26 +103,52 @@ private[rapids] class RapidsAutotuneGpuAdmissionController(
         if (active.activeTasks.isEmpty) {
           activeHints.remove(key)
         }
-        applyCurrentLimit()
+        applyCurrentAllocation()
       case _ =>
-        currentLimit
+        appliedLimit
     }
   }
 
   def reset(): Int = synchronized {
     activeHints.clear()
-    applyLimit(0)
+    appliedLimit = applyStageAllocation
+      .map(_(0, Map.empty, Map.empty))
+      .getOrElse(applyLimit(0))
+    appliedLimit
   }
 
-  private def currentLimit: Int = {
+  private def applyCurrentAllocation(): Int = {
     if (activeHints.isEmpty) {
-      0
-    } else {
-      activeHints.values.map(_.maxConcurrentTasks).min
+      return reset()
     }
-  }
 
-  private def applyCurrentLimit(): Int = applyLimit(currentLimit)
+    val stageLimits = activeHints.iterator.map { case (key, hint) =>
+      GpuAdmissionStageGroup(key) -> hint.maxConcurrentTasks
+    }.toMap
+    val stagePriorities = activeHints.iterator.map { case (key, hint) =>
+      GpuAdmissionStageGroup(key) -> hint.schedulingPriority
+    }.toMap
+    val requestedShared = activeHints.valuesIterator
+      .map(_.sharedMaxConcurrentTasks)
+      .filter(_ > 0)
+      .toSeq
+    // New hints carry one shared graph budget. Legacy one-field hints retain the old minimum-cap
+    // behavior until every active task has refreshed to a graph allocation.
+    val requestedLimit = if (requestedShared.nonEmpty) {
+      requestedShared.min
+    } else {
+      activeHints.valuesIterator.map(_.maxConcurrentTasks).min
+    }
+    val sharedLimit = if (maxSharedConcurrentTasks > 0) {
+      math.min(requestedLimit, maxSharedConcurrentTasks)
+    } else {
+      requestedLimit
+    }
+    appliedLimit = applyStageAllocation
+      .map(_(sharedLimit, stageLimits, stagePriorities))
+      .getOrElse(applyLimit(sharedLimit))
+    appliedLimit
+  }
 }
 
 /**
@@ -111,9 +164,19 @@ object RapidsAutotuneGpuAdmission {
   @volatile private var allowAboveStatic: Boolean = false
 
   private val controller = new RapidsAutotuneGpuAdmissionController(
-    limit => GpuSemaphore.setRuntimeMaxConcurrentGpuTasksLimit(limit, allowAboveStatic))
+    applyLimit = limit =>
+      GpuSemaphore.setRuntimeMaxConcurrentGpuTasksLimit(limit, allowAboveStatic),
+    applyStageAllocation = Some((sharedLimit, stageLimits, stagePriorities) =>
+      GpuSemaphore.setRuntimeGpuTaskAllocation(
+        sharedLimit, stageLimits, stagePriorities, allowAboveStatic)))
 
-  /** Set whether the runtime cap may exceed the static cap (true only in OPTIMIZE mode). */
+  /** Configure the executor-side hard envelope for graph allocations. */
+  def configure(allowAboveStatic: Boolean, maxSharedConcurrentTasks: Int): Unit = {
+    this.allowAboveStatic = allowAboveStatic
+    controller.configureMaxSharedConcurrentTasks(maxSharedConcurrentTasks)
+  }
+
+  /** Backward-compatible test hook; production uses [[configure]]. */
   def setAllowAboveStatic(allow: Boolean): Unit = {
     allowAboveStatic = allow
   }

@@ -61,6 +61,8 @@ case class SparkRapidsAutotuneHintAppliedEvent(
   scanMaxReadyBytes: Long,
   gpuMaxConcurrentTasks: Int,
   gpuAppliedMaxConcurrentTasks: Int,
+  gpuSharedMaxConcurrentTasks: Int = 0,
+  gpuSchedulingPriority: Long = 0L,
   shufflePrefetchWindow: Int = 0,
   shuffleMaxReadyBytes: Long = Long.MaxValue,
   shuffleCoalesceTargetBytes: Long = 0L,

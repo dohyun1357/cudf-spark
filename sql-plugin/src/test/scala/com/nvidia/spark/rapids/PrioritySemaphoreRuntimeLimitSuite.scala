@@ -16,6 +16,8 @@
 
 package com.nvidia.spark.rapids
 
+import java.util.concurrent.ConcurrentLinkedQueue
+
 import org.scalatest.funsuite.AnyFunSuite
 
 class PrioritySemaphoreRuntimeLimitSuite extends AnyFunSuite {
@@ -90,5 +92,69 @@ class PrioritySemaphoreRuntimeLimitSuite extends AnyFunSuite {
 
     semaphore.release(10)
     semaphore.release(10)
+  }
+
+  test("graph allocation enforces shared cap and per-stage quotas") {
+    val semaphore = new TestPrioritySemaphore(100, 0)
+    val left = 10L
+    val right = 20L
+
+    assert(semaphore.setRuntimeGpuTaskAllocation(
+      maxTasks = 3,
+      groupLimits = Map(left -> 2, right -> 1),
+      groupPriorities = Map(left -> 100L, right -> 40L)) == 3)
+
+    assert(semaphore.tryAcquire(10, 0L, () => false, 1L, left))
+    assert(semaphore.tryAcquire(10, 0L, () => false, 2L, left))
+    assert(!semaphore.tryAcquire(10, 0L, () => false, 3L, left)) // left quota exhausted
+    assert(semaphore.tryAcquire(10, 0L, () => false, 4L, right))
+    assert(!semaphore.tryAcquire(10, 0L, () => false, 5L)) // shared cap exhausted
+
+    semaphore.release(10, left)
+    assert(semaphore.tryAcquire(10, 0L, () => false, 5L, left))
+
+    semaphore.release(10, left)
+    semaphore.release(10, left)
+    semaphore.release(10, right)
+  }
+
+  test("graph critical-path priority orders eligible stage waiters") {
+    val semaphore = new TestPrioritySemaphore(100, 0)
+    val low = 10L
+    val high = 20L
+    semaphore.setRuntimeGpuTaskAllocation(
+      maxTasks = 1,
+      groupLimits = Map(low -> 1, high -> 1),
+      groupPriorities = Map(low -> 10L, high -> 100L))
+    assert(semaphore.tryAcquire(10, 0L, () => false, 0L))
+
+    val acquisitionOrder = new ConcurrentLinkedQueue[Long]()
+    def waiter(group: Long, taskId: Long): Thread = new Thread(new Runnable {
+      override def run(): Unit = {
+        val permits = semaphore.acquire(() => 10L, () => false, 0L, taskId, group)
+        acquisitionOrder.add(group)
+        semaphore.release(permits, group)
+      }
+    })
+    def awaitWaiters(expected: Int): Unit = {
+      val deadline = System.nanoTime() + 5000000000L
+      while (semaphore.getNumWaitingTasks < expected && System.nanoTime() < deadline) {
+        Thread.`yield`()
+      }
+      assert(semaphore.getNumWaitingTasks == expected)
+    }
+
+    val lowThread = waiter(low, 1L)
+    lowThread.start()
+    awaitWaiters(1)
+    val highThread = waiter(high, 2L)
+    highThread.start()
+    awaitWaiters(2)
+
+    semaphore.release(10)
+    highThread.join(5000L)
+    lowThread.join(5000L)
+    assert(!highThread.isAlive && !lowThread.isAlive)
+    assert(acquisitionOrder.toArray.toSeq == Seq(high, low))
   }
 }

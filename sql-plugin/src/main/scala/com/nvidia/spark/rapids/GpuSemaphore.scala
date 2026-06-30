@@ -263,6 +263,21 @@ object GpuSemaphore {
     }
   }
 
+  /** Install the graph optimizer's shared cap, per-stage quotas, and stage priorities. */
+  def setRuntimeGpuTaskAllocation(
+      maxTasks: Int,
+      stageLimits: scala.collection.immutable.Map[Long, Int],
+      stagePriorities: scala.collection.immutable.Map[Long, Long],
+      allowAboveStatic: Boolean = false): Int = {
+    val current = instance
+    if (current == null) {
+      0
+    } else {
+      current.setRuntimeGpuTaskAllocation(
+        maxTasks, stageLimits, stagePriorities, allowAboveStatic)
+    }
+  }
+
   /**
    * Dumps the stack traces for any tasks that have accessed the GPU semaphore
    * and have not completed. The output includes whether the task has the GPU semaphore
@@ -327,7 +342,10 @@ object GpuSemaphore {
  * this is considered to be okay as there are other mechanisms in place, and it should be rather
  * rare.
  */
-private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
+private final class SemaphoreTaskInfo(
+                                      val stageId: Int,
+                                      val stageAttemptId: Int,
+                                      val taskAttemptId: Long,
                                       memoryEstimator: GpuStageMemoryEstimator,
                                       bubbleTimerMgr: GpuBubbleTimerManager) extends Logging {
   /**
@@ -355,6 +373,7 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
   @volatile private var lastReleased: Long = 0L
 
   type GpuBackingSemaphore = PrioritySemaphore[Long]
+  private val admissionGroup = GpuAdmissionStageGroup(stageId, stageAttemptId)
 
   var nvtxRange: Option[NvtxUniqueRange] = None
 
@@ -437,7 +456,7 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
           val used = semaphore.acquire(() => 
               GpuSemaphore.memToPermitsWithMax(memoryEstimator.estimate()),
             () => lastAcquired > 0,
-            TaskPriority.getTaskPriority(taskAttemptId), taskAttemptId)
+            TaskPriority.getTaskPriority(taskAttemptId), taskAttemptId, admissionGroup)
           synchronized {
             permitsUsed = used
             // We now own the semaphore so we need to wake up all of the other tasks that are
@@ -484,7 +503,8 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
         val ret = semaphore.tryAcquire(numPermits,
           TaskPriority.getTaskPriority(taskAttemptId),
           () => lastAcquired > 0,
-          taskAttemptId)
+          taskAttemptId,
+          admissionGroup)
         if (ret) {
           hasSemaphore = true
           lastAcquired = System.nanoTime()
@@ -504,7 +524,7 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
     val t = Thread.currentThread()
     activeThreads.remove(t)
     if (hasSemaphore) {
-      semaphore.release(permitsUsed)
+      semaphore.release(permitsUsed, admissionGroup)
       hasSemaphore = false
       lastReleased = System.nanoTime()
       GpuTaskMetrics.get.addSemaphoreHoldingTime(lastReleased - lastAcquired)
@@ -569,7 +589,8 @@ private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int) extends Lo
     })
     val taskInfo = tasks.computeIfAbsent(taskAttemptId, _ => {
       onTaskCompletion(context, completeTask)
-      new SemaphoreTaskInfo(stageId, taskAttemptId, stageEstimate, bubbleTimerMgr)
+      new SemaphoreTaskInfo(stageId, context.stageAttemptNumber(), taskAttemptId,
+        stageEstimate, bubbleTimerMgr)
     })
     if (taskInfo.tryAcquire(semaphore, taskAttemptId)) {
       GpuDeviceManager.initializeFromTask()
@@ -600,7 +621,8 @@ private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int) extends Lo
       val taskAttemptId = context.taskAttemptId()
       val taskInfo = tasks.computeIfAbsent(taskAttemptId, _ => {
         onTaskCompletion(context, completeTask)
-        new SemaphoreTaskInfo(stageId, taskAttemptId, stageEstimate, bubbleTimerMgr)
+        new SemaphoreTaskInfo(stageId, context.stageAttemptNumber(), taskAttemptId,
+          stageEstimate, bubbleTimerMgr)
       })
       taskInfo.blockUntilReady(semaphore)
       GpuDeviceManager.initializeFromTask()
@@ -624,6 +646,15 @@ private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int) extends Lo
       maxTasks: Int,
       allowAboveStatic: Boolean = false): Int = {
     semaphore.setRuntimeMaxConcurrentGpuTasksLimit(maxTasks, allowAboveStatic)
+  }
+
+  def setRuntimeGpuTaskAllocation(
+      maxTasks: Int,
+      stageLimits: scala.collection.immutable.Map[Long, Int],
+      stagePriorities: scala.collection.immutable.Map[Long, Long],
+      allowAboveStatic: Boolean = false): Int = {
+    semaphore.setRuntimeGpuTaskAllocation(
+      maxTasks, stageLimits, stagePriorities, allowAboveStatic)
   }
 
   def completeTask(context: TaskContext): Unit = {

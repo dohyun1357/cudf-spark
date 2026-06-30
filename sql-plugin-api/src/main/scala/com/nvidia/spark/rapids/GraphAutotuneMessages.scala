@@ -53,10 +53,24 @@ object ScanRuntimeHint {
     maxReadyBytes = Long.MaxValue)
 }
 
-case class GpuRuntimeHint(maxConcurrentTasks: Int)
+/**
+ * GPU admission allocation selected by the graph optimizer.
+ *
+ * `maxConcurrentTasks` is this stage's executor-local quota. `sharedMaxConcurrentTasks` is the
+ * total executor-wide GPU-task budget shared by all active stages. `schedulingPriority` is derived
+ * from the stage's modeled remaining critical-path length; it only orders otherwise-eligible
+ * waiters and never bypasses either task-count limit or memory permits.
+ */
+case class GpuRuntimeHint(
+    maxConcurrentTasks: Int,
+    sharedMaxConcurrentTasks: Int = 0,
+    schedulingPriority: Long = 0L)
 
 object GpuRuntimeHint {
-  val empty: GpuRuntimeHint = GpuRuntimeHint(maxConcurrentTasks = 0)
+  val empty: GpuRuntimeHint = GpuRuntimeHint(
+    maxConcurrentTasks = 0,
+    sharedMaxConcurrentTasks = 0,
+    schedulingPriority = 0L)
 }
 
 case class ShuffleRuntimeHint(
