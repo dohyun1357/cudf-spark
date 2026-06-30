@@ -90,7 +90,8 @@ class AutotuneHintCache(
  */
 class RapidsAutotuneExecutorEndpoint(
     pluginContext: PluginContext,
-    conf: RapidsConf) extends Logging {
+    conf: RapidsConf,
+    nativeGpuTaskSlots: Int = 0) extends Logging {
   private val executorId = pluginContext.executorID()
   private val failOpen = conf.autotuneFailOpen
   // Only the closed-loop modes (GRAPH, OPTIMIZE) republish hints mid-query, so only there does the
@@ -99,8 +100,12 @@ class RapidsAutotuneExecutorEndpoint(
     if (conf.isAutotuneClosedLoopMode) conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L else 0L
   private val cache = new AutotuneHintCache(fetchHintFromDriver, fetchTtlNanos)
 
-  // OPTIMIZE mode is the only mode in which the runtime GPU cap may exceed the static cap.
-  RapidsAutotuneGpuAdmission.setAllowAboveStatic(conf.isAutotuneOptimizeMode)
+  // OPTIMIZE mode is the only mode in which the shared runtime GPU budget may exceed the static
+  // cap. The executor independently clamps every driver allocation to this configured envelope.
+  RapidsAutotuneGpuAdmission.configure(
+    allowAboveStatic = conf.isAutotuneOptimizeMode,
+    maxSharedConcurrentTasks =
+      GraphOptimizerConstraints.fromConf(conf, nativeGpuTaskSlots).gpu.maxConcurrentTasks)
 
   def hintFor(key: AutotuneStageKey): AutotuneCachedHint = cache.get(key)
 

@@ -58,8 +58,11 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     enabled = conf.autotuneGraphEnabled
     optimizerEnabled = conf.isAutotuneClosedLoopMode
     sparkContext = if (enabled) sc else null
+    val nativeGpuTaskSlots = if (sc == null) 0 else {
+      RapidsPluginUtils.estimateCoresOnExec(sc.getConf)
+    }
     optimizer = new AnalyticalGraphWideAutotuneOptimizer(
-      GraphOptimizerConstraints.fromConf(conf))
+      GraphOptimizerConstraints.fromConf(conf, nativeGpuTaskSlots))
     nanoSource = () => System.nanoTime()
     hints.clear()
     observations.clear()
@@ -98,19 +101,32 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       StageRuntimeHint.empty(key)
     } else {
       val content = optimizer.initialHint(key, descriptor)
-      publishStageHint(key, content.scan, content.gpu, content.shuffle, content.batch)
+      val published = publishStageHint(
+        key, content.scan, content.gpu, content.shuffle, content.batch)
+      optimizer.hintPublished(published)
+      published
     }
   }
 
   def stageSubmitted(key: AutotuneStageKey): Unit = {
     if (enabled && optimizer != null) {
-      optimizer.stageSubmitted(key)
+      try {
+        applyOptimizerDecisions(optimizer.stageSubmitted(key))
+      } catch {
+        case NonFatal(e) =>
+          logWarning("RAPIDS graph optimizer stage-submission update failed", e)
+      }
     }
   }
 
   def stageCompleted(key: AutotuneStageKey): Unit = {
     if (enabled && optimizer != null) {
-      optimizer.stageCompleted(key)
+      try {
+        applyOptimizerDecisions(optimizer.stageCompleted(key))
+      } catch {
+        case NonFatal(e) =>
+          logWarning("RAPIDS graph optimizer stage-completion update failed", e)
+      }
     }
   }
 
@@ -168,6 +184,9 @@ object RapidsAutotuneDriverEndpoint extends Logging {
           version = nextHintVersion.getAndIncrement(),
           expiresAtNanos = Long.MaxValue)
         hints.put(key, hint)
+        if (optimizer != null) {
+          optimizer.hintPublished(hint)
+        }
         hint
       }
     }
@@ -209,6 +228,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       scanMaxReadyBytes = msg.scan.maxReadyBytes,
       gpuMaxConcurrentTasks = msg.gpu.maxConcurrentTasks,
       gpuAppliedMaxConcurrentTasks = msg.gpuAppliedMaxConcurrentTasks,
+      gpuSharedMaxConcurrentTasks = msg.gpu.sharedMaxConcurrentTasks,
+      gpuSchedulingPriority = msg.gpu.schedulingPriority,
       shufflePrefetchWindow = msg.shuffle.prefetchWindow,
       shuffleMaxReadyBytes = msg.shuffle.maxReadyBytes,
       shuffleCoalesceTargetBytes = msg.shuffle.coalesceTargetBytes,
@@ -248,17 +269,22 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       if (current == null) {
         return
       }
-      optimizer.observe(msg, current, nanoSource()).foreach { decision =>
-        val published = republishStageHint(msg.key, decision.hint)
-        logDebug(s"RAPIDS graph optimizer re-hinted stage ${msg.key.stageId}." +
-          s"${msg.key.stageAttemptId} to version ${published.version}; predicted task work " +
-          s"${decision.predictedCurrentNanos} -> ${decision.predictedSelectedNanos} ns; " +
-          s"scan ${published.scan}, GPU ${published.gpu}, shuffle ${published.shuffle}, " +
-          s"batch ${published.batch}")
-      }
+      applyOptimizerDecisions(optimizer.observe(msg, current, nanoSource()))
     } catch {
       case NonFatal(e) =>
         logWarning("RAPIDS graph optimizer evaluation failed; leaving hint unchanged", e)
+    }
+  }
+
+  private def applyOptimizerDecisions(decisions: Seq[GraphOptimizerDecision]): Unit = {
+    decisions.foreach { decision =>
+      val key = decision.hint.key
+      val published = republishStageHint(key, decision.hint)
+      logDebug(s"RAPIDS graph optimizer re-hinted stage ${key.stageId}." +
+        s"${key.stageAttemptId} to version ${published.version}; predicted task work " +
+        s"${decision.predictedCurrentNanos} -> ${decision.predictedSelectedNanos} ns; " +
+        s"scan ${published.scan}, GPU ${published.gpu}, shuffle ${published.shuffle}, " +
+        s"batch ${published.batch}")
     }
   }
 

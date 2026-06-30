@@ -1924,8 +1924,9 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val AUTOTUNE_GPU_MAX_CONCURRENT_TASKS =
     conf("spark.rapids.sql.autotune.gpu.maxConcurrentTasks")
-      .doc("Graph autotune hint for the maximum number of tasks that can execute " +
-        "concurrently per GPU. This is the GRAPH ceiling and OPTIMIZE starting point; " +
+      .doc("Enable graph GPU-admission tuning and request this GRAPH ceiling. Cold stages start " +
+        "at the native Spark task-slot capacity because concurrentGpuTasks is a dynamic-memory " +
+        "estimator seed, not a hard limit; the optimizer may tighten only after observations. " +
         s"'${MAX_CONCURRENT_GPU_TASKS.key}' remains the static semaphore setting. Set to 0 " +
         "to disable optimizer GPU admission.")
       .integerConf
@@ -2006,7 +2007,10 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES =
     conf("spark.rapids.sql.autotune.shuffle.coalesceTargetBytes")
-      .doc("Graph autotune shuffle coalesce target-bytes hint. 0 (default) means no hint.")
+      .doc("Smallest shuffle coalesce target requested for graph autotuning. Cold stages " +
+        s"preserve the native '${GPU_BATCH_SIZE_BYTES.key}' target; the joint batch/shuffle " +
+        "model may select the smaller value after observations. 0 (default) keeps the native " +
+        "starting point.")
       .bytesConf(ByteUnit.BYTE)
       .checkValue(v => v >= 0, "The autotune shuffle coalesce target bytes must be non-negative.")
       .createWithDefault(0L)
@@ -2021,14 +2025,18 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val AUTOTUNE_BATCH_TARGET_BYTES =
     conf("spark.rapids.sql.autotune.batch.targetBytes")
-      .doc("Graph autotune target batch-bytes hint. 0 (default) means no hint.")
+      .doc("Smallest batch target considered by graph autotuning. Cold stages preserve the " +
+        s"native '${GPU_BATCH_SIZE_BYTES.key}' target; 0 (default) keeps that as the only " +
+        "starting candidate.")
       .bytesConf(ByteUnit.BYTE)
       .checkValue(v => v >= 0, "The autotune batch target bytes must be non-negative.")
       .createWithDefault(0L)
 
   val AUTOTUNE_BATCH_MAX_BYTES =
     conf("spark.rapids.sql.autotune.batch.maxBytes")
-      .doc("Hard cap for the graph autotune max batch-bytes hint.")
+      .doc("Largest batch target considered by graph autotuning. The native " +
+        s"'${GPU_BATCH_SIZE_BYTES.key}' target is always included because it is already a safe " +
+        "deployed point.")
       .bytesConf(ByteUnit.BYTE)
       .checkValue(v => v > 0, "The autotune batch max bytes must be greater than 0.")
       .createWithDefault(Long.MaxValue)

@@ -630,7 +630,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
       if (conf.autotuneGraphEnabled) {
         logInfo(s"Initializing RAPIDS graph autotune executor endpoint in " +
           s"${conf.autotuneGraphMode} mode")
-        autotuneHintEndpoint = new RapidsAutotuneExecutorEndpoint(pluginContext, conf)
+        autotuneHintEndpoint = new RapidsAutotuneExecutorEndpoint(pluginContext, conf, numCores)
       }
 
       ProfilerOnExecutor.init(pluginContext, conf)
