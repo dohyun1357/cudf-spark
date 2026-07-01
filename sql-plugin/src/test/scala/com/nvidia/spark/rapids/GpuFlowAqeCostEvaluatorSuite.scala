@@ -19,8 +19,21 @@ package com.nvidia.spark.rapids
 import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.execution.adaptive.Cost
 
 class GpuFlowAqeCostEvaluatorSuite extends AnyFunSuite {
+  private case class RankedCost(value: Int) extends Cost {
+    override def compare(other: Cost): Int = other match {
+      case that: RankedCost => Integer.compare(value, that.value)
+      case _ => 0
+    }
+  }
+
+  private def cost(
+      evaluation: GpuFlowAqePlanEvaluation,
+      fallback: Int = 0): GpuFlowAqeCost =
+    GpuFlowAqeCost(evaluation, RankedCost(fallback))
+
   private val fixedControl = GpuFlowControl(1.0, 1.0, 1.0, 1.0, 1.0)
   private val fixedBounds = GpuFlowControlBounds(fixedControl, fixedControl)
 
@@ -29,13 +42,15 @@ class GpuFlowAqeCostEvaluatorSuite extends AnyFunSuite {
       gpu: Option[Double] = Some(1.0),
       shuffle: Option[Double] = Some(1.0),
       broadcast: Option[Double] = Some(1.0),
-      batch: Option[Double] = Some(1.0)): GpuFlowAqeCalibration =
+      batch: Option[Double] = Some(1.0),
+      fixed: Option[Double] = Some(1.0)): GpuFlowAqeCalibration =
     GpuFlowAqeCalibration(
       scanUnitNanosPerByte = scan,
       gpuUnitNanosPerByte = gpu,
       shuffleUnitNanosPerByte = shuffle,
       broadcastNanosPerByte = broadcast,
       batchUnitNanosPerByte = batch,
+      fixedNanosPerTask = fixed,
       referenceControl = fixedControl,
       bounds = fixedBounds,
       sampleWindows = 4L)
@@ -60,7 +75,7 @@ class GpuFlowAqeCostEvaluatorSuite extends AnyFunSuite {
 
     assert(shufflePlan.identifiable && broadcastPlan.identifiable)
     assert(broadcastPlan.objectiveNanos < shufflePlan.objectiveNanos)
-    assert(GpuFlowAqeCost(broadcastPlan) < GpuFlowAqeCost(shufflePlan))
+    assert(cost(broadcastPlan) < cost(shufflePlan))
   }
 
   test("AQE flow cost ties when either complete plan is not identifiable") {
@@ -75,11 +90,12 @@ class GpuFlowAqeCostEvaluatorSuite extends AnyFunSuite {
     assert(known.identifiable)
     assert(!unknown.identifiable)
     assert(unknown.reason == "missing-broadcast-rate")
-    assert(GpuFlowAqeCost(known).compare(GpuFlowAqeCost(unknown)) == 0)
-    assert(GpuFlowAqeCost(unknown).compare(GpuFlowAqeCost(known)) == 0)
+    assert(cost(known).compare(cost(unknown)) == 0)
+    assert(cost(unknown).compare(cost(known)) == 0)
+    assert(cost(known) != cost(unknown))
   }
 
-  test("AQE compares identifiable physical alternatives with different operator fingerprints") {
+  test("AQE preserves Spark authority until different operator responses are measured") {
     val key = AutotuneStageKey(0L, 1, 0)
     val slow = GpuFlowAqePlanModel.evaluateNodes(
       Seq(GpuFlowAqeNode(key, Seq.empty, GpuFlowAqeDemand(shuffleBytes = 1000.0))),
@@ -89,7 +105,30 @@ class GpuFlowAqeCostEvaluatorSuite extends AnyFunSuite {
       calibration(), "join", "broadcast-hash")
 
     assert(fast.objectiveNanos < slow.objectiveNanos)
-    assert(GpuFlowAqeCost(fast) < GpuFlowAqeCost(slow))
+    assert(cost(fast, fallback = 2) > cost(slow, fallback = 1))
+    assert(cost(fast, fallback = 1) == cost(slow, fallback = 1))
+  }
+
+  test("AQE uses the flow objective for the same measured operator basis") {
+    val key = AutotuneStageKey(0L, 1, 0)
+    val slow = GpuFlowAqePlanModel.evaluateNodes(
+      Seq(GpuFlowAqeNode(key, Seq.empty, GpuFlowAqeDemand(shuffleBytes = 1000.0))),
+      calibration(), "join", "shuffle-left")
+    val fast = GpuFlowAqePlanModel.evaluateNodes(
+      Seq(GpuFlowAqeNode(key, Seq.empty, GpuFlowAqeDemand(shuffleBytes = 100.0))),
+      calibration(), "join", "shuffle-right")
+
+    assert(cost(fast, fallback = 2) < cost(slow, fallback = 1))
+  }
+
+  test("AQE preserves Spark ordering when distinct plans collapse to one flow objective") {
+    val key = AutotuneStageKey(0L, 1, 0)
+    val tied = GpuFlowAqePlanModel.evaluateNodes(
+      Seq(GpuFlowAqeNode(key, Seq.empty, GpuFlowAqeDemand(shuffleBytes = 100.0))),
+      calibration(), "join", "same-modeled-topology")
+
+    assert(cost(tied, fallback = 2) > cost(tied, fallback = 1))
+    assert(cost(tied, fallback = 1) == cost(tied, fallback = 1))
   }
 
   test("AQE flow plan uses max-plus branch completion instead of summing branches") {
@@ -117,6 +156,7 @@ class GpuFlowAqeCostEvaluatorSuite extends AnyFunSuite {
     assert(event.evaluationId == 7L && event.executionId == 11L)
     assert(event.identifiable)
     assert(event.objectiveNanos == evaluation.objectiveNanos)
+    assert(event.sparkFallbackCost == 0L)
     assert(event.shuffleBytes == 100.0)
     assert(event.calibrationSampleWindows == 4L)
   }

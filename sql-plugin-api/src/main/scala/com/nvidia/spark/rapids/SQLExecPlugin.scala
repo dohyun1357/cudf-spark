@@ -30,6 +30,7 @@ class SQLExecPlugin extends (SparkSessionExtensions => Unit) {
   override def apply(extensions: SparkSessionExtensions): Unit = {
     extensions.injectColumnar(columnarOverrides)
     extensions.injectQueryStagePrepRule(queryStagePrepOverrides)
+    extensions.injectQueryStageOptimizerRule(queryStageOptimizerOverrides)
     extensions.injectPlannerStrategy(_ => strategyRules)
     extensions.injectPostHocResolutionRule(postHocResolutionOverrides)
   }
@@ -40,6 +41,10 @@ class SQLExecPlugin extends (SparkSessionExtensions => Unit) {
 
   private def queryStagePrepOverrides(sparkSession: SparkSession): Rule[SparkPlan] = {
     ShimLoader.newGpuQueryStagePrepOverrides()
+  }
+
+  private def queryStageOptimizerOverrides(sparkSession: SparkSession): Rule[SparkPlan] = {
+    ShimLoader.newGpuFlowAqeParallelismRule()
   }
 
   private def postHocResolutionOverrides(sparkSession: SparkSession): Rule[LogicalPlan] = {

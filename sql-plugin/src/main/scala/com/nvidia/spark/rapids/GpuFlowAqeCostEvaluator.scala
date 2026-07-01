@@ -22,7 +22,8 @@ import scala.util.control.NonFatal
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.execution.adaptive.{Cost, CostEvaluator, QueryStageExec}
+import org.apache.spark.sql.execution.adaptive.{Cost, CostEvaluator, QueryStageExec, SimpleCost,
+  SimpleCostEvaluator}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
 
 private[rapids] case class GpuFlowAqeDemand(
@@ -49,7 +50,8 @@ private[rapids] case class GpuFlowAqePlanEvaluation(
     broadcastBytes: Double,
     batchBytes: Double,
     selectedControl: GpuFlowControl,
-    sampleWindows: Long)
+    sampleWindows: Long,
+    sparkFallbackCost: Long = 0L)
 
 /**
  * A Spark AQE cost with conservative comparison semantics.
@@ -61,12 +63,45 @@ private[rapids] case class GpuFlowAqePlanEvaluation(
  * reason to reject the comparison.
  */
 private[rapids] case class GpuFlowAqeCost(
-    evaluation: GpuFlowAqePlanEvaluation) extends Cost {
+    evaluation: GpuFlowAqePlanEvaluation,
+    sparkFallback: Cost) extends Cost {
   override def compare(other: Cost): Int = other match {
+    // A generic compute-byte rate does not identify the relative response of different physical
+    // operators (for example SortMergeJoin versus BroadcastHashJoin). Until operator-specific
+    // runtime calibration exists, preserve Spark's native AQE decision for that discrete basis.
+    case that: GpuFlowAqeCost if usesSparkFallback(that) =>
+      sparkFallback.compare(that.sparkFallback)
     case that: GpuFlowAqeCost if evaluation.identifiable && that.evaluation.identifiable =>
       java.lang.Double.compare(evaluation.objectiveNanos, that.evaluation.objectiveNanos)
     case _: GpuFlowAqeCost => 0
     case _ => 0
+  }
+
+  /**
+   * Spark accepts a distinct proposed plan on an equal cost only when the Cost values are equal.
+   * Keep equality consistent with the selected comparison basis, while leaving an unidentified
+   * same-operator tie unequal so Spark freezes the current plan.
+   */
+  override def equals(other: Any): Boolean = other match {
+    case that: GpuFlowAqeCost if usesSparkFallback(that) =>
+      sparkFallback == that.sparkFallback
+    case that: GpuFlowAqeCost => this eq that
+    case _ => false
+  }
+
+  // Equality is comparison-context dependent, so no stable field subset can provide a narrower
+  // hash while preserving the equals contract.
+  override def hashCode(): Int = 0
+
+  private def usesSparkFallback(that: GpuFlowAqeCost): Boolean = {
+    val differentOperatorBasis =
+      evaluation.operatorFingerprint != that.evaluation.operatorFingerprint
+    val equalIdentifiedObjective = evaluation.identifiable && that.evaluation.identifiable &&
+      java.lang.Double.compare(
+        evaluation.objectiveNanos, that.evaluation.objectiveNanos) == 0
+    // Distinct candidates collapsing to the same objective expose an unmodeled physical
+    // difference. Preserve Spark's native ordering until measured features distinguish them.
+    differentOperatorBasis || equalIdentifiedObjective
   }
 }
 
@@ -185,7 +220,14 @@ private[rapids] object GpuFlowAqePlanModel {
                       childBytes match {
                         case Some(processed) =>
                           val key = addNode(childRoots,
-                            GpuFlowAqeDemand(gpuBytes = processed, batchBytes = processed))
+                            GpuFlowAqeDemand(
+                              gpuBytes = processed,
+                              // Batch response is optional and independently identifiable. An
+                              // absent rate freezes that control at its reference value without
+                              // preventing the measured GPU/exchange topology comparison.
+                              batchBytes = if (calibrated.batchUnitNanosPerByte.isDefined) {
+                                processed
+                              } else 0.0))
                           Built(childBoundary, Seq(key), childSemantic :+ category,
                             childTopology :+ s"$category:${normalize(node.nodeName)}")
                         case None =>
@@ -390,11 +432,20 @@ private[rapids] object GpuFlowAqePlanModel {
 class GpuFlowAqeCostEvaluator(conf: SparkConf) extends CostEvaluator with Logging {
   def this() = this(new SparkConf(false))
 
+  private val sparkFallback = new SimpleCostEvaluator(
+    conf.getBoolean("spark.sql.adaptive.forceOptimizeSkewedJoin", false))
+
   override def evaluateCost(plan: SparkPlan): Cost = {
+    val nativeCost = sparkFallback.evaluateCost(plan)
+    val nativeValue = nativeCost match {
+      case cost: SimpleCost => cost.value
+      case _ => 0L
+    }
     val evaluation = GpuFlowAqePlanModel.evaluate(
       plan, RapidsAutotuneDriverEndpoint.aqeCalibrationSnapshot)
+      .copy(sparkFallbackCost = nativeValue)
     RapidsAutotuneDriverEndpoint.recordAqeCostEvaluation(evaluation)
-    GpuFlowAqeCost(evaluation)
+    GpuFlowAqeCost(evaluation, nativeCost)
   }
 }
 

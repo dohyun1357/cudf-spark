@@ -347,6 +347,10 @@ object ShimLoader {
     ShimReflectionUtils.newInstanceOf("com.nvidia.spark.rapids.GpuQueryStagePrepOverrides")
   }
 
+  def newGpuFlowAqeParallelismRule(): Rule[SparkPlan] = {
+    ShimReflectionUtils.newInstanceOf("com.nvidia.spark.rapids.GpuFlowAqeParallelismRule")
+  }
+
   def newGpuPostHocResolutionOverrides(ss: SparkSession): Rule[LogicalPlan] = {
     val clz = ShimReflectionUtils.loadClass(
       "com.nvidia.spark.rapids.GpuPostHocResolutionOverrides")

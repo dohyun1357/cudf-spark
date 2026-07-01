@@ -48,6 +48,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   private val observations = new ConcurrentHashMap[AutotuneStageKey, StageObservationAgg]()
   private val nextHintVersion = new AtomicLong(1L)
   private val nextAqeEvaluationId = new AtomicLong(1L)
+  private val nextParallelismDecisionId = new AtomicLong(1L)
   @volatile private var sparkContext: SparkContext = _
   @volatile private var enabled = false
   // The graph optimizer only runs in GRAPH/OPTIMIZE modes; OBSERVE/LOCAL never republish.
@@ -70,6 +71,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     observations.clear()
     nextHintVersion.set(1L)
     nextAqeEvaluationId.set(1L)
+    nextParallelismDecisionId.set(1L)
     if (enabled) {
       logInfo(s"Initialized RAPIDS graph autotune driver endpoint in " +
         s"${conf.autotuneGraphMode} mode")
@@ -86,6 +88,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     observations.clear()
     nextHintVersion.set(1L)
     nextAqeEvaluationId.set(1L)
+    nextParallelismDecisionId.set(1L)
   }
 
   /** Test-only: inject a deterministic monotonic clock for optimizer update cadence. */
@@ -381,6 +384,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       identifiable = evaluation.identifiable,
       reason = evaluation.reason,
       objectiveNanos = evaluation.objectiveNanos,
+      sparkFallbackCost = evaluation.sparkFallbackCost,
       operatorFingerprint = evaluation.operatorFingerprint,
       topologyFingerprint = evaluation.topologyFingerprint,
       scanBytes = evaluation.scanBytes,
@@ -394,6 +398,29 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       selectedShuffleBytes = evaluation.selectedControl.shuffleBytes,
       selectedBatchBytes = evaluation.selectedControl.batchBytes,
       calibrationSampleWindows = evaluation.sampleWindows)
+
+  private[rapids] def recordParallelismDecision(
+      decision: GpuFlowParallelismDecision): Unit = {
+    val sc = sparkContext
+    if (enabled && sc != null) {
+      val executionId = Option(sc.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
+        .flatMap(value => Try(value.toLong).toOption).getOrElse(-1L)
+      TrampolineUtil.postEvent(sc, SparkRapidsAutotuneParallelismEvent(
+        decisionId = nextParallelismDecisionId.getAndIncrement(),
+        executionId = executionId,
+        stageIds = decision.stageIds,
+        originalPartitions = decision.originalPartitions,
+        currentPartitions = decision.currentPartitions,
+        selectedPartitions = decision.selectedPartitions,
+        totalBytes = decision.totalBytes,
+        taskSlots = decision.taskSlots,
+        currentObjectiveNanos = decision.currentObjectiveNanos,
+        selectedObjectiveNanos = decision.selectedObjectiveNanos,
+        variableNanosPerByte = decision.variableNanosPerByte,
+        fixedNanosPerTask = decision.fixedNanosPerTask,
+        reason = decision.reason))
+    }
+  }
 
   private[rapids] def toObservationEvent(
       msg: RapidsAutotuneObservationMsg,

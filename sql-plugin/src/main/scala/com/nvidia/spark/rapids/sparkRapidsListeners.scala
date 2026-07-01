@@ -167,6 +167,7 @@ case class SparkRapidsAutotuneAqeCostEvent(
   identifiable: Boolean,
   reason: String,
   objectiveNanos: Double,
+  sparkFallbackCost: Long,
   operatorFingerprint: String,
   topologyFingerprint: String,
   scanBytes: Double,
@@ -180,4 +181,21 @@ case class SparkRapidsAutotuneAqeCostEvent(
   selectedShuffleBytes: Double,
   selectedBatchBytes: Double,
   calibrationSampleWindows: Long
+) extends SparkListenerEvent
+
+/** One model-selected reducer-parallelism decision at AQE query-stage optimization time. */
+case class SparkRapidsAutotuneParallelismEvent(
+  decisionId: Long,
+  executionId: Long,
+  stageIds: Seq[Int],
+  originalPartitions: Int,
+  currentPartitions: Int,
+  selectedPartitions: Int,
+  totalBytes: Long,
+  taskSlots: Int,
+  currentObjectiveNanos: Double,
+  selectedObjectiveNanos: Double,
+  variableNanosPerByte: Double,
+  fixedNanosPerTask: Double,
+  reason: String
 ) extends SparkListenerEvent

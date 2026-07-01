@@ -950,7 +950,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(allocations.values.map(_.maxConcurrentTasks).sum == 3)
   }
 
-  test("analytical optimizer solves scan GPU and shuffle controls as one joint candidate") {
+  test("single-setting feedback freezes joint executor controls at the measured point") {
     val constraints = optimizerConstraints()
     val shape = AutotuneStageShape(
       hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50, hasShuffle = true)
@@ -964,21 +964,23 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       .merge(optimizerObservation(key, 2L, wait = 0L, holding = 2000L,
         duration = 10000L, input = 1000L, output = 500L, shuffleRead = 500L))
 
-    val decision = AnalyticalStageCostModel.optimize(observation, current, shape, constraints).get
-    assert(decision.predictedSelectedNanos < decision.predictedCurrentNanos)
-    assert(decision.hint.scan.maxReadWindow == 8)
-    // Four GPU tasks are sufficient once scan/shuffle become the max-resource bottleneck; the
-    // joint optimizer therefore does not spend the remaining GPU envelope with no path benefit.
-    assert(decision.hint.gpu.maxConcurrentTasks == 4)
-    // Shuffle window and ready bytes are one multiplicative service capacity. The differentiable
-    // solve may distribute the same gain differently than a discrete coordinate enumeration.
-    assert(decision.hint.shuffle.prefetchWindow.toLong *
-      decision.hint.shuffle.maxReadyBytes >
-      current.shuffle.prefetchWindow.toLong * current.shuffle.maxReadyBytes)
-    assert(decision.hint.shuffle.maxReadyBytes >= constraints.shuffle.initialReadyBytes)
+    val curve = AnalyticalStageCostModel.costCurve(
+      observation, current, shape, constraints).get
+    assert(curve.alternatives.size == 1)
+    assert(curve.alternatives.head.hint.scan == current.scan)
+    assert(curve.alternatives.head.hint.gpu == current.gpu)
+    assert(curve.alternatives.head.hint.shuffle == current.shuffle)
+    assert(curve.alternatives.head.predictedNanos == curve.predictedCurrentNanos)
+    assert(AnalyticalStageCostModel.optimize(
+      observation, current, shape, constraints).isEmpty)
+    val reasons = curve.analyticalState.get.freezeReasons
+    assert(reasons.scanWindow == "single-operating-point-response-unidentified")
+    assert(reasons.gpuTasks == "single-operating-point-response-unidentified")
+    assert(reasons.shuffleWindow == "single-operating-point-response-unidentified")
+    assert(reasons.shuffleBytes == "single-operating-point-response-unidentified")
   }
 
-  test("analytical GPU objective treats semaphore wait as admission queueing") {
+  test("semaphore wait alone does not identify a different GPU admission quota") {
     val constraints = optimizerConstraints()
     val shape = AutotuneStageShape(
       hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
@@ -989,8 +991,12 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       .merge(optimizerObservation(key, 2L, wait = 1000L, holding = 100L,
         duration = 1100L, input = 0L, output = 0L))
 
-    val decision = AnalyticalStageCostModel.optimize(observation, current, shape, constraints).get
-    assert(decision.hint.gpu.maxConcurrentTasks == 8)
+    val curve = AnalyticalStageCostModel.costCurve(
+      observation, current, shape, constraints).get
+    assert(curve.alternatives.map(_.gpuTasks) == Seq(4))
+    assert(curve.analyticalState.get.currentGradient.gpuTasks < 0.0)
+    assert(curve.analyticalState.get.freezeReasons.gpuTasks ==
+      "single-operating-point-response-unidentified")
   }
 
   test("online flow solve does not invent an unobserved lower GPU quota") {
@@ -1008,10 +1014,10 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
 
     val curve = AnalyticalStageCostModel.costCurve(
       observation, current, shape, constraints).get
-    assert(curve.alternatives.forall(_.gpuTasks >= current.gpu.maxConcurrentTasks))
+    assert(curve.alternatives.map(_.gpuTasks) == Seq(current.gpu.maxConcurrentTasks))
   }
 
-  test("analytical optimizer owns batch and split targets") {
+  test("single-setting observations do not invent a batch-size response") {
     val constraints = optimizerConstraints()
     val shape = AutotuneStageShape(
       hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
@@ -1024,9 +1030,31 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       .merge(optimizerObservation(key, 2L, wait = 0L, holding = 1000L,
         duration = 5000L, input = 4096L, output = 4096L))
 
-    val decision = AnalyticalStageCostModel.optimize(observation, current, shape, constraints).get
-    assert(decision.hint.batch.targetBatchBytes == 1024L)
-    assert(decision.hint.batch.splitUntilSize == 1024L)
+    val curve = AnalyticalStageCostModel.costCurve(
+      observation, current, shape, constraints).get
+    assert(curve.alternatives.head.hint.batch.targetBatchBytes == 256L)
+    assert(curve.alternatives.head.hint.batch.splitUntilSize == 128L)
+    assert(curve.analyticalState.get.freezeReasons.batchBytes == "no-measured-work")
+  }
+
+  test("task observations do not invent driver-side broadcast service time") {
+    val constraints = optimizerConstraints()
+    val shape = AutotuneStageShape(
+      hasGpuScan = false,
+      hasGpuPrefetchConsumer = true,
+      numTasks = 50,
+      hasBroadcast = true)
+    val current = StageRuntimeHint.empty(key).copy(gpu = GpuRuntimeHint(2))
+    val observation = StageObservationAgg.empty
+      .merge(optimizerObservation(key, 1L, wait = 0L, holding = 1000L,
+        duration = 5000L, input = 4096L, output = 1024L))
+      .merge(optimizerObservation(key, 2L, wait = 0L, holding = 1000L,
+        duration = 5000L, input = 4096L, output = 1024L))
+
+    val sample = AnalyticalStageCostModel.costCurve(
+      observation, current, shape, constraints).get.calibrationSample.get
+    assert(sample.broadcastNanos == 0.0)
+    assert(sample.broadcastBytes == 0L)
   }
 
   test("optimizer state owns sample windows and update cadence") {
@@ -1042,7 +1070,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
 
     assert(optimizer.observe(first, initial, nowNanos = 1000L).isEmpty)
     val changed = optimizer.observe(second, initial, nowNanos = 1000L)
-    assert(changed.exists(_.hint.gpu.maxConcurrentTasks == 8))
+    assert(changed.exists(_.hint.gpu.maxConcurrentTasks == 2))
     // A fresh two-sample window inside the interval remains queued, not evaluated.
     val updated = changed.head.hint
     assert(optimizer.observe(first, updated, nowNanos = 1050L).isEmpty)
@@ -1074,18 +1102,19 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(calibrated.size == 1)
     val record = calibrated.head
     assert(record.trigger == "feedback")
-    assert(record.graphSelectedObjectiveNanos < record.graphCurrentObjectiveNanos)
+    assert(record.graphSelectedObjectiveNanos == record.graphCurrentObjectiveNanos)
     assert(record.durationAdjoint == 1.0)
-    assert(record.selectedControl.gpuTasks > record.currentControl.gpuTasks)
+    assert(record.selectedControl.gpuTasks == record.currentControl.gpuTasks)
     assert(record.endToEndGradient.gpuTasks < 0.0)
-    assert(record.freezeReasons.gpuTasks == "downward-response-unidentified")
+    assert(record.freezeReasons.gpuTasks ==
+      "single-operating-point-response-unidentified")
 
     val event = RapidsAutotuneDriverEndpoint.toDecisionEvent(record)
     assert(event.epochId == record.epochId)
     assert(event.parentStageIds == Seq(1))
     assert(event.selectedGpuTasks == record.selectedControl.gpuTasks)
     assert(event.gpuTasksGradient == record.endToEndGradient.gpuTasks)
-    assert(event.gpuTasksFreezeReason == "downward-response-unidentified")
+    assert(event.gpuTasksFreezeReason == "single-operating-point-response-unidentified")
   }
 
   test("optimizer calibrates only observations from the current complete hint version") {
@@ -1136,9 +1165,10 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       .merge(optimizerObservation(key, 2L, wait = 0L, holding = 1000L,
         duration = 5000L, input = 4096L, output = 4096L, shuffleWrite = 4096L))
 
-    val decision = AnalyticalStageCostModel.optimize(observation, current, shape, constraints).get
-    assert(decision.hint.batch.targetBatchBytes == 256L)
-    assert(decision.hint.batch.splitUntilSize == 128L)
+    val curve = AnalyticalStageCostModel.costCurve(
+      observation, current, shape, constraints).get
+    assert(curve.alternatives.head.hint.batch.targetBatchBytes == 256L)
+    assert(curve.alternatives.head.hint.batch.splitUntilSize == 128L)
   }
 
   test("driver publishes and republishes optimizer-owned complete hints") {
@@ -1166,7 +1196,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       val served = RapidsAutotuneDriverEndpoint.handleHintRequest(
         RapidsAutotuneHintRequestMsg("exec-1", key)).hint.get
       assert(served.version == 2L)
-      assert(served.gpu.maxConcurrentTasks == 8)
+      assert(served.gpu.maxConcurrentTasks == 2)
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
     }

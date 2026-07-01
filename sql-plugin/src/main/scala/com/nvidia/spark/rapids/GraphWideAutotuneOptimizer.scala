@@ -151,7 +151,10 @@ private[rapids] case class GpuFlowCalibrationSample(
     broadcastNanos: Double,
     broadcastBytes: Long,
     batchUnitNanos: Double,
-    batchBytes: Long)
+    batchBytes: Long,
+    nonGpuNanos: Double,
+    ioBytes: Long,
+    taskCount: Long)
 
 private[rapids] case class GpuFlowAqeCalibration(
     scanUnitNanosPerByte: Option[Double],
@@ -159,6 +162,7 @@ private[rapids] case class GpuFlowAqeCalibration(
     shuffleUnitNanosPerByte: Option[Double],
     broadcastNanosPerByte: Option[Double],
     batchUnitNanosPerByte: Option[Double],
+    fixedNanosPerTask: Option[Double],
     referenceControl: GpuFlowControl,
     bounds: GpuFlowControlBounds,
     sampleWindows: Long)
@@ -175,24 +179,12 @@ private[rapids] object GpuFlowAqeCalibration {
         constraints.shuffle.initialReadyBytes
       } else 0.0,
       batchBytes = if (constraints.batch.enabled) constraints.batch.initialTargetBytes else 0.0)
-    val minimum = GpuFlowControl(
-      scanWindow = if (reference.scanWindow > 0.0) 1.0 else 0.0,
-      gpuTasks = reference.gpuTasks,
-      shuffleWindow = if (reference.shuffleWindow > 0.0) 1.0 else 0.0,
-      shuffleBytes = reference.shuffleBytes,
-      batchBytes = if (reference.batchBytes > 0.0 &&
-          constraints.batch.minimumTargetBytes > 0L) {
-        constraints.batch.minimumTargetBytes
-      } else reference.batchBytes)
-    val maximum = GpuFlowControl(
-      scanWindow = math.max(reference.scanWindow, constraints.scan.maxReadWindow.toDouble),
-      gpuTasks = math.max(reference.gpuTasks, constraints.gpu.maxConcurrentTasks.toDouble),
-      shuffleWindow = math.max(reference.shuffleWindow,
-        constraints.shuffle.maxPrefetchWindow.toDouble),
-      shuffleBytes = math.max(reference.shuffleBytes, constraints.shuffle.maxReadyBytes.toDouble),
-      batchBytes = math.max(reference.batchBytes, constraints.batch.maxBatchBytes.toDouble))
-    GpuFlowAqeCalibration(None, None, None, None, None, reference,
-      GpuFlowControlBounds(minimum, maximum), sampleWindows = 0L)
+    // A rate measured at one actuator setting identifies service demand at that operating point,
+    // not the counterfactual response to a different scan window, GPU quota, shuffle envelope, or
+    // batch size. AQE may use these rates to compare plan demand, but it must price every candidate
+    // at the deployed reference control until multi-setting response evidence exists.
+    GpuFlowAqeCalibration(None, None, None, None, None, None, reference,
+      GpuFlowControlBounds(reference, reference), sampleWindows = 0L)
   }
 }
 
@@ -208,6 +200,12 @@ private[rapids] class GpuFlowAqeCalibrationAccumulator(
   private var broadcastBytes = 0L
   private var batchUnitNanos = 0.0
   private var batchBytes = 0L
+  private var regressionWindows = 0L
+  private var meanIoBytesPerTask = 0.0
+  private var meanNonGpuNanosPerTask = 0.0
+  private var ioVariance = 0.0
+  private var ioNonGpuCovariance = 0.0
+  private var nonGpuVariance = 0.0
   private var windows = 0L
 
   def add(sample: GpuFlowCalibrationSample): Unit = {
@@ -231,6 +229,18 @@ private[rapids] class GpuFlowAqeCalibrationAccumulator(
       batchUnitNanos += sample.batchUnitNanos
       batchBytes += sample.batchBytes
     }
+    if (sample.nonGpuNanos >= 0.0 && sample.ioBytes >= 0L && sample.taskCount > 0L) {
+      val ioPerTask = sample.ioBytes.toDouble / sample.taskCount.toDouble
+      val nanosPerTask = sample.nonGpuNanos / sample.taskCount.toDouble
+      regressionWindows += 1L
+      val ioDelta = ioPerTask - meanIoBytesPerTask
+      val nanosDelta = nanosPerTask - meanNonGpuNanosPerTask
+      meanIoBytesPerTask += ioDelta / regressionWindows.toDouble
+      meanNonGpuNanosPerTask += nanosDelta / regressionWindows.toDouble
+      ioVariance += ioDelta * (ioPerTask - meanIoBytesPerTask)
+      ioNonGpuCovariance += ioDelta * (nanosPerTask - meanNonGpuNanosPerTask)
+      nonGpuVariance += nanosDelta * (nanosPerTask - meanNonGpuNanosPerTask)
+    }
     windows += 1L
   }
 
@@ -242,11 +252,47 @@ private[rapids] class GpuFlowAqeCalibrationAccumulator(
       shuffleUnitNanosPerByte = rate(shuffleUnitNanos, shuffleBytes),
       broadcastNanosPerByte = rate(broadcastNanos, broadcastBytes),
       batchUnitNanosPerByte = rate(batchUnitNanos, batchBytes),
+      fixedNanosPerTask = fittedFixedNanosPerTask,
       sampleWindows = windows)
   }
 
   private def rate(unitNanos: Double, bytes: Long): Option[Double] =
     if (unitNanos > 0.0 && bytes > 0L) Some(unitNanos / bytes.toDouble) else None
+
+  /**
+   * Exact two-variable non-negative least squares for
+   * non-GPU time = bytes * rate + tasks * fixed.
+   */
+  private def fittedFixedNanosPerTask: Option[Double] = {
+    if (regressionWindows == 0L) {
+      None
+    } else if (meanIoBytesPerTask == 0.0 && ioVariance == 0.0) {
+      Some(math.max(0.0, meanNonGpuNanosPerTask))
+    } else if (regressionWindows < 2L || ioVariance <= 0.0) {
+      None
+    } else {
+      val count = regressionWindows.toDouble
+      val sumX2 = ioVariance + count * meanIoBytesPerTask * meanIoBytesPerTask
+      val sumXY = ioNonGpuCovariance +
+        count * meanIoBytesPerTask * meanNonGpuNanosPerTask
+      val sumY2 = nonGpuVariance +
+        count * meanNonGpuNanosPerTask * meanNonGpuNanosPerTask
+      val unconstrainedSlope = ioNonGpuCovariance / ioVariance
+      val unconstrainedFixed = meanNonGpuNanosPerTask -
+        unconstrainedSlope * meanIoBytesPerTask
+      val candidates = mutable.ArrayBuffer.empty[(Double, Double)]
+      if (unconstrainedSlope >= 0.0 && unconstrainedFixed >= 0.0) {
+        candidates += ((unconstrainedSlope, unconstrainedFixed))
+      }
+      candidates += ((0.0, math.max(0.0, meanNonGpuNanosPerTask)))
+      candidates += ((if (sumX2 > 0.0) math.max(0.0, sumXY / sumX2) else 0.0, 0.0))
+      Some(candidates.minBy { case (slope, fixed) =>
+        sumY2 + slope * slope * sumX2 + fixed * fixed * count +
+          2.0 * slope * fixed * count * meanIoBytesPerTask -
+          2.0 * slope * sumXY - 2.0 * fixed * count * meanNonGpuNanosPerTask
+      }._2)
+    }
+  }
 }
 
 /** Replay-complete record for one stage at one graph decision epoch. */
@@ -814,13 +860,13 @@ object AnalyticalStageCostModel {
 
     val work = calibrate(observation, current, shape)
     val currentControl = controlFor(current)
-    val gpuValues = intDomain(
-      currentControl.gpuTasks.toInt,
-      if (current.gpu.maxConcurrentTasks > 0 &&
-          work.gpuNanos > 0.0) {
-        constraints.gpu.maxConcurrentTasks
-      } else 0)
-    val bounds = controlBounds(work, currentControl, constraints)
+    // A single feedback window supplies one operating point. It can calibrate the work already
+    // performed, but cannot identify any actuator's counterfactual response. Keep every continuous
+    // control at that measured point. Structural AQE parallelism is optimized separately from
+    // measured map sizes and task-wave cost, so it remains eligible without fabricating a response
+    // curve for executor controls.
+    val gpuValues = Seq(currentControl.gpuTasks.toInt)
+    val bounds = GpuFlowControlBounds(currentControl, currentControl)
     val currentEvaluation = GpuFlowStageModel.evaluate(work, currentControl)
 
     val alternatives = gpuValues.map { gpuTasks =>
@@ -895,16 +941,10 @@ object AnalyticalStageCostModel {
       shape: AutotuneStageShape): GpuFlowStageWork = {
     val classified = classifyNonGpuWork(obs, shape)
     val retry = obs.totalRetryOrLostTimeNanos.toDouble
-    val processedBytes = math.max(obs.totalInputBytes, obs.totalOutputBytes)
-    val currentBatch = activeBatchBytes(current)
-    // If batch sizing is active, the unclassified per-task overhead is modeled by the number of
-    // target-sized batches. This is identifiable from measured elapsed work and bytes; no fixed
-    // "good batch size" or tuning threshold is embedded in the optimizer.
-    val batchOverhead = if (currentBatch > 0L && processedBytes > 0L) {
-      classified.unclassifiedNanos
-    } else {
-      0.0
-    }
+    // One observation at one batch target cannot distinguish fixed task cost from per-batch
+    // setup. Keep batch response frozen until history contains multiple batch controls; treating
+    // the entire residual as batch work fabricates a derivative and biases AQE operator counts.
+    val batchOverhead = 0.0
     GpuFlowStageWork(
       scanNanos = classified.scanNanos,
       gpuNanos = obs.totalGpuHoldingNanos.toDouble +
@@ -912,7 +952,7 @@ object AnalyticalStageCostModel {
       shuffleNanos = classified.shuffleNanos,
       batchNanos = batchOverhead,
       fixedNanos = classified.broadcastNanos +
-        math.max(0.0, classified.unclassifiedNanos - batchOverhead),
+        classified.unclassifiedNanos,
       retryNanos = retry,
       baseline = controlFor(current))
   }
@@ -941,9 +981,9 @@ object AnalyticalStageCostModel {
     val shuffleBytes = if (shape.hasShuffle) {
       observation.totalShuffleReadBytes + observation.totalShuffleWriteBytes
     } else 0L
-    val broadcastBytes = if (shape.hasBroadcast) {
-      math.max(observation.totalInputBytes, observation.totalOutputBytes)
-    } else 0L
+    // Broadcast exchange build/distribution runs on the driver and is not measured by this task
+    // observation clock. Do not relabel task input/output time as broadcast service time.
+    val broadcastBytes = 0L
     val classifiedBytes = scanBytes + shuffleBytes + broadcastBytes
     def nanos(bytes: Long): Double = {
       if (classifiedBytes > 0L) available * bytes.toDouble / classifiedBytes.toDouble else 0.0
@@ -968,41 +1008,6 @@ object AnalyticalStageCostModel {
     shuffleBytes = activeShuffleBytes(hint).toDouble,
     batchBytes = activeBatchBytes(hint).toDouble)
 
-  private def controlBounds(
-      work: GpuFlowStageWork,
-      current: GpuFlowControl,
-      constraints: GraphOptimizerConstraints): GpuFlowControlBounds = {
-    def range(
-        value: Double,
-        hasWork: Boolean,
-        minimum: Double,
-        maximum: Double): (Double, Double) = {
-      if (value <= 0.0 || !hasWork || maximum <= 0.0) (value, value)
-      else (math.min(minimum, maximum), math.max(value, maximum))
-    }
-    val scan = range(current.scanWindow, work.scanNanos > 0.0,
-      1.0, constraints.scan.maxReadWindow.toDouble)
-    val gpu = range(current.gpuTasks, work.gpuNanos > 0.0,
-      1.0, constraints.gpu.maxConcurrentTasks.toDouble)
-    val shuffleWindow = range(current.shuffleWindow, work.shuffleNanos > 0.0,
-      1.0, constraints.shuffle.maxPrefetchWindow.toDouble)
-    val shuffleBytes = range(current.shuffleBytes, work.shuffleNanos > 0.0,
-      constraints.shuffle.initialReadyBytes.toDouble,
-      constraints.shuffle.maxReadyBytes.toDouble)
-    val minimumBatch = if (constraints.batch.minimumTargetBytes > 0L) {
-      constraints.batch.minimumTargetBytes
-    } else {
-      constraints.batch.initialTargetBytes
-    }
-    val batch = range(current.batchBytes, work.batchNanos > 0.0,
-      minimumBatch.toDouble, constraints.batch.maxBatchBytes.toDouble)
-    GpuFlowControlBounds(
-      minimum = GpuFlowControl(scan._1, gpu._1, shuffleWindow._1,
-        shuffleBytes._1, batch._1),
-      maximum = GpuFlowControl(scan._2, gpu._2, shuffleWindow._2,
-        shuffleBytes._2, batch._2))
-  }
-
   private def freezeReasons(
       work: GpuFlowStageWork,
       current: GpuFlowControl,
@@ -1010,18 +1015,14 @@ object AnalyticalStageCostModel {
     def reason(value: Double, measuredWork: Double, minimum: Double, maximum: Double): String = {
       if (value <= 0.0) "actuator-not-present"
       else if (measuredWork <= 0.0) "no-measured-work"
-      else if (maximum <= minimum) "fixed-by-feasibility-bounds"
+      else if (maximum <= minimum) "single-operating-point-response-unidentified"
       else ""
-    }
-    val gpuReason = reason(current.gpuTasks, work.gpuNanos,
-      bounds.minimum.gpuTasks, bounds.maximum.gpuTasks) match {
-      case "" => "downward-response-unidentified"
-      case other => other
     }
     GraphControlFreezeReasons(
       scanWindow = reason(current.scanWindow, work.scanNanos,
         bounds.minimum.scanWindow, bounds.maximum.scanWindow),
-      gpuTasks = gpuReason,
+      gpuTasks = reason(current.gpuTasks, work.gpuNanos,
+        bounds.minimum.gpuTasks, bounds.maximum.gpuTasks),
       shuffleWindow = reason(current.shuffleWindow, work.shuffleNanos,
         bounds.minimum.shuffleWindow, bounds.maximum.shuffleWindow),
       shuffleBytes = reason(current.shuffleBytes, work.shuffleNanos,
@@ -1050,29 +1051,11 @@ object AnalyticalStageCostModel {
       broadcastNanos = classified.broadcastNanos,
       broadcastBytes = classified.broadcastBytes,
       batchUnitNanos = work.batchNanos * work.baseline.batchBytes,
-      batchBytes = processedBytes)
-  }
-
-  private def intDomain(current: Int, maximum: Int): Seq[Int] = {
-    if (current <= 0 || maximum <= 0) {
-      Seq(current)
-    } else if (maximum <= 64) {
-      // A GPU-admission quota gates the complete task, not only the measured GPU-holding lane.
-      // One observation at `current` cannot identify the counterfactual response below it. Keep
-      // lower quotas ineligible until replay/history supplies that response; online queueing can
-      // still support retaining or raising the quota within the hard envelope.
-      (math.min(current, maximum) to maximum).toSeq
-    } else {
-      val values = mutable.TreeSet.empty[Int]
-      values += math.min(current, maximum)
-      values += maximum
-      var value = math.max(1, current)
-      while (value < maximum && value <= Integer.MAX_VALUE / 2) {
-        value = math.min(maximum, value * 2)
-        values += value
-      }
-      values.toSeq
-    }
+      batchBytes = processedBytes,
+      nonGpuNanos = classified.scanNanos + classified.shuffleNanos +
+        classified.broadcastNanos + classified.unclassifiedNanos,
+      ioBytes = classified.scanBytes + classified.shuffleBytes + classified.broadcastBytes,
+      taskCount = observation.taskCount)
   }
 
   private def activeScanWindow(hint: StageRuntimeHint): Int =
