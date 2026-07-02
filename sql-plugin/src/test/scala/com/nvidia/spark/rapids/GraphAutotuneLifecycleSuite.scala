@@ -21,12 +21,6 @@ import org.scalatest.funsuite.AnyFunSuite
 class GraphAutotuneLifecycleSuite extends AnyFunSuite {
   private val key = AutotuneStageKey(executionId = 11L, stageId = 3, stageAttemptId = 1)
 
-  test("native GPU task slots respect both CPU and Spark GPU resources") {
-    assert(GpuTaskSlotEstimator.estimate(8, Some(0.25), Some(1.0)) == 4)
-    assert(GpuTaskSlotEstimator.estimate(2, Some(0.25), Some(2.0)) == 2)
-    assert(GpuTaskSlotEstimator.estimate(8, None, None) == 8)
-  }
-
   test("SQL execution cleanup removes only that execution's runtime state") {
     val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
     val otherKey = key.copy(executionId = key.executionId + 1, stageId = 4)

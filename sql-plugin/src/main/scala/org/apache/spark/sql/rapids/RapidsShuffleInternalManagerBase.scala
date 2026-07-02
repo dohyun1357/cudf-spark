@@ -2055,15 +2055,12 @@ class RapidsShuffleInternalManagerBase(conf: SparkConf, val isDriver: Boolean)
             RapidsShuffleInternalManagerBase.startThreadPoolIfNeeded(
               rapidsConf.shuffleMultiThreadedWriterThreads,
               rapidsConf.shuffleMultiThreadedReaderThreads)
-            // Graph-autotune shuffle-read actuator: GRAPH may only tighten the static cap;
-            // OPTIMIZE may raise it to its explicit per-task host-memory ceiling. Default-off and
-            // fail-open; see ShuffleReadHints.
+            // Graph-autotune shuffle-read actuator: a hint may only tighten the static cap.
+            // Default-off and fail-open; see ShuffleReadHints.
             val effectiveMaxBytesInFlight = ShuffleReadHints.effectiveMaxBytesInFlight(
               rapidsConf.shuffleMultiThreadedMaxBytesInFlight,
               RapidsAutotuneTaskHints.currentShuffleHint,
-              rapidsConf.isAutotuneGraphShuffleEnabled,
-              allowAboveStatic = rapidsConf.isAutotuneOptimizeMode,
-              optimizeMaxBytesInFlight = rapidsConf.autotuneEffectiveShuffleMaxBytesInFlight)
+              rapidsConf.isAutotuneGraphShuffleEnabled)
             new RapidsShuffleThreadedReader(
               startMapIndex,
               endMapIndex,

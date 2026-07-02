@@ -1879,9 +1879,9 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .doc("Autotuning mode. OBSERVE is the default no-op/telemetry mode: it emits applied-hint " +
         "eventlog records and publishes only empty (no-op) stage hints, leaving execution " +
         "unchanged. LOCAL enables executor-local controllers under static caps. GRAPH enables " +
-        "one driver graph optimizer whose joint scan/GPU/shuffle/batch decision is bounded by " +
-        "static caps. OPTIMIZE uses the same optimizer with separately configured larger " +
-        "device/host-memory safety envelopes.")
+        "one driver graph optimizer whose joint scan/shuffle/batch decision is bounded by " +
+        "static caps. OPTIMIZE additionally enables the model-driven AQE reducer-parallelism " +
+        "rule.")
       .stringConf
       .transform(_.toUpperCase(java.util.Locale.ROOT))
       .checkValues(AutotuneGraphMode.values.map(_.toString))
@@ -1909,8 +1909,8 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     conf("spark.rapids.sql.autotune.scan.enabled")
       .doc("Enable graph autotune scan hints. When false, the driver publishes only empty " +
         "(no-op) scan hints and the scan read-window controller keeps the stock reader " +
-        "behavior. Provides the same per-subsystem gate that shuffle, batch, and GPU " +
-        "admission already have, for mechanism ablation.")
+        "behavior. Provides the same per-subsystem gate that shuffle and batch already " +
+        "have, for mechanism ablation.")
       .booleanConf
       .createWithDefault(true)
 
@@ -1930,59 +1930,6 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .bytesConf(ByteUnit.BYTE)
       .checkValue(v => v > 0, "The autotune scan max ready bytes must be greater than 0.")
       .createWithDefault(Long.MaxValue)
-
-  val AUTOTUNE_GPU_MAX_CONCURRENT_TASKS =
-    conf("spark.rapids.sql.autotune.gpu.maxConcurrentTasks")
-      .doc("Enable graph GPU-admission tuning and request this GRAPH ceiling. Cold stages start " +
-        "at the native Spark task-slot capacity because concurrentGpuTasks is a dynamic-memory " +
-        "estimator seed, not a hard limit; the optimizer may tighten only after observations. " +
-        s"'${MAX_CONCURRENT_GPU_TASKS.key}' remains the static semaphore setting. Set to 0 " +
-        "to disable optimizer GPU admission.")
-      .integerConf
-      .checkValue(v => v >= 0,
-        "The autotune GPU max concurrent tasks value must be non-negative.")
-      .createWithDefault(0)
-
-  val AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS =
-    conf("spark.rapids.sql.autotune.optimize.gpu.maxConcurrentTasks")
-      .doc("OPTIMIZE-mode GPU-admission ceiling in the graph optimizer's feasible domain, " +
-        s"ABOVE the static '${MAX_CONCURRENT_GPU_TASKS.key}'. Only used in OPTIMIZE mode, only " +
-        s"when above '${AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key}'. Raising the cap cannot " +
-        "OOM: the GPU semaphore memory-permit pool (sized by gpu.allocFraction at startup) gates " +
-        "every admission regardless of the task-count cap. 0 (default) means no increase.")
-      .integerConf
-      .checkValue(v => v >= 0,
-        "The autotune optimize GPU max concurrent tasks value must be non-negative.")
-      .createWithDefault(0)
-
-  val AUTOTUNE_OPTIMIZE_SCAN_MAX_READ_WINDOW =
-    conf("spark.rapids.sql.autotune.optimize.scan.maxReadWindow")
-      .doc("OPTIMIZE-mode scan read-window ceiling in the graph optimizer's feasible domain, " +
-        s"above the '${AUTOTUNE_SCAN_MAX_READ_WINDOW.key}' / scan.prefetch.maxParallelism cap. " +
-        "Used only " +
-        "in OPTIMIZE mode and only when positive. The window is additionally bounded by the " +
-        "per-task input file count -- it cannot exceed what the stock (non-autotune) multi-file " +
-        "reader already reads concurrently. " +
-        s"'${AUTOTUNE_SCAN_MAX_READY_BYTES.key}' should be set to a host budget " +
-        "when raising the window. 0 (default) means no above-static scan window.")
-      .integerConf
-      .checkValue(v => v >= 0,
-        "The autotune optimize scan max read window must be non-negative.")
-      .createWithDefault(0)
-
-  val AUTOTUNE_OPTIMIZE_SHUFFLE_MAX_BYTES_IN_FLIGHT =
-    conf("spark.rapids.sql.autotune.optimize.shuffle.maxBytesInFlight")
-      .doc("OPTIMIZE-mode hard per-task host-memory ceiling for the graph optimizer's " +
-        "multithreaded shuffle-reader bytes-in-flight decision, above the static " +
-        "'spark.rapids.shuffle.multiThreaded.maxBytesInFlight' cap. Size this together with the " +
-        "maximum concurrent tasks per executor so their aggregate read-ahead fits the available " +
-        "pinned/off-heap host-memory budget. The executor clamps every hint to this ceiling. " +
-        "Only used in OPTIMIZE mode when shuffle autotuning is enabled. 0 (default) means no " +
-        "above-static shuffle read-ahead.")
-      .bytesConf(ByteUnit.BYTE)
-      .checkValue(v => v >= 0,
-        "The autotune optimize shuffle max bytes in flight must be non-negative.")
-      .createWithDefault(0L)
 
   val AUTOTUNE_FAIL_OPEN =
     conf("spark.rapids.sql.autotune.failOpen")
@@ -2007,9 +1954,8 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val AUTOTUNE_SHUFFLE_MAX_READY_BYTES =
     conf("spark.rapids.sql.autotune.shuffle.maxReadyBytes")
-      .doc("Per-task max-ready-bytes hint for graph autotune shuffle read-ahead. GRAPH may use " +
-        "it only to tighten the static shuffle bytes-in-flight cap. In OPTIMIZE it is the " +
-        "initial bound in the optimizer's larger feasible domain.")
+      .doc("Per-task max-ready-bytes hint for graph autotune shuffle read-ahead. It may only " +
+        "tighten the static shuffle bytes-in-flight cap.")
       .bytesConf(ByteUnit.BYTE)
       .checkValue(v => v > 0, "The autotune shuffle max ready bytes must be greater than 0.")
       .createWithDefault(Long.MaxValue)
@@ -4068,29 +4014,7 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val autotuneScanReadWindowCap: Int =
     math.min(autotuneScanMaxReadWindow, scanPrefetchMaxParallelism)
 
-  lazy val autotuneOptimizeScanReadWindowCap: Int =
-    get(AUTOTUNE_OPTIMIZE_SCAN_MAX_READ_WINDOW)
-
-  /**
-   * Effective scan read-window ceiling. GRAPH/other modes bound it at the static autotune cap;
-   * OPTIMIZE raises it to the (higher) OPTIMIZE ceiling when that is configured, letting the window
-   * grow above static. The per-task reader still bounds the actual window by the format's
-   * multiThreadedRead.maxNumFilesParallel and the input file count, so it never exceeds what the
-   * stock multi-file reader would read concurrently.
-   */
-  lazy val autotuneEffectiveScanReadWindowCap: Int =
-    if (isAutotuneOptimizeMode && autotuneOptimizeScanReadWindowCap > 0) {
-      math.max(autotuneScanReadWindowCap, autotuneOptimizeScanReadWindowCap)
-    } else {
-      autotuneScanReadWindowCap
-    }
-
   lazy val autotuneScanMaxReadyBytes: Long = get(AUTOTUNE_SCAN_MAX_READY_BYTES)
-
-  lazy val autotuneGpuMaxConcurrentTasks: Int = get(AUTOTUNE_GPU_MAX_CONCURRENT_TASKS)
-
-  lazy val autotuneOptimizeGpuMaxConcurrentTasks: Int =
-    get(AUTOTUNE_OPTIMIZE_GPU_MAX_CONCURRENT_TASKS)
 
   lazy val autotuneFailOpen: Boolean = get(AUTOTUNE_FAIL_OPEN)
 
@@ -4104,32 +4028,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val autotuneShuffleMaxReadyBytes: Long = get(AUTOTUNE_SHUFFLE_MAX_READY_BYTES)
 
-  lazy val autotuneOptimizeShuffleMaxBytesInFlight: Long =
-    get(AUTOTUNE_OPTIMIZE_SHUFFLE_MAX_BYTES_IN_FLIGHT)
-
-  /**
-   * Hard executor-side shuffle bytes-in-flight ceiling. GRAPH and an unconfigured OPTIMIZE mode
-   * retain the static cap; an explicit OPTIMIZE ceiling may raise it.
-   */
-  lazy val autotuneEffectiveShuffleMaxBytesInFlight: Long =
-    if (isAutotuneOptimizeMode &&
-        autotuneOptimizeShuffleMaxBytesInFlight > shuffleMultiThreadedMaxBytesInFlight) {
-      autotuneOptimizeShuffleMaxBytesInFlight
-    } else {
-      shuffleMultiThreadedMaxBytesInFlight
-    }
-
-  /**
-   * Initial OPTIMIZE shuffle hint starts at today's effective bound (static, or a tighter graph
-   * hint) before the optimizer evaluates the larger OPTIMIZE domain.
-   */
-  lazy val autotuneInitialShuffleMaxReadyBytes: Long =
-    if (isAutotuneOptimizeMode &&
-        autotuneEffectiveShuffleMaxBytesInFlight > shuffleMultiThreadedMaxBytesInFlight) {
-      math.min(autotuneShuffleMaxReadyBytes, shuffleMultiThreadedMaxBytesInFlight)
-    } else {
-      autotuneShuffleMaxReadyBytes
-    }
+  /** Initial shuffle hint bound: the configured static max-ready-bytes envelope. */
+  lazy val autotuneInitialShuffleMaxReadyBytes: Long = autotuneShuffleMaxReadyBytes
 
   lazy val autotuneShuffleCoalesceTargetBytes: Long = get(AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES)
 

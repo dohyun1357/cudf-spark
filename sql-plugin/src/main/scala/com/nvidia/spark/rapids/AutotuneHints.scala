@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids
 
-// The serialized autotune wire types -- AutotuneStageKey, ScanRuntimeHint, GpuRuntimeHint,
+// The serialized autotune wire types -- AutotuneStageKey, ScanRuntimeHint,
 // StageRuntimeHint and the RapidsAutotuneHint*Msg messages -- live in the sql-plugin-api module
 // (see GraphAutotuneMessages) so they are packaged at the jar root / base classloader and Spark's
 // RpcEnv can deserialize them. The types in this package use them but are not themselves sent over
@@ -58,9 +58,6 @@ object RapidsAutotuneTaskHints {
 
   def currentScanHint: Option[ScanRuntimeHint] =
     Option(currentHint.get()).filter(_.hasHint).map(_.hint.scan)
-
-  def currentGpuHint: Option[GpuRuntimeHint] =
-    Option(currentHint.get()).filter(_.hasHint).map(_.hint.gpu)
 
   def currentShuffleHint: Option[ShuffleRuntimeHint] =
     Option(currentHint.get()).filter(_.hasHint).map(_.hint.shuffle)
@@ -106,12 +103,11 @@ object BatchRuntimeHints {
  *
  * The multithreaded shuffle reader sizes its per-reader `BytesInFlightLimiter` at construction, on
  * the task thread where [[RapidsAutotuneTaskHints]] is live. This turns the task-local
- * [[ShuffleRuntimeHint]] into an effective limiter bound. GRAPH mode can only tighten the static
- * `spark.rapids.shuffle.multiThreaded.maxBytesInFlight` cap. OPTIMIZE may raise it, but only up to
- * the separately configured per-task host-memory ceiling. Fail-open: when disabled, with no hint,
- * or with the empty-hint sentinel (`Long.MaxValue`), the static cap is returned unchanged. A
- * non-positive `maxReadyBytes` is also ignored. The executor applies the ceiling even if a bad or
- * stale driver hint asks for more, so the configured host-memory envelope is a hard backstop.
+ * [[ShuffleRuntimeHint]] into an effective limiter bound. A hint can only tighten the static
+ * `spark.rapids.shuffle.multiThreaded.maxBytesInFlight` cap. Fail-open: when disabled, with no
+ * hint, or with the empty-hint sentinel (`Long.MaxValue`), the static cap is returned unchanged. A
+ * non-positive `maxReadyBytes` is also ignored. The executor applies the cap even if a bad or
+ * stale driver hint asks for more, so the static host-memory envelope is a hard backstop.
  */
 object ShuffleReadHints {
   def effectivePrefetchWindow(hint: Option[ShuffleRuntimeHint]): Int =
@@ -127,21 +123,13 @@ object ShuffleReadHints {
   def effectiveMaxBytesInFlight(
       staticMaxBytesInFlight: Long,
       hint: Option[ShuffleRuntimeHint],
-      enabled: Boolean,
-      allowAboveStatic: Boolean = false,
-      optimizeMaxBytesInFlight: Long = 0L): Long = {
+      enabled: Boolean): Long = {
     if (!enabled) {
       staticMaxBytesInFlight
     } else {
       hint.map(_.maxReadyBytes).filter(b => b > 0L && b != Long.MaxValue) match {
         case Some(hintBound) =>
-          val hardCeiling =
-            if (allowAboveStatic && optimizeMaxBytesInFlight > staticMaxBytesInFlight) {
-              optimizeMaxBytesInFlight
-            } else {
-              staticMaxBytesInFlight
-            }
-          math.max(1L, math.min(hardCeiling, hintBound))
+          math.max(1L, math.min(staticMaxBytesInFlight, hintBound))
         case None => staticMaxBytesInFlight
       }
     }

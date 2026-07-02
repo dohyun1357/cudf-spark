@@ -30,8 +30,8 @@ package com.nvidia.spark.rapids
  * lands them in the parallel world, and the receiving endpoint fails to resolve them with
  * `java.lang.ClassNotFoundException`, which kills the executor on every autotune hint exchange.
  *
- * The autotune endpoints, policies, caches and admission controller that *use* these messages
- * stay in `sql-plugin` (`GraphAutotuneRuntime`); only the serialized wire closure lives here.
+ * The autotune endpoints, policies and caches that *use* these messages stay in `sql-plugin`
+ * (`GraphAutotuneRuntime`); only the serialized wire closure lives here.
  */
 
 case class AutotuneStageKey(
@@ -51,26 +51,6 @@ object ScanRuntimeHint {
     minReadWindow = 0,
     maxReadWindow = 0,
     maxReadyBytes = Long.MaxValue)
-}
-
-/**
- * GPU admission allocation selected by the graph optimizer.
- *
- * `maxConcurrentTasks` is this stage's executor-local quota. `sharedMaxConcurrentTasks` is the
- * total executor-wide GPU-task budget shared by all active stages. `schedulingPriority` is derived
- * from the stage's modeled remaining critical-path length; it only orders otherwise-eligible
- * waiters and never bypasses either task-count limit or memory permits.
- */
-case class GpuRuntimeHint(
-    maxConcurrentTasks: Int,
-    sharedMaxConcurrentTasks: Int = 0,
-    schedulingPriority: Long = 0L)
-
-object GpuRuntimeHint {
-  val empty: GpuRuntimeHint = GpuRuntimeHint(
-    maxConcurrentTasks = 0,
-    sharedMaxConcurrentTasks = 0,
-    schedulingPriority = 0L)
 }
 
 case class ShuffleRuntimeHint(
@@ -103,7 +83,6 @@ case class StageRuntimeHint(
     stageAttemptId: Int,
     version: Long,
     scan: ScanRuntimeHint,
-    gpu: GpuRuntimeHint,
     shuffle: ShuffleRuntimeHint = ShuffleRuntimeHint.empty,
     batch: BatchRuntimeHint = BatchRuntimeHint.empty,
     expiresAtNanos: Long) {
@@ -119,7 +98,6 @@ object StageRuntimeHint {
     stageAttemptId = key.stageAttemptId,
     version = 0L,
     scan = ScanRuntimeHint.empty,
-    gpu = GpuRuntimeHint.empty,
     shuffle = ShuffleRuntimeHint.empty,
     batch = BatchRuntimeHint.empty,
     expiresAtNanos = Long.MaxValue)
@@ -141,10 +119,8 @@ case class RapidsAutotuneHintAppliedMsg(
     hintVersion: Long,
     hasHint: Boolean,
     scan: ScanRuntimeHint,
-    gpu: GpuRuntimeHint,
     shuffle: ShuffleRuntimeHint,
-    batch: BatchRuntimeHint,
-    gpuAppliedMaxConcurrentTasks: Int)
+    batch: BatchRuntimeHint)
 
 /**
  * Executor -> driver runtime observation reported (fire-and-forget) at task completion. Feeds the

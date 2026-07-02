@@ -67,11 +67,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     enabled = conf.autotuneGraphEnabled
     optimizerEnabled = conf.isAutotuneClosedLoopMode
     sparkContext = if (enabled) sc else null
-    val nativeGpuTaskSlots = if (sc == null) 0 else {
-      RapidsPluginUtils.estimateGpuTaskSlotsOnExec(sc.getConf)
-    }
     optimizer = new AnalyticalGraphWideAutotuneOptimizer(
-      GraphOptimizerConstraints.fromConf(conf, nativeGpuTaskSlots))
+      GraphOptimizerConstraints.fromConf(conf))
     nanoSource = () => System.nanoTime()
     hints.clear()
     observations.clear()
@@ -124,7 +121,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   }
 
   def publishDefaultNoopHint(key: AutotuneStageKey): StageRuntimeHint = synchronized {
-    publishStageHint(key, ScanRuntimeHint.empty, GpuRuntimeHint.empty)
+    publishStageHint(key, ScanRuntimeHint.empty)
   }
 
   /** Register a graph node and publish the optimizer's complete initial joint hint. */
@@ -136,7 +133,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     } else {
       val content = optimizer.initialHint(key, descriptor)
       val published = publishStageHint(
-        key, content.scan, content.gpu, content.shuffle, content.batch)
+        key, content.scan, content.shuffle, content.batch)
       optimizer.hintPublished(published)
       published
     }
@@ -191,7 +188,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   def publishStageHint(
       key: AutotuneStageKey,
       scanHint: ScanRuntimeHint,
-      gpuHint: GpuRuntimeHint = GpuRuntimeHint.empty,
       shuffleHint: ShuffleRuntimeHint = ShuffleRuntimeHint.empty,
       batchHint: BatchRuntimeHint = BatchRuntimeHint.empty): StageRuntimeHint = synchronized {
     if (!enabled) {
@@ -206,7 +202,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
             stageAttemptId = key.stageAttemptId,
             version = nextHintVersion.getAndIncrement(),
             scan = scanHint,
-            gpu = gpuHint,
             shuffle = shuffleHint,
             batch = batchHint,
             expiresAtNanos = Long.MaxValue)
@@ -279,10 +274,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       scanMinReadWindow = msg.scan.minReadWindow,
       scanMaxReadWindow = msg.scan.maxReadWindow,
       scanMaxReadyBytes = msg.scan.maxReadyBytes,
-      gpuMaxConcurrentTasks = msg.gpu.maxConcurrentTasks,
-      gpuAppliedMaxConcurrentTasks = msg.gpuAppliedMaxConcurrentTasks,
-      gpuSharedMaxConcurrentTasks = msg.gpu.sharedMaxConcurrentTasks,
-      gpuSchedulingPriority = msg.gpu.schedulingPriority,
       shufflePrefetchWindow = msg.shuffle.prefetchWindow,
       shuffleMaxReadyBytes = msg.shuffle.maxReadyBytes,
       shuffleCoalesceTargetBytes = msg.shuffle.coalesceTargetBytes,
@@ -336,7 +327,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       logDebug(s"RAPIDS graph optimizer re-hinted stage ${key.stageId}." +
         s"${key.stageAttemptId} to version ${published.version}; predicted task work " +
         s"${decision.predictedCurrentNanos} -> ${decision.predictedSelectedNanos} ns; " +
-        s"scan ${published.scan}, GPU ${published.gpu}, shuffle ${published.shuffle}, " +
+        s"scan ${published.scan}, shuffle ${published.shuffle}, " +
         s"batch ${published.batch}")
     }
     publishDecisionRecords()
@@ -650,7 +641,7 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
     if (hint.version > 0) {
       logDebug(s"Published RAPIDS graph autotune hint version ${hint.version} " +
         s"for execution $executionId, stage ${key.stageId}.${key.stageAttemptId}, " +
-        s"scan hint ${hint.scan}, GPU hint ${hint.gpu}, shuffle hint ${hint.shuffle}, " +
+        s"scan hint ${hint.scan}, shuffle hint ${hint.shuffle}, " +
         s"batch hint ${hint.batch}")
     }
     hint

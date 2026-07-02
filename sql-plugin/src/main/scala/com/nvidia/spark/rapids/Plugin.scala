@@ -62,21 +62,6 @@ case class ColumnarOverrideRules() extends ColumnarRule with Logging {
   override def postColumnarTransitions: Rule[SparkPlan] = overrideTransitions
 }
 
-private[rapids] object GpuTaskSlotEstimator {
-  def estimate(
-      coreSlots: Int,
-      taskGpuAmount: Option[Double],
-      executorGpuAmount: Option[Double]): Int = {
-    val boundedCoreSlots = math.max(1, coreSlots)
-    val gpuSlots = for {
-      taskAmount <- taskGpuAmount
-      executorAmount <- executorGpuAmount
-      if taskAmount > 0.0 && executorAmount > 0.0
-    } yield math.max(1, math.floor(executorAmount / taskAmount).toInt)
-    math.min(boundedCoreSlots, gpuSlots.getOrElse(boundedCoreSlots))
-  }
-}
-
 object RapidsPluginUtils extends Logging {
   val CUDF_PROPS_FILENAME = "cudf-java-version-info.properties"
   val JNI_PROPS_FILENAME = "spark-rapids-jni-version-info.properties"
@@ -244,14 +229,6 @@ object RapidsPluginUtils extends Logging {
     }
     logInfo(s"Estimated number of cores is $numCores")
     numCores
-  }
-
-  /** Spark task slots per executor after both CPU cores and configured GPU resources apply. */
-  def estimateGpuTaskSlotsOnExec(conf: SparkConf): Int = {
-    GpuTaskSlotEstimator.estimate(
-      estimateCoresOnExec(conf),
-      conf.getOption(TASK_GPU_AMOUNT_KEY).map(_.toDouble),
-      conf.getOption(EXECUTOR_GPU_AMOUNT_KEY).map(_.toDouble))
   }
 
   def fixupConfigsOnDriver(conf: SparkConf): Unit = {
@@ -647,15 +624,13 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
 
       val sparkConf = pluginContext.conf()
       val numCores = RapidsPluginUtils.estimateCoresOnExec(sparkConf)
-      val nativeGpuTaskSlots = RapidsPluginUtils.estimateGpuTaskSlotsOnExec(sparkConf)
       val conf = new RapidsConf(extraConf.asScala.toMap)
 
       isAsyncProfilerEnabled = conf.asyncProfilerPathPrefix.nonEmpty
       if (conf.autotuneGraphEnabled) {
         logInfo(s"Initializing RAPIDS graph autotune executor endpoint in " +
           s"${conf.autotuneGraphMode} mode")
-        autotuneHintEndpoint = new RapidsAutotuneExecutorEndpoint(
-          pluginContext, conf, nativeGpuTaskSlots)
+        autotuneHintEndpoint = new RapidsAutotuneExecutorEndpoint(pluginContext, conf)
       }
 
       ProfilerOnExecutor.init(pluginContext, conf)
@@ -953,8 +928,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
         key,
         taskAttemptId,
         taskCtx.partitionId(),
-        hint,
-        gpuAppliedMaxConcurrentTasks = 0)
+        hint)
       // Report raw work/resource observations at task completion to feed the driver optimizer.
       // Fully fail-open: a completion listener that threw could fail the task, so reading the
       // metrics and reporting must never propagate an exception.

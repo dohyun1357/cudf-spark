@@ -89,8 +89,7 @@ class AutotuneHintCache(
  */
 class RapidsAutotuneExecutorEndpoint(
     pluginContext: PluginContext,
-    conf: RapidsConf,
-    nativeGpuTaskSlots: Int = 0) extends Logging {
+    conf: RapidsConf) extends Logging {
   private val executorId = pluginContext.executorID()
   private val failOpen = conf.autotuneFailOpen
   // Only the closed-loop modes (GRAPH, OPTIMIZE) republish hints mid-query, so only there does the
@@ -105,8 +104,7 @@ class RapidsAutotuneExecutorEndpoint(
       key: AutotuneStageKey,
       taskAttemptId: Long,
       partitionId: Int,
-      cachedHint: AutotuneCachedHint,
-      gpuAppliedMaxConcurrentTasks: Int): Unit = {
+      cachedHint: AutotuneCachedHint): Unit = {
     logDebug(s"Applied RAPIDS graph autotune hint version ${cachedHint.version} " +
       s"for execution ${key.executionId}, stage ${key.stageId}.${key.stageAttemptId}, " +
       s"task $taskAttemptId")
@@ -119,10 +117,8 @@ class RapidsAutotuneExecutorEndpoint(
         hintVersion = cachedHint.version,
         hasHint = cachedHint.hasHint,
         scan = cachedHint.hint.scan,
-        gpu = cachedHint.hint.gpu,
         shuffle = cachedHint.hint.shuffle,
-        batch = cachedHint.hint.batch,
-        gpuAppliedMaxConcurrentTasks = gpuAppliedMaxConcurrentTasks))
+        batch = cachedHint.hint.batch))
     } catch {
       case NonFatal(e) if failOpen =>
         logWarning("Failed to report RAPIDS graph autotune applied hint; continuing", e)

@@ -23,7 +23,6 @@ case class GraphOptimizerConstraints(
     minSampleTasks: Long,
     updateIntervalNanos: Long,
     scan: ScanOptimizerBounds,
-    gpu: GpuOptimizerBounds,
     shuffle: ShuffleOptimizerBounds,
     batch: BatchOptimizerBounds)
 
@@ -32,11 +31,6 @@ case class ScanOptimizerBounds(
     initialReadWindow: Int,
     maxReadWindow: Int,
     maxReadyBytes: Long)
-
-case class GpuOptimizerBounds(
-    enabled: Boolean,
-    initialConcurrentTasks: Int,
-    maxConcurrentTasks: Int)
 
 case class ShuffleOptimizerBounds(
     enabled: Boolean,
@@ -54,24 +48,7 @@ case class BatchOptimizerBounds(
     minimumTargetBytes: Long = 0L)
 
 object GraphOptimizerConstraints {
-  def fromConf(
-      conf: RapidsConf,
-      nativeGpuTaskSlots: Int = 0): GraphOptimizerConstraints = {
-    val configuredGpuMaximum = if (conf.isAutotuneOptimizeMode) {
-      math.max(conf.autotuneGpuMaxConcurrentTasks,
-        conf.autotuneOptimizeGpuMaxConcurrentTasks)
-    } else {
-      conf.autotuneGpuMaxConcurrentTasks
-    }
-    // concurrentGpuTasks seeds RAPIDS' dynamic memory-permit estimator; it is not a hard task
-    // limit. A cold graph hint must therefore allow every Spark task slot that stock RAPIDS could
-    // admit. The existing permit pool remains the authoritative memory-safety boundary.
-    val nativeGpuMaximum = if (nativeGpuTaskSlots > 0) {
-      nativeGpuTaskSlots
-    } else {
-      conf.autotuneGpuMaxConcurrentTasks
-    }
-    val gpuMaximum = math.max(nativeGpuMaximum, configuredGpuMaximum)
+  def fromConf(conf: RapidsConf): GraphOptimizerConstraints = {
     val nativeBatchTarget = conf.gpuTargetBatchSizeBytes
     val configuredMinimumTargets = Seq(
       conf.autotuneBatchTargetBytes,
@@ -90,15 +67,11 @@ object GraphOptimizerConstraints {
       updateIntervalNanos = conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L,
       scan = ScanOptimizerBounds(
         enabled = conf.isAutotuneClosedLoopMode && conf.autotuneScanEnabled,
-        // Start at the static envelope. OPTIMIZE makes the larger value part of the feasible
-        // domain; it is the optimizer, rather than an initial per-knob policy, that selects it.
+        // Start at the static envelope; the optimizer, rather than an initial per-knob policy,
+        // selects any different feasible point.
         initialReadWindow = conf.autotuneScanReadWindowCap,
-        maxReadWindow = conf.autotuneEffectiveScanReadWindowCap,
+        maxReadWindow = conf.autotuneScanReadWindowCap,
         maxReadyBytes = conf.autotuneScanMaxReadyBytes),
-      gpu = GpuOptimizerBounds(
-        enabled = conf.isAutotuneClosedLoopMode && conf.autotuneGpuMaxConcurrentTasks > 0,
-        initialConcurrentTasks = nativeGpuMaximum,
-        maxConcurrentTasks = gpuMaximum),
       shuffle = ShuffleOptimizerBounds(
         enabled = conf.isAutotuneClosedLoopMode && conf.autotuneShuffleEnabled,
         // A cold stage begins at the configured feasible envelope. Window 1 was an unevidenced
@@ -106,7 +79,7 @@ object GraphOptimizerConstraints {
         initialPrefetchWindow = conf.autotuneShuffleMaxPrefetchWindow,
         maxPrefetchWindow = conf.autotuneShuffleMaxPrefetchWindow,
         initialReadyBytes = conf.autotuneInitialShuffleMaxReadyBytes,
-        maxReadyBytes = conf.autotuneEffectiveShuffleMaxBytesInFlight,
+        maxReadyBytes = conf.shuffleMultiThreadedMaxBytesInFlight,
         // Shuffle coalescing targets the same native GPU batch size. A smaller configured value
         // is a model candidate, never an unconditional cold-stage override.
         initialCoalesceBytes = nativeBatchTarget),
@@ -179,7 +152,9 @@ private[rapids] object GpuFlowAqeCalibration {
   def empty(constraints: GraphOptimizerConstraints): GpuFlowAqeCalibration = {
     val reference = GpuFlowControl(
       scanWindow = if (constraints.scan.enabled) constraints.scan.initialReadWindow else 0.0,
-      gpuTasks = if (constraints.gpu.enabled) constraints.gpu.initialConcurrentTasks else 0.0,
+      // The GPU admission hint surface was removed; the gpu dimension stays in the model as the
+      // disabled (zero) actuator, matching the configuration validated by ablation.
+      gpuTasks = 0.0,
       shuffleWindow = if (constraints.shuffle.enabled) {
         constraints.shuffle.initialPrefetchWindow
       } else 0.0,
@@ -373,15 +348,14 @@ private[rapids] case class GraphStageDecisionRecord(
     endToEndGradient: GpuFlowGradient,
     freezeReasons: GraphControlFreezeReasons)
 
-/** Best locally feasible complete hint for one fixed GPU-stage quota. */
+/** Best locally feasible complete hint at one calibrated operating point. */
 private[rapids] case class GraphStageCostAlternative(
-    gpuTasks: Int,
     hint: StageRuntimeHint,
     predictedNanos: Double,
     control: Option[GpuFlowControl] = None,
     localGradient: GpuFlowGradient = GpuFlowGradient())
 
-/** Model-calibrated stage cost curve consumed by the graph-wide shared allocator. */
+/** Model-calibrated stage cost curve consumed by the graph-wide decision epoch. */
 private[rapids] case class GraphStageCostCurve(
     predictedCurrentNanos: Double,
     sampleTasks: Long,
@@ -393,7 +367,7 @@ private[rapids] case class GraphStageCostCurve(
  * Single owner of initial and updated joint [[StageRuntimeHint]] values.
  *
  * Implementations receive graph lifecycle and raw task observations. They return complete hints;
- * scan, GPU, shuffle and batch decisions are never delegated to independent knob policies.
+ * scan, shuffle and batch decisions are never delegated to independent knob policies.
  */
 trait GraphWideAutotuneOptimizer {
   def initialHint(key: AutotuneStageKey, descriptor: AutotuneStageDescriptor): StageRuntimeHint
@@ -426,11 +400,11 @@ trait GraphWideAutotuneOptimizer {
 /**
  * Driver graph optimizer backed by a constrained analytical stage-cost model.
  *
- * The optimizer uses a projected-gradient inner solve for continuous controls and an exact
- * discrete outer solve for shared GPU quotas. The objective is predicted end-to-end completion of
- * the remaining max-plus Spark DAG, calibrated from measured task elapsed time and resource work.
- * A reverse pass supplies stage criticality and control gradients. User configuration and executor
- * clamps define feasibility, not policy; unidentifiable counterfactual controls remain ineligible.
+ * The objective is predicted end-to-end completion of the remaining max-plus Spark DAG,
+ * calibrated from measured task elapsed time and resource work. A reverse pass supplies stage
+ * criticality and control gradients for eventlog reporting. User configuration and executor
+ * clamps define feasibility, not policy; unidentifiable counterfactual controls remain ineligible,
+ * so every continuous control is held at its measured operating point.
  */
 class AnalyticalGraphWideAutotuneOptimizer(
     constraints: GraphOptimizerConstraints) extends GraphWideAutotuneOptimizer {
@@ -548,6 +522,12 @@ class AnalyticalGraphWideAutotuneOptimizer(
     aqeCalibration.get(executionId).map(_.snapshot).filter(_.sampleWindows > 0L)
   }
 
+  /**
+   * Record one graph-wide decision epoch. Every continuous control is held at its measured
+   * operating point and no shared GPU quota exists anymore, so an epoch is reporting-only: it
+   * evaluates the remaining max-plus graph at the current controls (objective, reverse-mode
+   * criticality, freeze reasons) and never republishes a hint.
+   */
   private def recomputeAllocations(trigger: String): Seq[GraphOptimizerDecision] = {
     val inputs = stages.iterator.map { case (key, state) =>
       GraphStageAllocationInput(
@@ -559,43 +539,35 @@ class AnalyticalGraphWideAutotuneOptimizer(
         currentHint = state.currentHint,
         costCurve = state.costCurve)
     }.toSeq
-    val solution = GraphCriticalPathAllocator.solve(inputs, constraints.gpu.maxConcurrentTasks)
-    recordDecisionEpoch(trigger, inputs, solution)
-    solution.toSeq.flatMap(_.allocations).flatMap {
-      allocation =>
-        stages.get(allocation.key).flatMap { state =>
-          if (sameHintContent(state.currentHint, allocation.hint)) {
-            None
-          } else {
-            state.currentHint = allocation.hint
-            Some(GraphOptimizerDecision(
-              hint = allocation.hint,
-              predictedCurrentNanos = allocation.predictedCurrentNanos,
-              predictedSelectedNanos = allocation.predictedSelectedNanos))
-          }
-        }
-    }
+    recordDecisionEpoch(trigger, inputs)
+    Seq.empty
   }
 
   private def recordDecisionEpoch(
       trigger: String,
-      inputs: Seq[GraphStageAllocationInput],
-      solution: Option[GraphAllocationSolution]): Unit = {
+      inputs: Seq[GraphStageAllocationInput]): Unit = {
     val epochId = nextEpochId
     nextEpochId += 1L
-    val allocationByKey = solution.toSeq.flatMap(_.allocations).map(a => a.key -> a).toMap
-    val selectedAdjoints = solution.map(_.selectedFlow.durationAdjoints).getOrElse(Map.empty)
+    val calibrated = inputs.filter { input =>
+      input.active && input.costCurve.exists(_.alternatives.nonEmpty)
+    }
+    val flow = if (calibrated.isEmpty) None else {
+      val costs = calibrated.flatMap { input =>
+        input.costCurve.map { curve =>
+          input.key -> remainingNanos(input, curve.predictedCurrentNanos, curve.sampleTasks)
+        }
+      }.toMap
+      Some(evaluateGraph(inputs, costs))
+    }
+    val adjoints = flow.map(_.durationAdjoints).getOrElse(Map.empty)
     inputs.sortBy(input => (input.key.executionId, input.key.stageId, input.key.stageAttemptId))
       .foreach { input =>
         val curve = input.costCurve
         val analytical = curve.flatMap(_.analyticalState)
-        val allocation = allocationByKey.get(input.key)
         val currentControl = analytical.map(_.currentControl)
           .getOrElse(AnalyticalStageCostModel.controlFor(input.currentHint))
-        val selectedControl = allocation.flatMap(_.control).getOrElse(currentControl)
-        val localGradient = allocation.map(_.localGradient)
-          .orElse(analytical.map(_.currentGradient)).getOrElse(GpuFlowGradient())
-        val adjoint = selectedAdjoints.getOrElse(input.key, 0.0)
+        val localGradient = analytical.map(_.currentGradient).getOrElse(GpuFlowGradient())
+        val adjoint = adjoints.getOrElse(input.key, 0.0)
         val reasons = analytical.map(_.freezeReasons).getOrElse {
           val reason = if (input.completed) "completed-work-is-sunk"
           else if (!input.active) "stage-not-active"
@@ -612,234 +584,16 @@ class AnalyticalGraphWideAutotuneOptimizer(
           observedTasks = input.observedTasks,
           sampleTasks = curve.map(_.sampleTasks).getOrElse(0L),
           currentHintVersion = input.currentHint.version,
-          graphCurrentObjectiveNanos = solution.map(_.currentFlow.objectiveNanos).getOrElse(0.0),
-          graphSelectedObjectiveNanos = solution.map(_.selectedFlow.objectiveNanos).getOrElse(0.0),
+          graphCurrentObjectiveNanos = flow.map(_.objectiveNanos).getOrElse(0.0),
+          graphSelectedObjectiveNanos = flow.map(_.objectiveNanos).getOrElse(0.0),
           predictedCurrentNanos = curve.map(_.predictedCurrentNanos).getOrElse(0.0),
-          predictedSelectedNanos = allocation.map(_.predictedSelectedNanos)
-            .getOrElse(curve.map(_.predictedCurrentNanos).getOrElse(0.0)),
+          predictedSelectedNanos = curve.map(_.predictedCurrentNanos).getOrElse(0.0),
           durationAdjoint = adjoint,
           currentControl = currentControl,
-          selectedControl = selectedControl,
+          selectedControl = currentControl,
           endToEndGradient = localGradient.scale(adjoint),
           freezeReasons = reasons)
       }
-  }
-
-  private def sameHintContent(left: StageRuntimeHint, right: StageRuntimeHint): Boolean =
-    left.scan == right.scan && left.gpu == right.gpu &&
-      left.shuffle == right.shuffle && left.batch == right.batch
-
-  private def initialHintContent(
-      key: AutotuneStageKey,
-      shape: AutotuneStageShape): StageRuntimeHint = {
-    val scanHint = if (constraints.scan.enabled && shape.isScanPrefetchCandidate &&
-        constraints.scan.initialReadWindow > 0) {
-      ScanRuntimeHint(
-        eagerPrefetch = true,
-        minReadWindow = ScanReadWindowSettings.MIN_WINDOW,
-        maxReadWindow = constraints.scan.initialReadWindow,
-        maxReadyBytes = constraints.scan.maxReadyBytes)
-    } else {
-      ScanRuntimeHint.empty
-    }
-    val gpuHint = if (constraints.gpu.enabled && shape.numTasks > 0) {
-      GpuRuntimeHint(
-        maxConcurrentTasks = constraints.gpu.initialConcurrentTasks,
-        sharedMaxConcurrentTasks = constraints.gpu.maxConcurrentTasks)
-    } else {
-      GpuRuntimeHint.empty
-    }
-    val shuffleHint = if (constraints.shuffle.enabled && shape.isShuffleStage) {
-      ShuffleRuntimeHint(
-        prefetchWindow = constraints.shuffle.initialPrefetchWindow,
-        maxReadyBytes = constraints.shuffle.initialReadyBytes,
-        coalesceTargetBytes = constraints.shuffle.initialCoalesceBytes)
-    } else {
-      ShuffleRuntimeHint.empty
-    }
-    val batchHint = if (constraints.batch.enabled && shape.hasGpuWork) {
-      BatchRuntimeHint(
-        targetBatchBytes = constraints.batch.initialTargetBytes,
-        maxBatchBytes = constraints.batch.maxBatchBytes,
-        // Preserve the executor's native, pool-derived split threshold until the model selects a
-        // different batch point from observations.
-        splitUntilSize = 0L)
-    } else {
-      BatchRuntimeHint.empty
-    }
-    StageRuntimeHint.empty(key).copy(
-      scan = scanHint,
-      gpu = gpuHint,
-      shuffle = shuffleHint,
-      batch = batchHint)
-  }
-}
-
-private[rapids] case class GraphStageAllocationInput(
-    key: AutotuneStageKey,
-    descriptor: AutotuneStageDescriptor,
-    active: Boolean,
-    completed: Boolean = false,
-    observedTasks: Long,
-    currentHint: StageRuntimeHint,
-    costCurve: Option[GraphStageCostCurve])
-
-private[rapids] case class GraphStageAllocation(
-    key: AutotuneStageKey,
-    hint: StageRuntimeHint,
-    predictedCurrentNanos: Double,
-    predictedSelectedNanos: Double,
-    control: Option[GpuFlowControl] = None,
-    localGradient: GpuFlowGradient = GpuFlowGradient())
-
-private[rapids] case class GraphAllocationSolution(
-    allocations: Seq[GraphStageAllocation],
-    currentFlow: GpuFlowGraphEvaluation,
-    selectedFlow: GpuFlowGraphEvaluation)
-
-/**
- * Pure shared-resource solver. It enumerates legal stage GPU quotas under one shared budget and
- * minimizes the sum of each SQL execution's remaining DAG critical-path length. No stage class,
- * fixed priority, or pressure threshold participates in allocation: priorities are the modeled
- * path-through lengths of the selected graph solution.
- */
-private[rapids] object GraphCriticalPathAllocator {
-  def allocate(
-      graph: Seq[GraphStageAllocationInput],
-      sharedGpuBudget: Int): Seq[GraphStageAllocation] =
-    solve(graph, sharedGpuBudget).map(_.allocations).getOrElse(Seq.empty)
-
-  def solve(
-      graph: Seq[GraphStageAllocationInput],
-      sharedGpuBudget: Int): Option[GraphAllocationSolution] = {
-    val hasCalibratedStage = graph.exists(input =>
-      input.active && input.costCurve.exists(_.alternatives.nonEmpty))
-    if (!hasCalibratedStage) {
-      return None
-    }
-    val tunable = graph.filter(_.active).flatMap { input =>
-      input.costCurve.filter(_.alternatives.nonEmpty)
-        .orElse(uncalibratedGpuCurve(input))
-        .map(input -> _)
-    }.sortBy { case (input, _) =>
-      (input.key.executionId, input.key.stageId, input.key.stageAttemptId)
-    }
-    if (tunable.isEmpty) {
-      return None
-    }
-    val tunableByKey = tunable.map { case (input, curve) =>
-      (input.key, (input, curve))
-    }.toMap
-
-    val gpuStageCount = tunable.count { case (_, curve) =>
-      curve.alternatives.exists(_.gpuTasks > 0)
-    }
-    // A positive quota keeps a stage runnable while the lower shared semaphore cap and
-    // model-derived priority decide who runs. If the minimum eligible quotas cannot fit this
-    // enumeration budget, the solve defers instead of inventing an unsupported lower quota.
-    val quotaBudget = math.max(math.max(0, sharedGpuBudget), gpuStageCount)
-    val choices = tunable.map { case (input, curve) =>
-      val byGpuTasks = curve.alternatives
-        .filter(alt => alt.gpuTasks <= quotaBudget || alt.gpuTasks <= 0)
-        .groupBy(_.gpuTasks)
-        .map { case (_, alternatives) => alternatives.minBy(_.predictedNanos) }
-        .toSeq
-        .sortBy(_.gpuTasks)
-      (input, (curve, byGpuTasks))
-    }
-
-    var best = Map.empty[AutotuneStageKey, GraphStageCostAlternative]
-    var bestObjective = Double.PositiveInfinity
-    var bestGpuTasks = Int.MaxValue
-
-    def search(
-        index: Int,
-        usedGpuTasks: Int,
-        selected: Map[AutotuneStageKey, GraphStageCostAlternative]): Unit = {
-      if (index >= choices.length) {
-        val costs = selected.map { case (key, alternative) =>
-          val (input, curve) = tunableByKey(key)
-          key -> remainingNanos(input, alternative.predictedNanos,
-            curve.sampleTasks)
-        }
-        val objective = graphObjective(graph, costs)
-        if (objective < bestObjective ||
-            (objective == bestObjective && usedGpuTasks < bestGpuTasks)) {
-          best = selected
-          bestObjective = objective
-          bestGpuTasks = usedGpuTasks
-        }
-      } else {
-        val (input, (_, alternatives)) = choices(index)
-        alternatives.foreach { alternative =>
-          val consumed = math.max(0, alternative.gpuTasks)
-          if (usedGpuTasks + consumed <= quotaBudget) {
-            search(index + 1, usedGpuTasks + consumed,
-              selected + (input.key -> alternative))
-          }
-        }
-      }
-    }
-
-    search(0, 0, Map.empty)
-    if (best.isEmpty) {
-      return None
-    }
-
-    val currentCosts = tunable.map { case (input, curve) =>
-      input.key -> remainingNanos(input, curve.predictedCurrentNanos, curve.sampleTasks)
-    }.toMap
-    val selectedCosts = best.map { case (key, alternative) =>
-      val (input, curve) = tunableByKey(key)
-      key -> remainingNanos(input, alternative.predictedNanos, curve.sampleTasks)
-    }
-    val currentFlow = evaluateGraph(graph, currentCosts)
-    val selectedFlow = evaluateGraph(graph, selectedCosts)
-    val allocations = tunable.flatMap { case (input, curve) =>
-      best.get(input.key).map { alternative =>
-        // Reverse-mode criticality is the marginal change in the end-to-end objective caused by
-        // one additional nanosecond in this stage. Multiplying by its remaining duration gives
-        // the amount of query completion time currently exposed through this node.
-        val priority = toPriority(
-          selectedFlow.durationAdjoints.getOrElse(input.key, 0.0) *
-            selectedCosts.getOrElse(input.key, 0.0))
-        val allocatedGpu = if (alternative.hint.gpu.maxConcurrentTasks > 0) {
-          alternative.hint.gpu.copy(
-            maxConcurrentTasks = alternative.gpuTasks,
-            sharedMaxConcurrentTasks = math.max(0, sharedGpuBudget),
-            schedulingPriority = priority)
-        } else {
-          alternative.hint.gpu
-        }
-        GraphStageAllocation(
-          key = input.key,
-          hint = alternative.hint.copy(gpu = allocatedGpu),
-          predictedCurrentNanos = curve.predictedCurrentNanos,
-          predictedSelectedNanos = alternative.predictedNanos,
-          control = alternative.control,
-          localGradient = alternative.localGradient)
-      }
-    }
-    Some(GraphAllocationSolution(allocations, currentFlow, selectedFlow))
-  }
-
-  /** Keep an uncalibrated active GPU stage at its native allocation. */
-  private def uncalibratedGpuCurve(
-      input: GraphStageAllocationInput): Option[GraphStageCostCurve] = {
-    val currentGpuTasks = input.currentHint.gpu.maxConcurrentTasks
-    if (input.costCurve.isEmpty && currentGpuTasks > 0) {
-      Some(GraphStageCostCurve(
-        predictedCurrentNanos = 0.0,
-        sampleTasks = 1L,
-        // Unknown cost is not evidence for tightening. Keeping only the native allocation makes
-        // the global solve defer if calibrated siblings cannot coexist with this cold stage.
-        alternatives = Seq(GraphStageCostAlternative(
-          currentGpuTasks,
-          input.currentHint,
-          predictedNanos = 0.0))))
-    } else {
-      None
-    }
   }
 
   private def remainingNanos(
@@ -849,12 +603,6 @@ private[rapids] object GraphCriticalPathAllocator {
     val totalTasks = math.max(1L, input.descriptor.shape.numTasks.toLong)
     val remainingTasks = math.max(1L, totalTasks - math.min(totalTasks, input.observedTasks))
     sampledNanos / math.max(1L, sampleTasks).toDouble * remainingTasks.toDouble
-  }
-
-  private def graphObjective(
-      graph: Seq[GraphStageAllocationInput],
-      costs: Map[AutotuneStageKey, Double]): Double = {
-    evaluateGraph(graph, costs).objectiveNanos
   }
 
   private def evaluateGraph(
@@ -884,12 +632,52 @@ private[rapids] object GraphCriticalPathAllocator {
     }.toMap
   }
 
-  private def toPriority(nanos: Double): Long = {
-    if (nanos.isNaN || nanos <= 0.0) 0L
-    else if (nanos >= Long.MaxValue.toDouble) Long.MaxValue
-    else math.ceil(nanos).toLong
+  private def initialHintContent(
+      key: AutotuneStageKey,
+      shape: AutotuneStageShape): StageRuntimeHint = {
+    val scanHint = if (constraints.scan.enabled && shape.isScanPrefetchCandidate &&
+        constraints.scan.initialReadWindow > 0) {
+      ScanRuntimeHint(
+        eagerPrefetch = true,
+        minReadWindow = ScanReadWindowSettings.MIN_WINDOW,
+        maxReadWindow = constraints.scan.initialReadWindow,
+        maxReadyBytes = constraints.scan.maxReadyBytes)
+    } else {
+      ScanRuntimeHint.empty
+    }
+    val shuffleHint = if (constraints.shuffle.enabled && shape.isShuffleStage) {
+      ShuffleRuntimeHint(
+        prefetchWindow = constraints.shuffle.initialPrefetchWindow,
+        maxReadyBytes = constraints.shuffle.initialReadyBytes,
+        coalesceTargetBytes = constraints.shuffle.initialCoalesceBytes)
+    } else {
+      ShuffleRuntimeHint.empty
+    }
+    val batchHint = if (constraints.batch.enabled && shape.hasGpuWork) {
+      BatchRuntimeHint(
+        targetBatchBytes = constraints.batch.initialTargetBytes,
+        maxBatchBytes = constraints.batch.maxBatchBytes,
+        // Preserve the executor's native, pool-derived split threshold until the model selects a
+        // different batch point from observations.
+        splitUntilSize = 0L)
+    } else {
+      BatchRuntimeHint.empty
+    }
+    StageRuntimeHint.empty(key).copy(
+      scan = scanHint,
+      shuffle = shuffleHint,
+      batch = batchHint)
   }
 }
+
+private[rapids] case class GraphStageAllocationInput(
+    key: AutotuneStageKey,
+    descriptor: AutotuneStageDescriptor,
+    active: Boolean,
+    completed: Boolean = false,
+    observedTasks: Long,
+    currentHint: StageRuntimeHint,
+    costCurve: Option[GraphStageCostCurve])
 
 /** Pure constrained optimizer used by [[AnalyticalGraphWideAutotuneOptimizer]]. */
 object AnalyticalStageCostModel {
@@ -937,26 +725,19 @@ object AnalyticalStageCostModel {
     // control at that measured point. Structural AQE parallelism is optimized separately from
     // measured map sizes and task-wave cost, so it remains eligible without fabricating a response
     // curve for executor controls.
-    val gpuValues = Seq(currentControl.gpuTasks.toInt)
     val bounds = GpuFlowControlBounds(currentControl, currentControl)
     val currentEvaluation = GpuFlowStageModel.evaluate(work, currentControl)
 
-    val alternatives = gpuValues.map { gpuTasks =>
-      val fixedGpu = gpuTasks.toDouble
-      // The bounds are the single measured operating point, so the only feasible continuous
-      // control is the current one. A response-identified solver replaces this once multiple
-      // operating points exist; guessing a descent direction from one point is what caused the
-      // historical q17 scan/shuffle regressions.
-      val selected = currentControl.copy(gpuTasks = fixedGpu)
-      val selectedEvaluation = GpuFlowStageModel.evaluate(work, selected)
-      GraphStageCostAlternative(
-        gpuTasks = gpuTasks,
-        hint = hintForCandidate(
-          current, currentControl, selected, constraints.batch.initialSplitUntilSize),
-        predictedNanos = selectedEvaluation.predictedNanos,
-        control = Some(selected),
-        localGradient = selectedEvaluation.gradient)
-    }
+    // The bounds are the single measured operating point, so the only feasible continuous
+    // control is the current one. A response-identified solver replaces this once multiple
+    // operating points exist; guessing a descent direction from one point is what caused the
+    // historical q17 scan/shuffle regressions.
+    val alternatives = Seq(GraphStageCostAlternative(
+      hint = hintForCandidate(
+        current, currentControl, currentControl, constraints.batch.initialSplitUntilSize),
+      predictedNanos = currentEvaluation.predictedNanos,
+      control = Some(currentControl),
+      localGradient = currentEvaluation.gradient))
     Some(GraphStageCostCurve(
       predictedCurrentNanos = currentEvaluation.predictedNanos,
       sampleTasks = observation.taskCount,
@@ -977,9 +758,6 @@ object AnalyticalStageCostModel {
     scan = if (current.scan.maxReadWindow > 0) {
       current.scan.copy(maxReadWindow = selected.scanWindow.toInt)
     } else current.scan,
-    gpu = if (current.gpu.maxConcurrentTasks > 0) {
-      current.gpu.copy(maxConcurrentTasks = selected.gpuTasks.toInt)
-    } else current.gpu,
     shuffle = if (isActiveShuffle(current)) {
       current.shuffle.copy(
         prefetchWindow = selected.shuffleWindow.toInt,
@@ -995,12 +773,11 @@ object AnalyticalStageCostModel {
     } else current.batch)
 
   private def sameHintContent(left: StageRuntimeHint, right: StageRuntimeHint): Boolean =
-    left.scan == right.scan && left.gpu == right.gpu &&
+    left.scan == right.scan &&
       left.shuffle == right.shuffle && left.batch == right.batch
 
   private def hintResource(hint: StageRuntimeHint): Double =
     math.max(0, hint.scan.maxReadWindow).toDouble +
-      math.max(0, hint.gpu.maxConcurrentTasks).toDouble +
       math.max(0, hint.shuffle.prefetchWindow).toDouble +
       math.max(0L, if (hint.shuffle.maxReadyBytes == Long.MaxValue) {
         0L
@@ -1075,7 +852,9 @@ object AnalyticalStageCostModel {
 
   private[rapids] def controlFor(hint: StageRuntimeHint): GpuFlowControl = GpuFlowControl(
     scanWindow = activeScanWindow(hint).toDouble,
-    gpuTasks = activeGpuTasks(hint).toDouble,
+    // The GPU admission hint surface was removed; report the gpu control dimension as the
+    // disabled (zero) actuator.
+    gpuTasks = 0.0,
     shuffleWindow = activeShuffleWindow(hint).toDouble,
     shuffleBytes = activeShuffleBytes(hint).toDouble,
     batchBytes = activeBatchBytes(hint).toDouble)
@@ -1132,9 +911,6 @@ object AnalyticalStageCostModel {
 
   private def activeScanWindow(hint: StageRuntimeHint): Int =
     if (hint.scan.maxReadWindow > 0) hint.scan.maxReadWindow else 0
-
-  private def activeGpuTasks(hint: StageRuntimeHint): Int =
-    if (hint.gpu.maxConcurrentTasks > 0) hint.gpu.maxConcurrentTasks else 0
 
   private def isActiveShuffle(hint: StageRuntimeHint): Boolean =
     hint.shuffle.maxReadyBytes > 0L && hint.shuffle.maxReadyBytes != Long.MaxValue
