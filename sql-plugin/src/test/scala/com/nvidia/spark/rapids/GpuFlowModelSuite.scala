@@ -90,28 +90,4 @@ class GpuFlowModelSuite extends AnyFunSuite {
     assert(evaluation.durationAdjoints(join) == 1.0)
   }
 
-  test("projected flow optimizer decreases the modeled objective within bounds") {
-    val baseline = GpuFlowControl(2.0, 2.0, 2.0, 128.0, 256.0)
-    val bounds = GpuFlowControlBounds(
-      GpuFlowControl(1.0, 2.0, 1.0, 64.0, 128.0),
-      GpuFlowControl(8.0, 2.0, 8.0, 1024.0, 2048.0))
-    val work = GpuFlowStageWork(
-      scanNanos = 1000.0,
-      gpuNanos = 500.0,
-      shuffleNanos = 800.0,
-      batchNanos = 200.0,
-      fixedNanos = 100.0,
-      retryNanos = 0.0,
-      baseline = baseline)
-
-    val selected = GpuFlowProjectedOptimizer.optimize(work, baseline, bounds)
-    assert(selected.gpuTasks == 2.0)
-    assert(GpuFlowStageModel.evaluate(work, selected).predictedNanos <
-      GpuFlowStageModel.evaluate(work, baseline).predictedNanos)
-    GpuFlowControl.Indices.foreach { index =>
-      assert(selected.value(index) >= bounds.minimum.value(index))
-      assert(selected.value(index) <= bounds.maximum.value(index))
-    }
-  }
-
 }

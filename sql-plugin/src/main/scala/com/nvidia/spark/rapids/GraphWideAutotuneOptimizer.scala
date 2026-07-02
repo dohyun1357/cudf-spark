@@ -943,11 +943,11 @@ object AnalyticalStageCostModel {
 
     val alternatives = gpuValues.map { gpuTasks =>
       val fixedGpu = gpuTasks.toDouble
-      val fixedBounds = bounds.copy(
-        minimum = bounds.minimum.copy(gpuTasks = fixedGpu),
-        maximum = bounds.maximum.copy(gpuTasks = fixedGpu))
-      val selected = GpuFlowProjectedOptimizer.optimize(
-        work, currentControl.copy(gpuTasks = fixedGpu), fixedBounds)
+      // The bounds are the single measured operating point, so the only feasible continuous
+      // control is the current one. A response-identified solver replaces this once multiple
+      // operating points exist; guessing a descent direction from one point is what caused the
+      // historical q17 scan/shuffle regressions.
+      val selected = currentControl.copy(gpuTasks = fixedGpu)
       val selectedEvaluation = GpuFlowStageModel.evaluate(work, selected)
       GraphStageCostAlternative(
         gpuTasks = gpuTasks,
