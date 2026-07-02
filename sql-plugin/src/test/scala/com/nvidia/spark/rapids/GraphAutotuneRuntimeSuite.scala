@@ -361,6 +361,32 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(hint.batch == BatchRuntimeHint(oneGiB, oneGiB, splitUntilSize = 0L))
   }
 
+  test("each autotune subsystem gates independently for mechanism ablation") {
+    val conf = new RapidsConf(Map(
+      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
+      RapidsConf.AUTOTUNE_SCAN_ENABLED.key -> "false",
+      RapidsConf.AUTOTUNE_GPU_MAX_CONCURRENT_TASKS.key -> "4",
+      RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "false",
+      RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "false"))
+
+    val constraints = GraphOptimizerConstraints.fromConf(conf, nativeGpuTaskSlots = 16)
+    assert(!constraints.scan.enabled)
+    assert(!constraints.shuffle.enabled)
+    assert(!constraints.batch.enabled)
+    assert(constraints.gpu.enabled)
+
+    // A disabled subsystem publishes only the empty no-op hint for its actuator.
+    val optimizer = new AnalyticalGraphWideAutotuneOptimizer(constraints)
+    val shape = AutotuneStageShape(
+      hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 200, hasShuffle = true)
+    val hint = optimizer.initialHint(key, AutotuneStageDescriptor(shape))
+    assert(hint.scan == ScanRuntimeHint.empty)
+    assert(hint.shuffle == ShuffleRuntimeHint.empty)
+    assert(hint.batch == BatchRuntimeHint.empty)
+    assert(hint.gpu.maxConcurrentTasks > 0)
+  }
+
   test("legacy GPU admission hints retain the minimum active positive stage cap") {
     val appliedLimits = mutable.ArrayBuffer.empty[Int]
     val controller = new RapidsAutotuneGpuAdmissionController(limit => {

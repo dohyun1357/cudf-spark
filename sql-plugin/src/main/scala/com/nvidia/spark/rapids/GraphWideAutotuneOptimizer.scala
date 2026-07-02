@@ -89,7 +89,7 @@ object GraphOptimizerConstraints {
       minSampleTasks = conf.autotuneGraphMinSampleTasks.toLong,
       updateIntervalNanos = conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L,
       scan = ScanOptimizerBounds(
-        enabled = conf.isAutotuneClosedLoopMode,
+        enabled = conf.isAutotuneClosedLoopMode && conf.autotuneScanEnabled,
         // Start at the static envelope. OPTIMIZE makes the larger value part of the feasible
         // domain; it is the optimizer, rather than an initial per-knob policy, that selects it.
         initialReadWindow = conf.autotuneScanReadWindowCap,

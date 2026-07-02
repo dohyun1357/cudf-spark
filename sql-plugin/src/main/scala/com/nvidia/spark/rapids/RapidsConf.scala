@@ -1905,6 +1905,15 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValue(v => v >= 0, "The autotune graph update interval must be non-negative.")
       .createWithDefault(500)
 
+  val AUTOTUNE_SCAN_ENABLED =
+    conf("spark.rapids.sql.autotune.scan.enabled")
+      .doc("Enable graph autotune scan hints. When false, the driver publishes only empty " +
+        "(no-op) scan hints and the scan read-window controller keeps the stock reader " +
+        "behavior. Provides the same per-subsystem gate that shuffle, batch, and GPU " +
+        "admission already have, for mechanism ablation.")
+      .booleanConf
+      .createWithDefault(true)
+
   val AUTOTUNE_SCAN_MAX_READ_WINDOW =
     conf("spark.rapids.sql.autotune.scan.maxReadWindow")
       .doc("Hard cap for the executor-local autotune scan read window. The effective read " +
@@ -4046,6 +4055,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val autotuneGraphMinSampleTasks: Int = get(AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS)
 
   lazy val autotuneGraphUpdateIntervalMs: Int = get(AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS)
+
+  lazy val autotuneScanEnabled: Boolean = get(AUTOTUNE_SCAN_ENABLED)
 
   lazy val autotuneScanMaxReadWindow: Int = get(AUTOTUNE_SCAN_MAX_READ_WINDOW)
 
