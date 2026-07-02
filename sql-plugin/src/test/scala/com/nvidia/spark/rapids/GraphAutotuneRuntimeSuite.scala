@@ -27,6 +27,8 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.apache.spark.SparkConf
 import org.apache.spark.api.plugin.PluginContext
 import org.apache.spark.resource.ResourceInformation
+import org.apache.spark.scheduler.{SparkListenerExecutorAdded, SparkListenerExecutorRemoved}
+import org.apache.spark.scheduler.cluster.ExecutorInfo
 import org.apache.spark.sql.rapids.GpuTaskMetrics
 
 class GraphAutotuneRuntimeSuite extends AnyFunSuite {
@@ -444,6 +446,46 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       val response = RapidsAutotuneDriverEndpoint.handleHintRequest(
         RapidsAutotuneHintRequestMsg("exec-1", key))
       assert(response.hint.contains(first))
+    } finally {
+      RapidsAutotuneDriverEndpoint.shutdown()
+    }
+  }
+
+  test("driver endpoint sums cluster task slots from registered executors") {
+    val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
+    RapidsAutotuneDriverEndpoint.init(null, conf)
+    try {
+      assert(RapidsAutotuneDriverEndpoint.clusterTaskSlots == 0)
+      RapidsAutotuneDriverEndpoint.executorAdded("1", 16)
+      RapidsAutotuneDriverEndpoint.executorAdded("2", 16)
+      assert(RapidsAutotuneDriverEndpoint.clusterTaskSlots == 32)
+      // Re-registration replaces the census entry; it never double-counts an executor.
+      RapidsAutotuneDriverEndpoint.executorAdded("1", 8)
+      assert(RapidsAutotuneDriverEndpoint.clusterTaskSlots == 24)
+      RapidsAutotuneDriverEndpoint.executorRemoved("2")
+      assert(RapidsAutotuneDriverEndpoint.clusterTaskSlots == 8)
+      RapidsAutotuneDriverEndpoint.executorRemoved("unknown")
+      RapidsAutotuneDriverEndpoint.executorAdded("3", 0)
+      assert(RapidsAutotuneDriverEndpoint.clusterTaskSlots == 8)
+      RapidsAutotuneDriverEndpoint.setTaskCpusForTest(2)
+      assert(RapidsAutotuneDriverEndpoint.clusterTaskSlots == 4)
+    } finally {
+      RapidsAutotuneDriverEndpoint.shutdown()
+    }
+  }
+
+  test("stage hint listener feeds executor registration into the slot census") {
+    val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
+    RapidsAutotuneDriverEndpoint.init(null, conf)
+    try {
+      val listener = new RapidsAutotuneStageHintListener(conf)
+      listener.onExecutorAdded(SparkListenerExecutorAdded(
+        0L, "1", new ExecutorInfo("host-1", 16, Map.empty)))
+      listener.onExecutorAdded(SparkListenerExecutorAdded(
+        0L, "2", new ExecutorInfo("host-2", 16, Map.empty)))
+      assert(RapidsAutotuneDriverEndpoint.clusterTaskSlots == 32)
+      listener.onExecutorRemoved(SparkListenerExecutorRemoved(1L, "1", "lost"))
+      assert(RapidsAutotuneDriverEndpoint.clusterTaskSlots == 16)
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
@@ -1131,6 +1173,43 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(optimizer.observe(stale, initial, nowNanos = 1000L).isEmpty)
     assert(optimizer.observe(current1, initial, nowNanos = 1000L).isEmpty)
     assert(optimizer.observe(current2, initial, nowNanos = 1000L).nonEmpty)
+  }
+
+  test("AQE calibration is isolated by SQL execution and released on completion") {
+    val optimizer = new AnalyticalGraphWideAutotuneOptimizer(
+      optimizerConstraints(minSamples = 1L, intervalNanos = 0L))
+    val identifiedKey = key.copy(executionId = 21L)
+    val boundaryKey = key.copy(executionId = 22L)
+    val shape = AutotuneStageShape(
+      hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 3)
+    val identifiedHint = optimizer.initialHint(
+      identifiedKey, AutotuneStageDescriptor(shape)).copy(version = 1L)
+    val boundaryHint = optimizer.initialHint(
+      boundaryKey, AutotuneStageDescriptor(shape)).copy(version = 1L)
+
+    Seq((1000L, 2500L), (2000L, 4500L), (3000L, 6500L)).zipWithIndex.foreach {
+      case ((bytes, duration), index) =>
+        optimizer.observe(optimizerObservation(identifiedKey, index + 1L,
+          wait = 0L, holding = 0L, duration = duration, input = bytes, output = bytes),
+          identifiedHint, nowNanos = index.toLong)
+    }
+    Seq((1000L, 2000L), (2000L, 4000L), (3000L, 6000L)).zipWithIndex.foreach {
+      case ((bytes, duration), index) =>
+        optimizer.observe(optimizerObservation(boundaryKey, index + 1L,
+          wait = 0L, holding = 0L, duration = duration, input = bytes, output = bytes),
+          boundaryHint, nowNanos = index.toLong)
+    }
+
+    val identified = optimizer.aqeCalibrationSnapshot(identifiedKey.executionId).get
+    val boundary = optimizer.aqeCalibrationSnapshot(boundaryKey.executionId).get
+    assert(math.abs(identified.fixedNanosPerTask.get - 500.0) < 1e-9)
+    assert(identified.fixedTaskCostReason.isEmpty)
+    assert(boundary.fixedNanosPerTask.isEmpty)
+    assert(boundary.fixedTaskCostReason == "boundary-fixed-task-cost-fit")
+
+    optimizer.executionCompleted(identifiedKey.executionId)
+    assert(optimizer.aqeCalibrationSnapshot(identifiedKey.executionId).isEmpty)
+    assert(optimizer.aqeCalibrationSnapshot(boundaryKey.executionId).nonEmpty)
   }
 
   test("late observations do not reactivate a completed stage") {

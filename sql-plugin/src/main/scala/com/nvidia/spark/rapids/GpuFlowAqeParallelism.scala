@@ -48,7 +48,10 @@ private[rapids] case class GpuFlowParallelismDecision(
     selectedObjectiveNanos: Double,
     variableNanosPerByte: Double,
     fixedNanosPerTask: Double,
-    reason: String)
+    reason: String,
+    fixedNanosPerTaskStandardError: Double = 0.0,
+    fixedTaskCostSampleWindows: Long = 0L,
+    fixedTaskCostSource: String = "")
 
 /** Pure, threshold-free optimization of contiguous reducer ranges. */
 private[rapids] object GpuFlowPartitionOptimizer {
@@ -57,7 +60,8 @@ private[rapids] object GpuFlowPartitionOptimizer {
       currentRanges: Seq[(Int, Int)],
       taskSlots: Int,
       variableNanosPerByte: Double,
-      fixedNanosPerTask: Double): Option[GpuFlowPartitionLayout] = {
+      fixedNanosPerTask: Double,
+      maxPartitions: Int = Int.MaxValue): Option[GpuFlowPartitionLayout] = {
     if (partitionBytes.isEmpty || taskSlots <= 0 || variableNanosPerByte < 0.0 ||
         fixedNanosPerTask < 0.0 || currentRanges.isEmpty) {
       return None
@@ -67,7 +71,8 @@ private[rapids] object GpuFlowPartitionOptimizer {
       partitionBytes, currentRanges, taskSlots, variableNanosPerByte, fixedNanosPerTask)
     val waveEndpoints = taskSlots.to(originalPartitions, taskSlots)
     val candidateCounts = (waveEndpoints :+ originalPartitions :+ currentRanges.size)
-      .filter(count => count > 0 && count <= originalPartitions).distinct.sorted
+      .filter(count => count > 0 && count <= originalPartitions && count <= maxPartitions)
+      .distinct.sorted
     Some(candidateCounts.foldLeft(current) { (best, count) =>
       val candidate = layoutForRanges(partitionBytes, balancedRanges(partitionBytes, count),
         taskSlots, variableNanosPerByte, fixedNanosPerTask)
@@ -212,7 +217,13 @@ case class GpuFlowAqeParallelismRule()
     calibration match {
       case None => (emptyDecision.copy(reason = "no-runtime-calibration"), None)
       case Some(calibrated) =>
-        val taskSlots = math.max(1, calibrated.referenceControl.gpuTasks.toInt)
+        // Wave arithmetic needs the cluster-wide CPU task-slot width the Spark scheduler admits
+        // tasks against, measured from executor registration. The per-executor GPU admission
+        // quota is a different resource and undercounts a multi-executor cluster.
+        val taskSlots = calibrated.clusterTaskSlots
+        if (taskSlots <= 0) {
+          return (emptyDecision.copy(reason = "cluster-task-slots-unmeasured"), None)
+        }
         val variableRates = Seq(
           divideRate(calibrated.gpuUnitNanosPerByte,
             calibrated.referenceControl.gpuTasks),
@@ -223,11 +234,6 @@ case class GpuFlowAqeParallelismRule()
           return (emptyDecision.copy(taskSlots = taskSlots,
             reason = "missing-reducer-service-rate"), None)
         }
-        if (calibrated.fixedNanosPerTask.isEmpty) {
-          return (emptyDecision.copy(taskSlots = taskSlots,
-            variableNanosPerByte = variableRates.max,
-            reason = "missing-fixed-task-cost"), None)
-        }
         val combined = Array.fill[Long](originalPartitions)(0L)
         group.foreach { info =>
           info.stage.mapStats.get.bytesByPartitionId.zipWithIndex.foreach {
@@ -237,12 +243,31 @@ case class GpuFlowAqeParallelismRule()
               } else combined(index) + math.max(0L, bytes)
           }
         }
+        val totalBytes = combined.foldLeft(0L) { (sum, bytes) =>
+          if (bytes > Long.MaxValue - sum) Long.MaxValue else sum + bytes
+        }
+        val rate = variableRates.max
+        if (calibrated.fixedNanosPerTask.isEmpty) {
+          return (emptyDecision.copy(taskSlots = taskSlots,
+            totalBytes = totalBytes,
+            variableNanosPerByte = rate,
+            fixedNanosPerTaskStandardError =
+              calibrated.fixedNanosPerTaskStandardError.getOrElse(0.0),
+            fixedTaskCostSampleWindows = calibrated.fixedTaskCostSampleWindows,
+            fixedTaskCostSource = calibrated.fixedTaskCostSource,
+            reason = calibrated.fixedTaskCostReason), None)
+        }
         val currentRanges = group.head.specs.map(spec =>
           (spec.startReducerIndex, spec.endReducerIndex))
-        val rate = variableRates.max
         val fixed = calibrated.fixedNanosPerTask.get
-        val selected = GpuFlowPartitionOptimizer.optimize(
+        // Spark's current AQE layout is the identified baseline. Coalescing further has exact map
+        // statistics plus measured task-wave cost. Increasing beyond it also adds driver scheduler
+        // and task-launch work that is not in the executor clock, so keep that direction frozen.
+        val unconstrained = GpuFlowPartitionOptimizer.optimize(
           combined.toSeq, currentRanges, taskSlots, rate, fixed).get
+        val selected = GpuFlowPartitionOptimizer.optimize(
+          combined.toSeq, currentRanges, taskSlots, rate, fixed,
+          maxPartitions = currentRanges.size).get
         val currentBytes = currentRanges.map { case (start, end) =>
           combined.slice(start, end).map(_.toDouble).sum
         }
@@ -255,15 +280,23 @@ case class GpuFlowAqeParallelismRule()
           (range.startReducerIndex, range.endReducerIndex)) != currentRanges
         val decision = emptyDecision.copy(
           selectedPartitions = selected.ranges.size,
-          totalBytes = combined.foldLeft(0L) { (sum, bytes) =>
-            if (bytes > Long.MaxValue - sum) Long.MaxValue else sum + bytes
-          },
+          totalBytes = totalBytes,
           taskSlots = taskSlots,
           currentObjectiveNanos = currentObjective,
           selectedObjectiveNanos = selected.objectiveNanos,
           variableNanosPerByte = rate,
           fixedNanosPerTask = fixed,
-          reason = if (changed) "" else "current-layout-optimal")
+          reason = if (changed) {
+            ""
+          } else if (unconstrained.ranges.size > currentRanges.size) {
+            "higher-parallelism-response-unidentified"
+          } else {
+            "current-layout-optimal"
+          },
+          fixedNanosPerTaskStandardError =
+            calibrated.fixedNanosPerTaskStandardError.getOrElse(0.0),
+          fixedTaskCostSampleWindows = calibrated.fixedTaskCostSampleWindows,
+          fixedTaskCostSource = calibrated.fixedTaskCostSource)
         val replacement = if (!changed || selected.objectiveNanos >= currentObjective) None else {
           Some(group.map { info =>
             val stageBytes = info.stage.mapStats.get.bytesByPartitionId

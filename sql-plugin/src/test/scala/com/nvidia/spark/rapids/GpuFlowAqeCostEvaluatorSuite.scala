@@ -78,14 +78,36 @@ class GpuFlowAqeCostEvaluatorSuite extends AnyFunSuite {
     assert(cost(broadcastPlan) < cost(shufflePlan))
   }
 
+  test("identical physical structure delegates statistics refinement to Spark") {
+    val key = AutotuneStageKey(0L, 1, 0)
+    val stale = GpuFlowAqePlanModel.evaluateNodes(
+      Seq(GpuFlowAqeNode(key, Seq.empty, GpuFlowAqeDemand(shuffleBytes = 1000.0))),
+      calibration(), "join", "shuffle")
+    val refreshed = GpuFlowAqePlanModel.evaluateNodes(
+      Seq(GpuFlowAqeNode(key, Seq.empty, GpuFlowAqeDemand(shuffleBytes = 1005.0))),
+      calibration(), "join", "shuffle")
+
+    assert(stale.identifiable && refreshed.identifiable)
+    assert(stale.objectiveNanos < refreshed.objectiveNanos)
+    // Same operators and same topology: the objective delta is refreshed runtime statistics,
+    // not a physical alternative, so Spark's native contract owns the comparison and its equal
+    // native cost adopts the refreshed plan.
+    assert(cost(stale, fallback = 1).compare(cost(refreshed, fallback = 1)) == 0)
+    assert(cost(stale, fallback = 1) == cost(refreshed, fallback = 1))
+    assert(cost(refreshed, fallback = 2) > cost(stale, fallback = 1))
+  }
+
   test("AQE flow cost ties when either complete plan is not identifiable") {
     val key = AutotuneStageKey(0L, 1, 0)
     val nodes = Seq(GpuFlowAqeNode(
       key, Seq.empty, GpuFlowAqeDemand(broadcastBytes = 1000.0)))
+    // Structurally distinct candidates (different topology): an unidentified rate must freeze
+    // the current plan. A same-structure pair is a statistics refresh and delegates to Spark
+    // regardless of identifiability.
     val known = GpuFlowAqePlanModel.evaluateNodes(
       nodes, calibration(), "join", "broadcast")
     val unknown = GpuFlowAqePlanModel.evaluateNodes(
-      nodes, calibration(broadcast = None), "join", "broadcast")
+      nodes, calibration(broadcast = None), "join", "broadcast-reordered")
 
     assert(known.identifiable)
     assert(!unknown.identifiable)

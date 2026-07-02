@@ -197,5 +197,8 @@ case class SparkRapidsAutotuneParallelismEvent(
   selectedObjectiveNanos: Double,
   variableNanosPerByte: Double,
   fixedNanosPerTask: Double,
-  reason: String
+  reason: String,
+  fixedNanosPerTaskStandardError: Double = 0.0,
+  fixedTaskCostSampleWindows: Long = 0L,
+  fixedTaskCostSource: String = ""
 ) extends SparkListenerEvent

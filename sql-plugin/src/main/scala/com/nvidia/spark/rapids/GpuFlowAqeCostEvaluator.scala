@@ -80,7 +80,9 @@ private[rapids] case class GpuFlowAqeCost(
   /**
    * Spark accepts a distinct proposed plan on an equal cost only when the Cost values are equal.
    * Keep equality consistent with the selected comparison basis, while leaving an unidentified
-   * same-operator tie unequal so Spark freezes the current plan.
+   * tie between structurally distinct candidates unequal so Spark freezes the current plan.
+   * Identical-structure pairs always take the Spark fallback basis, so a statistics refresh is
+   * adopted under Spark's native contract even when rates are unidentified.
    */
   override def equals(other: Any): Boolean = other match {
     case that: GpuFlowAqeCost if usesSparkFallback(that) =>
@@ -96,12 +98,20 @@ private[rapids] case class GpuFlowAqeCost(
   private def usesSparkFallback(that: GpuFlowAqeCost): Boolean = {
     val differentOperatorBasis =
       evaluation.operatorFingerprint != that.evaluation.operatorFingerprint
+    // Identical operator and topology fingerprints mean the candidates share one physical
+    // structure and differ only in the runtime statistics Spark refreshed between plannings.
+    // There is no physical counterfactual for the flow model to price; ranking the pair by the
+    // statistics delta vetoed every AQE re-optimization and pinned stale plan statistics (every
+    // strict flow decision in the SF3000 stream was such a pair). Spark's native contract owns
+    // the choice and adopts the refreshed plan.
+    val identicalStructure = !differentOperatorBasis &&
+      evaluation.topologyFingerprint == that.evaluation.topologyFingerprint
     val equalIdentifiedObjective = evaluation.identifiable && that.evaluation.identifiable &&
       java.lang.Double.compare(
         evaluation.objectiveNanos, that.evaluation.objectiveNanos) == 0
     // Distinct candidates collapsing to the same objective expose an unmodeled physical
     // difference. Preserve Spark's native ordering until measured features distinguish them.
-    differentOperatorBasis || equalIdentifiedObjective
+    differentOperatorBasis || identicalStructure || equalIdentifiedObjective
   }
 }
 

@@ -26,8 +26,9 @@ import scala.util.control.NonFatal
 
 import org.apache.spark.SparkContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent, SparkListenerJobStart,
-  SparkListenerStageCompleted, SparkListenerStageSubmitted}
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent,
+  SparkListenerExecutorAdded, SparkListenerExecutorRemoved, SparkListenerJobStart,
+  SparkListenerStageCompleted, SparkListenerStageSubmitted, SparkListenerTaskEnd}
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
@@ -49,6 +50,12 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   private val nextHintVersion = new AtomicLong(1L)
   private val nextAqeEvaluationId = new AtomicLong(1L)
   private val nextParallelismDecisionId = new AtomicLong(1L)
+  // Live executor-core census from scheduler registration events. Cluster task slots are the sum
+  // of floor(cores / spark.task.cpus) over registered executors -- the width Spark's scheduler
+  // actually admits tasks against. The per-executor GPU admission quota is a different resource
+  // and undercounts a multi-executor cluster.
+  private val executorCores = new ConcurrentHashMap[String, Int]()
+  @volatile private var taskCpus = 1
   @volatile private var sparkContext: SparkContext = _
   @volatile private var enabled = false
   // The graph optimizer only runs in GRAPH/OPTIMIZE modes; OBSERVE/LOCAL never republish.
@@ -69,6 +76,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     nanoSource = () => System.nanoTime()
     hints.clear()
     observations.clear()
+    executorCores.clear()
+    taskCpus = if (sc == null) 1 else math.max(1, sc.getConf.getInt("spark.task.cpus", 1))
     nextHintVersion.set(1L)
     nextAqeEvaluationId.set(1L)
     nextParallelismDecisionId.set(1L)
@@ -86,14 +95,35 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     nanoSource = () => System.nanoTime()
     hints.clear()
     observations.clear()
+    executorCores.clear()
+    taskCpus = 1
     nextHintVersion.set(1L)
     nextAqeEvaluationId.set(1L)
     nextParallelismDecisionId.set(1L)
   }
 
+  def executorAdded(executorId: String, totalCores: Int): Unit = {
+    if (totalCores > 0) {
+      executorCores.put(executorId, totalCores)
+    }
+  }
+
+  def executorRemoved(executorId: String): Unit = {
+    executorCores.remove(executorId)
+  }
+
+  /** Measured cluster CPU task slots; zero until an executor has registered. */
+  private[rapids] def clusterTaskSlots: Int =
+    executorCores.values().asScala.map(_ / taskCpus).sum
+
   /** Test-only: inject a deterministic monotonic clock for optimizer update cadence. */
   private[rapids] def setNanoSourceForTest(source: () => Long): Unit = synchronized {
     nanoSource = source
+  }
+
+  /** Test-only: override the task-CPU divisor used by the cluster slot census. */
+  private[rapids] def setTaskCpusForTest(cpus: Int): Unit = synchronized {
+    taskCpus = math.max(1, cpus)
   }
 
   def publishDefaultNoopHint(key: AutotuneStageKey): StageRuntimeHint = synchronized {
@@ -133,6 +163,17 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       } catch {
         case NonFatal(e) =>
           logWarning("RAPIDS graph optimizer stage-completion update failed", e)
+      }
+    }
+  }
+
+  def observeTaskSetup(executionId: Long, setupNanos: Long): Unit = {
+    if (enabled && optimizer != null) {
+      try {
+        optimizer.observeTaskSetup(executionId, setupNanos)
+      } catch {
+        case NonFatal(e) =>
+          logWarning("RAPIDS graph optimizer task-setup calibration failed", e)
       }
     }
   }
@@ -361,7 +402,11 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     Option(observations.get(key))
 
   private[rapids] def aqeCalibrationSnapshot: Option[GpuFlowAqeCalibration] = synchronized {
-    Option(optimizer).flatMap(_.aqeCalibrationSnapshot)
+    val executionId = Option(sparkContext)
+      .flatMap(sc => Option(sc.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)))
+      .flatMap(value => Try(value.toLong).toOption)
+    executionId.flatMap(id => Option(optimizer).flatMap(_.aqeCalibrationSnapshot(id)))
+      .map(_.copy(clusterTaskSlots = clusterTaskSlots))
   }
 
   private[rapids] def recordAqeCostEvaluation(evaluation: GpuFlowAqePlanEvaluation): Unit = {
@@ -418,6 +463,9 @@ object RapidsAutotuneDriverEndpoint extends Logging {
         selectedObjectiveNanos = decision.selectedObjectiveNanos,
         variableNanosPerByte = decision.variableNanosPerByte,
         fixedNanosPerTask = decision.fixedNanosPerTask,
+        fixedNanosPerTaskStandardError = decision.fixedNanosPerTaskStandardError,
+        fixedTaskCostSampleWindows = decision.fixedTaskCostSampleWindows,
+        fixedTaskCostSource = decision.fixedTaskCostSource,
         reason = decision.reason))
     }
   }
@@ -575,6 +623,31 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
     val info = stageCompleted.stageInfo
     stageKeys.get((info.stageId, info.attemptNumber())).foreach(
       RapidsAutotuneDriverEndpoint.stageCompleted)
+  }
+
+  override def onExecutorAdded(executorAdded: SparkListenerExecutorAdded): Unit = {
+    RapidsAutotuneDriverEndpoint.executorAdded(
+      executorAdded.executorId, executorAdded.executorInfo.totalCores)
+  }
+
+  override def onExecutorRemoved(executorRemoved: SparkListenerExecutorRemoved): Unit = {
+    RapidsAutotuneDriverEndpoint.executorRemoved(executorRemoved.executorId)
+  }
+
+  override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = synchronized {
+    val metrics = taskEnd.taskMetrics
+    val info = taskEnd.taskInfo
+    if (metrics != null && info != null && info.successful) {
+      stageKeys.get((taskEnd.stageId, taskEnd.stageAttemptId)).foreach { key =>
+        val millis = math.max(0L, metrics.executorDeserializeTime)
+        val nanos = if (millis > Long.MaxValue / 1000000L) {
+          Long.MaxValue
+        } else {
+          millis * 1000000L
+        }
+        RapidsAutotuneDriverEndpoint.observeTaskSetup(key.executionId, nanos)
+      }
+    }
   }
 
   override def onOtherEvent(event: SparkListenerEvent): Unit = {

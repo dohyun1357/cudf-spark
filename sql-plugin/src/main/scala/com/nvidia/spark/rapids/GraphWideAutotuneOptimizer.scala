@@ -165,7 +165,15 @@ private[rapids] case class GpuFlowAqeCalibration(
     fixedNanosPerTask: Option[Double],
     referenceControl: GpuFlowControl,
     bounds: GpuFlowControlBounds,
-    sampleWindows: Long)
+    sampleWindows: Long,
+    fixedNanosPerTaskStandardError: Option[Double] = None,
+    fixedTaskCostSampleWindows: Long = 0L,
+    fixedTaskCostReason: String = "missing-fixed-task-cost",
+    fixedTaskCostSource: String = "",
+    // Cluster-wide CPU task slots from registered executors, stamped by the driver endpoint when
+    // the snapshot is served. Zero means no executor census exists yet; consumers that need wave
+    // arithmetic must freeze rather than substitute a per-executor quantity.
+    clusterTaskSlots: Int = 0)
 
 private[rapids] object GpuFlowAqeCalibration {
   def empty(constraints: GraphOptimizerConstraints): GpuFlowAqeCalibration = {
@@ -190,6 +198,16 @@ private[rapids] object GpuFlowAqeCalibration {
 
 private[rapids] class GpuFlowAqeCalibrationAccumulator(
     constraints: GraphOptimizerConstraints) {
+  private case class FixedTaskCostFit(
+      estimate: Option[Double],
+      standardError: Option[Double],
+      sampleWindows: Long,
+      reason: String,
+      source: String = "fitted-task-duration-intercept")
+
+  // A 95% normal confidence boundary is an evidence requirement, not a tuning preference. The
+  // reducer rule may only use the fitted intercept when measurement uncertainty excludes zero.
+  private val fixedTaskCostConfidenceZ = 1.96
   private var scanUnitNanos = 0.0
   private var scanBytes = 0L
   private var gpuUnitNanos = 0.0
@@ -206,6 +224,8 @@ private[rapids] class GpuFlowAqeCalibrationAccumulator(
   private var ioVariance = 0.0
   private var ioNonGpuCovariance = 0.0
   private var nonGpuVariance = 0.0
+  private var directFixedNanosPerTaskLowerBound = Double.PositiveInfinity
+  private var directFixedSampleWindows = 0L
   private var windows = 0L
 
   def add(sample: GpuFlowCalibrationSample): Unit = {
@@ -244,53 +264,90 @@ private[rapids] class GpuFlowAqeCalibrationAccumulator(
     windows += 1L
   }
 
+  def addTaskSetupNanos(setupNanos: Long): Unit = {
+    if (setupNanos >= 0L) {
+      directFixedNanosPerTaskLowerBound = math.min(
+        directFixedNanosPerTaskLowerBound, setupNanos.toDouble)
+      directFixedSampleWindows += 1L
+    }
+  }
+
   def snapshot: GpuFlowAqeCalibration = {
     val empty = GpuFlowAqeCalibration.empty(constraints)
+    val fixedTaskCost = fittedFixedTaskCost
     empty.copy(
       scanUnitNanosPerByte = rate(scanUnitNanos, scanBytes),
       gpuUnitNanosPerByte = rate(gpuUnitNanos, gpuBytes),
       shuffleUnitNanosPerByte = rate(shuffleUnitNanos, shuffleBytes),
       broadcastNanosPerByte = rate(broadcastNanos, broadcastBytes),
       batchUnitNanosPerByte = rate(batchUnitNanos, batchBytes),
-      fixedNanosPerTask = fittedFixedNanosPerTask,
-      sampleWindows = windows)
+      fixedNanosPerTask = fixedTaskCost.estimate,
+      sampleWindows = windows,
+      fixedNanosPerTaskStandardError = fixedTaskCost.standardError,
+      fixedTaskCostSampleWindows = fixedTaskCost.sampleWindows,
+      fixedTaskCostReason = fixedTaskCost.reason,
+      fixedTaskCostSource = fixedTaskCost.source)
   }
 
   private def rate(unitNanos: Double, bytes: Long): Option[Double] =
     if (unitNanos > 0.0 && bytes > 0L) Some(unitNanos / bytes.toDouble) else None
 
   /**
-   * Exact two-variable non-negative least squares for
-   * non-GPU time = bytes * rate + tasks * fixed.
+   * Fit non-GPU time/task = bytes/task * rate + fixed task cost.
+   *
+   * A non-negative least-squares boundary solution is not identification: when the best fit puts
+   * the intercept at zero, byte service and fixed task overhead have not been separated. Using
+   * that boundary as a measured zero caused the reducer rule to add tasks for microseconds of
+   * modeled byte-service gain. Require an interior ordinary-least-squares solution and enough
+   * residual evidence for the intercept's 95% lower confidence bound to remain above zero.
    */
-  private def fittedFixedNanosPerTask: Option[Double] = {
-    if (regressionWindows == 0L) {
-      None
-    } else if (meanIoBytesPerTask == 0.0 && ioVariance == 0.0) {
-      Some(math.max(0.0, meanNonGpuNanosPerTask))
-    } else if (regressionWindows < 2L || ioVariance <= 0.0) {
-      None
-    } else {
-      val count = regressionWindows.toDouble
-      val sumX2 = ioVariance + count * meanIoBytesPerTask * meanIoBytesPerTask
-      val sumXY = ioNonGpuCovariance +
-        count * meanIoBytesPerTask * meanNonGpuNanosPerTask
-      val sumY2 = nonGpuVariance +
-        count * meanNonGpuNanosPerTask * meanNonGpuNanosPerTask
-      val unconstrainedSlope = ioNonGpuCovariance / ioVariance
-      val unconstrainedFixed = meanNonGpuNanosPerTask -
-        unconstrainedSlope * meanIoBytesPerTask
-      val candidates = mutable.ArrayBuffer.empty[(Double, Double)]
-      if (unconstrainedSlope >= 0.0 && unconstrainedFixed >= 0.0) {
-        candidates += ((unconstrainedSlope, unconstrainedFixed))
+  private def fittedFixedTaskCost: FixedTaskCostFit = {
+    if (directFixedSampleWindows > 0L && directFixedNanosPerTaskLowerBound > 0.0 &&
+        java.lang.Double.isFinite(directFixedNanosPerTaskLowerBound)) {
+      return FixedTaskCostFit(Some(directFixedNanosPerTaskLowerBound), None,
+        directFixedSampleWindows, "", "executor-deserialize-lower-bound")
+    }
+    if (regressionWindows < 3L) {
+      return FixedTaskCostFit(None, None, regressionWindows,
+        "insufficient-fixed-task-cost-samples")
+    }
+
+    val count = regressionWindows.toDouble
+    if (ioVariance <= 0.0) {
+      if (meanIoBytesPerTask != 0.0) {
+        return FixedTaskCostFit(None, None, regressionWindows,
+          "collinear-fixed-task-cost-samples")
       }
-      candidates += ((0.0, math.max(0.0, meanNonGpuNanosPerTask)))
-      candidates += ((if (sumX2 > 0.0) math.max(0.0, sumXY / sumX2) else 0.0, 0.0))
-      Some(candidates.minBy { case (slope, fixed) =>
-        sumY2 + slope * slope * sumX2 + fixed * fixed * count +
-          2.0 * slope * fixed * count * meanIoBytesPerTask -
-          2.0 * slope * sumXY - 2.0 * fixed * count * meanNonGpuNanosPerTask
-      }._2)
+      val estimate = meanNonGpuNanosPerTask
+      val residualVariance = math.max(0.0, nonGpuVariance) / (count - 1.0)
+      val standardError = math.sqrt(residualVariance / count)
+      return identifiedFixedTaskCost(estimate, standardError)
+    }
+
+    val slope = ioNonGpuCovariance / ioVariance
+    val estimate = meanNonGpuNanosPerTask - slope * meanIoBytesPerTask
+    if (slope < 0.0 || estimate <= 0.0) {
+      return FixedTaskCostFit(None, None, regressionWindows,
+        "boundary-fixed-task-cost-fit")
+    }
+    val residualSumSquares = math.max(0.0,
+      nonGpuVariance - ioNonGpuCovariance * ioNonGpuCovariance / ioVariance)
+    val residualVariance = residualSumSquares / (count - 2.0)
+    val standardError = math.sqrt(residualVariance *
+      (1.0 / count + meanIoBytesPerTask * meanIoBytesPerTask / ioVariance))
+    identifiedFixedTaskCost(estimate, standardError)
+  }
+
+  private def identifiedFixedTaskCost(
+      estimate: Double,
+      standardError: Double): FixedTaskCostFit = {
+    if (!java.lang.Double.isFinite(estimate) || !java.lang.Double.isFinite(standardError) ||
+        estimate <= 0.0 ||
+        estimate - fixedTaskCostConfidenceZ * standardError <= 0.0) {
+      FixedTaskCostFit(None, Some(standardError), regressionWindows,
+        "uncertain-fixed-task-cost-fit")
+    } else {
+      FixedTaskCostFit(Some(estimate), Some(standardError), regressionWindows, "")
     }
   }
 }
@@ -359,8 +416,11 @@ trait GraphWideAutotuneOptimizer {
   /** Drain replay-complete records produced by graph decision epochs. */
   def drainDecisionRecords(): Seq[GraphStageDecisionRecord] = Seq.empty
 
-  /** Calibrated resource-demand rates consumed by complete AQE plan evaluation. */
-  def aqeCalibrationSnapshot: Option[GpuFlowAqeCalibration] = None
+  /** Record one finalized Spark task setup cost for execution-local AQE calibration. */
+  def observeTaskSetup(executionId: Long, setupNanos: Long): Unit = {}
+
+  /** Calibrated resource-demand rates for one SQL execution's complete AQE plan evaluation. */
+  def aqeCalibrationSnapshot(executionId: Long): Option[GpuFlowAqeCalibration] = None
 }
 
 /**
@@ -388,7 +448,10 @@ class AnalyticalGraphWideAutotuneOptimizer(
 
   private val stages = mutable.HashMap.empty[AutotuneStageKey, StageState]
   private val pendingDecisionRecords = mutable.ArrayBuffer.empty[GraphStageDecisionRecord]
-  private val aqeCalibration = new GpuFlowAqeCalibrationAccumulator(constraints)
+  // Rates and fixed task cost are execution-local evidence. Mixing unrelated queries made the
+  // fixed-cost intercept depend on workload order: a large exchange could calibrate tiny later
+  // exchanges, while tiny exchanges could collapse a useful large-exchange fit to its boundary.
+  private val aqeCalibration = mutable.HashMap.empty[Long, GpuFlowAqeCalibrationAccumulator]
   private var nextEpochId = 1L
 
   override def initialHint(
@@ -435,7 +498,10 @@ class AnalyticalGraphWideAutotuneOptimizer(
         state.lastEvaluationNanos = nowNanos
         state.costCurve = AnalyticalStageCostModel.costCurve(
           observation, current, state.descriptor.shape, constraints)
-        state.costCurve.flatMap(_.calibrationSample).foreach(aqeCalibration.add)
+        state.costCurve.flatMap(_.calibrationSample).foreach { sample =>
+          aqeCalibration.getOrElseUpdate(msg.key.executionId,
+            new GpuFlowAqeCalibrationAccumulator(constraints)).add(sample)
+        }
         recomputeAllocations("feedback")
       }
     }.getOrElse(Seq.empty)
@@ -463,6 +529,12 @@ class AnalyticalGraphWideAutotuneOptimizer(
 
   override def executionCompleted(executionId: Long): Unit = synchronized {
     stages.retain { case (key, _) => key.executionId != executionId }
+    aqeCalibration.remove(executionId)
+  }
+
+  override def observeTaskSetup(executionId: Long, setupNanos: Long): Unit = synchronized {
+    aqeCalibration.getOrElseUpdate(executionId,
+      new GpuFlowAqeCalibrationAccumulator(constraints)).addTaskSetupNanos(setupNanos)
   }
 
   override def drainDecisionRecords(): Seq[GraphStageDecisionRecord] = synchronized {
@@ -471,9 +543,9 @@ class AnalyticalGraphWideAutotuneOptimizer(
     drained
   }
 
-  override def aqeCalibrationSnapshot: Option[GpuFlowAqeCalibration] = synchronized {
-    val snapshot = aqeCalibration.snapshot
-    if (snapshot.sampleWindows > 0L) Some(snapshot) else None
+  override def aqeCalibrationSnapshot(
+      executionId: Long): Option[GpuFlowAqeCalibration] = synchronized {
+    aqeCalibration.get(executionId).map(_.snapshot).filter(_.sampleWindows > 0L)
   }
 
   private def recomputeAllocations(trigger: String): Seq[GraphOptimizerDecision] = {
