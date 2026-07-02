@@ -293,11 +293,6 @@ object RapidsPluginUtils extends Logging {
     // set driver timezone
     conf.set(RapidsConf.DRIVER_TIMEZONE.key, ZoneId.systemDefault().normalized().toString)
 
-    GpuFlowAqeCostEvaluator.configureIfNeeded(conf).foreach { existing =>
-      logWarning(s"Graph-wide autotuning cannot own AQE topology because " +
-        s"${GpuFlowAqeCostEvaluator.SparkCostEvaluatorKey} is already $existing; retaining it")
-    }
-
     // If spark.rapids.sql.multiThreadedRead.numThreads is not set explicitly, then we derive it
     // from other settings. Otherwise, we keep the users' setting.
     val numThreadsKey = RapidsConf.MULTITHREAD_READ_NUM_THREADS.key

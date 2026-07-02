@@ -160,29 +160,6 @@ case class SparkRapidsAutotuneGraphDecisionEvent(
   batchBytesFreezeReason: String
 ) extends SparkListenerEvent
 
-/** One complete physical-plan evaluation at Spark's pre-materialization AQE cost boundary. */
-case class SparkRapidsAutotuneAqeCostEvent(
-  evaluationId: Long,
-  executionId: Long,
-  identifiable: Boolean,
-  reason: String,
-  objectiveNanos: Double,
-  sparkFallbackCost: Long,
-  operatorFingerprint: String,
-  topologyFingerprint: String,
-  scanBytes: Double,
-  gpuBytes: Double,
-  shuffleBytes: Double,
-  broadcastBytes: Double,
-  batchBytes: Double,
-  selectedScanWindow: Double,
-  selectedGpuTasks: Double,
-  selectedShuffleWindow: Double,
-  selectedShuffleBytes: Double,
-  selectedBatchBytes: Double,
-  calibrationSampleWindows: Long
-) extends SparkListenerEvent
-
 /** One model-selected reducer-parallelism decision at AQE query-stage optimization time. */
 case class SparkRapidsAutotuneParallelismEvent(
   decisionId: Long,

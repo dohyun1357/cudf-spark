@@ -48,7 +48,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   // Monotonic by design (lifetime totals/high-water), so it is not the optimizer's window input.
   private val observations = new ConcurrentHashMap[AutotuneStageKey, StageObservationAgg]()
   private val nextHintVersion = new AtomicLong(1L)
-  private val nextAqeEvaluationId = new AtomicLong(1L)
   private val nextParallelismDecisionId = new AtomicLong(1L)
   // Live executor-core census from scheduler registration events. Cluster task slots are the sum
   // of floor(cores / spark.task.cpus) over registered executors -- the width Spark's scheduler
@@ -79,7 +78,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     executorCores.clear()
     taskCpus = if (sc == null) 1 else math.max(1, sc.getConf.getInt("spark.task.cpus", 1))
     nextHintVersion.set(1L)
-    nextAqeEvaluationId.set(1L)
     nextParallelismDecisionId.set(1L)
     if (enabled) {
       logInfo(s"Initialized RAPIDS graph autotune driver endpoint in " +
@@ -98,7 +96,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     executorCores.clear()
     taskCpus = 1
     nextHintVersion.set(1L)
-    nextAqeEvaluationId.set(1L)
     nextParallelismDecisionId.set(1L)
   }
 
@@ -408,41 +405,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     executionId.flatMap(id => Option(optimizer).flatMap(_.aqeCalibrationSnapshot(id)))
       .map(_.copy(clusterTaskSlots = clusterTaskSlots))
   }
-
-  private[rapids] def recordAqeCostEvaluation(evaluation: GpuFlowAqePlanEvaluation): Unit = {
-    val sc = sparkContext
-    if (enabled && sc != null) {
-      val executionId = Option(sc.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
-        .flatMap(value => Try(value.toLong).toOption).getOrElse(-1L)
-      val evaluationId = nextAqeEvaluationId.getAndIncrement()
-      TrampolineUtil.postEvent(sc, toAqeCostEvent(evaluationId, executionId, evaluation))
-    }
-  }
-
-  private[rapids] def toAqeCostEvent(
-      evaluationId: Long,
-      executionId: Long,
-      evaluation: GpuFlowAqePlanEvaluation): SparkRapidsAutotuneAqeCostEvent =
-    SparkRapidsAutotuneAqeCostEvent(
-      evaluationId = evaluationId,
-      executionId = executionId,
-      identifiable = evaluation.identifiable,
-      reason = evaluation.reason,
-      objectiveNanos = evaluation.objectiveNanos,
-      sparkFallbackCost = evaluation.sparkFallbackCost,
-      operatorFingerprint = evaluation.operatorFingerprint,
-      topologyFingerprint = evaluation.topologyFingerprint,
-      scanBytes = evaluation.scanBytes,
-      gpuBytes = evaluation.gpuBytes,
-      shuffleBytes = evaluation.shuffleBytes,
-      broadcastBytes = evaluation.broadcastBytes,
-      batchBytes = evaluation.batchBytes,
-      selectedScanWindow = evaluation.selectedControl.scanWindow,
-      selectedGpuTasks = evaluation.selectedControl.gpuTasks,
-      selectedShuffleWindow = evaluation.selectedControl.shuffleWindow,
-      selectedShuffleBytes = evaluation.selectedControl.shuffleBytes,
-      selectedBatchBytes = evaluation.selectedControl.batchBytes,
-      calibrationSampleWindows = evaluation.sampleWindows)
 
   private[rapids] def recordParallelismDecision(
       decision: GpuFlowParallelismDecision): Unit = {

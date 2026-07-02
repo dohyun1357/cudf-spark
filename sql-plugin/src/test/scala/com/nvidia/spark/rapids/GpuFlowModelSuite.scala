@@ -114,32 +114,4 @@ class GpuFlowModelSuite extends AnyFunSuite {
     }
   }
 
-  test("AQE outer evaluator scores complete legal candidates with the flow objective") {
-    val build = key.copy(stageId = 40)
-    val probe = key.copy(stageId = 41)
-    val join = key.copy(stageId = 42)
-    def node(stageKey: AutotuneStageKey, parents: Seq[AutotuneStageKey], nanos: Double) =
-      GpuFlowGraphNode(stageKey, parents,
-        GpuFlowStageEvaluation(nanos, GpuFlowGradient()))
-    val current = GraphAqeCandidate("shuffle", Seq(
-      node(build, Seq.empty, 20.0),
-      node(probe, Seq.empty, 100.0),
-      node(join, Seq(build, probe), 30.0)), current = true)
-    val broadcast = GraphAqeCandidate("broadcast", Seq(
-      node(build, Seq.empty, 20.0),
-      node(join, Seq(build), 50.0)))
-
-    val selected = GraphAqeCandidateEvaluator.select(Seq(current, broadcast))
-    assert(selected.candidate.id == "broadcast")
-    assert(selected.flow.objectiveNanos == 70.0)
-  }
-
-  test("AQE outer evaluator preserves the current topology on an exact tie") {
-    val node = GpuFlowGraphNode(key, Seq.empty,
-      GpuFlowStageEvaluation(100.0, GpuFlowGradient()))
-    val current = GraphAqeCandidate("current", Seq(node), current = true)
-    val rewrite = GraphAqeCandidate("rewrite", Seq(node))
-
-    assert(GraphAqeCandidateEvaluator.select(Seq(rewrite, current)).candidate.id == "current")
-  }
 }
