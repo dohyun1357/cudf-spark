@@ -19,8 +19,6 @@ package com.nvidia.spark.rapids
 import java.io.IOException
 import java.util.{Collections, Map => JMap}
 
-import scala.collection.mutable
-
 import com.codahale.metrics.MetricRegistry
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -387,70 +385,6 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(hint.gpu.maxConcurrentTasks > 0)
   }
 
-  test("legacy GPU admission hints retain the minimum active positive stage cap") {
-    val appliedLimits = mutable.ArrayBuffer.empty[Int]
-    val controller = new RapidsAutotuneGpuAdmissionController(limit => {
-      appliedLimits += limit
-      limit
-    })
-    val secondKey = key.copy(stageId = 4, stageAttemptId = 0)
-    val hint4 = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
-      version = 1L,
-      gpu = GpuRuntimeHint(maxConcurrentTasks = 4)), hasHint = true)
-    val hint2 = AutotuneCachedHint(StageRuntimeHint.empty(secondKey).copy(
-      version = 2L,
-      gpu = GpuRuntimeHint(maxConcurrentTasks = 2)), hasHint = true)
-
-    assert(controller.taskStarted(key, 100L, hint4) == 4)        // key active {100}
-    assert(controller.taskStarted(key, 101L, hint4) == 4)        // key active {100,101}
-    assert(controller.taskStarted(secondKey, 200L, hint2) == 2)  // min(4,2)
-    assert(controller.taskCompleted(secondKey, 200L) == 4)       // secondKey drained -> 4
-    assert(controller.taskCompleted(key, 100L) == 4)             // key still has {101}
-    assert(controller.taskCompleted(key, 101L) == 0)             // key drained -> 0
-    assert(controller.reset() == 0)
-
-    assert(appliedLimits == Seq(4, 4, 2, 4, 4, 0, 0))
-  }
-
-  test("GPU admission installs shared graph budget stage quotas and priorities") {
-    val allocations = mutable.ArrayBuffer.empty[
-      (Int, Map[Long, Int], Map[Long, Long])]
-    val controller = new RapidsAutotuneGpuAdmissionController(
-      applyLimit = identity,
-      applyStageAllocation = Some((shared, limits, priorities) => {
-        allocations += ((shared, limits, priorities))
-        shared
-      }),
-      initialMaxSharedConcurrentTasks = 3)
-    val secondKey = key.copy(stageId = 4, stageAttemptId = 1)
-    val critical = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
-      version = 1L,
-      gpu = GpuRuntimeHint(
-        maxConcurrentTasks = 2,
-        sharedMaxConcurrentTasks = 3,
-        schedulingPriority = 100L)), hasHint = true)
-    val sibling = AutotuneCachedHint(StageRuntimeHint.empty(secondKey).copy(
-      version = 2L,
-      gpu = GpuRuntimeHint(
-        maxConcurrentTasks = 1,
-        sharedMaxConcurrentTasks = 3,
-        schedulingPriority = 40L)), hasHint = true)
-
-    assert(controller.taskStarted(key, 100L, critical) == 3)
-    assert(controller.taskStarted(secondKey, 200L, sibling) == 3)
-    val (_, limits, priorities) = allocations.last
-    assert(limits == Map(
-      GpuAdmissionStageGroup(key) -> 2,
-      GpuAdmissionStageGroup(secondKey) -> 1))
-    assert(priorities == Map(
-      GpuAdmissionStageGroup(key) -> 100L,
-      GpuAdmissionStageGroup(secondKey) -> 40L))
-
-    assert(controller.taskCompleted(key, 100L) == 3)
-    assert(allocations.last._2 == Map(GpuAdmissionStageGroup(secondKey) -> 1))
-    assert(controller.taskCompleted(secondKey, 200L) == 0)
-  }
-
   test("driver endpoint publishes stable positive default no-op hints") {
     val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true"))
     RapidsAutotuneDriverEndpoint.init(null, conf)
@@ -576,73 +510,6 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
-  }
-
-  test("GPU admission controller no-ops on unknown-key completion and clears on reset") {
-    val appliedLimits = mutable.ArrayBuffer.empty[Int]
-    val controller = new RapidsAutotuneGpuAdmissionController(limit => {
-      appliedLimits += limit
-      limit
-    })
-
-    // Completing a key that never started is a no-op: returns the current limit, applies nothing.
-    assert(controller.taskCompleted(key, 1L) == 0)
-    // A task with no positive GPU cap does not register and applies nothing.
-    val noCap = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(version = 1L), hasHint = true)
-    assert(controller.taskStarted(key, 1L, noCap) == 0)
-    assert(appliedLimits.isEmpty)
-
-    // Reset while a positive-cap task is active drops the runtime cap back to 0, and the now
-    // forgotten task's completion is a no-op.
-    val capped = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
-      version = 2L, gpu = GpuRuntimeHint(maxConcurrentTasks = 3)), hasHint = true)
-    assert(controller.taskStarted(key, 2L, capped) == 3)
-    assert(controller.reset() == 0)
-    assert(controller.taskCompleted(key, 2L) == 0)
-
-    assert(appliedLimits == Seq(3, 0))
-  }
-
-  test("GPU admission: a no-hint task's completion does not release a capped sibling's entry") {
-    // Regression for the fetch-TTL asymmetry: task A starts under no hint (cap 0, unregistered),
-    // task B starts under cap 3 (registers). A completing must NOT remove B's still-active entry.
-    val appliedLimits = mutable.ArrayBuffer.empty[Int]
-    val controller = new RapidsAutotuneGpuAdmissionController(limit => {
-      appliedLimits += limit
-      limit
-    })
-    val noHint = AutotuneCachedHint.empty(key)
-    val capped = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
-      version = 2L, gpu = GpuRuntimeHint(maxConcurrentTasks = 3)), hasHint = true)
-
-    assert(controller.taskStarted(key, 100L, noHint) == 0) // A: unregistered, applies nothing
-    assert(controller.taskStarted(key, 200L, capped) == 3) // B: registers, cap 3
-    assert(controller.taskCompleted(key, 100L) == 3)       // A completes -> B's entry intact
-    assert(controller.taskCompleted(key, 200L) == 0)       // B completes -> entry drained
-
-    // A's unregistered completion does not re-apply a limit; only B's start (3) and drain (0) do.
-    assert(appliedLimits == Seq(3, 0))
-  }
-
-  test("GPU admission tracks the highest-version optimizer hint in both graph modes") {
-    val controller = new RapidsAutotuneGpuAdmissionController(applyLimit = limit => limit)
-    def hint(ver: Long, cap: Int) = AutotuneCachedHint(
-      StageRuntimeHint.empty(key).copy(version = ver, gpu = GpuRuntimeHint(cap)), hasHint = true)
-
-    assert(controller.taskStarted(key, 1L, hint(1L, 2)) == 2) // start at cap 2
-    assert(controller.taskStarted(key, 2L, hint(2L, 5)) == 5) // newer version RAISES above static 2
-    assert(controller.taskStarted(key, 3L, hint(1L, 3)) == 5) // stale (older) version ignored
-    assert(controller.taskStarted(key, 4L, hint(3L, 3)) == 3) // newer lower cap backs off
-  }
-
-  test("GRAPH admission follows bounded optimizer increases as well as decreases") {
-    val controller = new RapidsAutotuneGpuAdmissionController(applyLimit = limit => limit)
-    def hint(ver: Long, cap: Int) = AutotuneCachedHint(
-      StageRuntimeHint.empty(key).copy(version = ver, gpu = GpuRuntimeHint(cap)), hasHint = true)
-
-    assert(controller.taskStarted(key, 1L, hint(1L, 4)) == 4)
-    assert(controller.taskStarted(key, 2L, hint(2L, 6)) == 6)
-    assert(controller.taskStarted(key, 3L, hint(3L, 2)) == 2)
   }
 
   test("hint cache put overrides fetch and refreshes once the pushed hint expires") {

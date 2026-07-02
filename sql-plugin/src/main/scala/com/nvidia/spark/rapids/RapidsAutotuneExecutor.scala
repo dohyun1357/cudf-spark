@@ -83,8 +83,7 @@ class AutotuneHintCache(
 /**
  * Executor-side autotune endpoint.
  *
- * Fetches and caches per-stage hints from the driver, applies the GPU admission hint through
- * [[RapidsAutotuneGpuAdmission]] on task start/completion, and reports applied hints back to the
+ * Fetches and caches per-stage hints from the driver and reports applied hints back to the
  * driver for eventlog evidence. All driver interaction is fail-open: when `autotune.failOpen` is
  * true, RPC failures fall back to "no hint" / current RAPIDS behavior instead of failing the task.
  */
@@ -99,13 +98,6 @@ class RapidsAutotuneExecutorEndpoint(
   private val fetchTtlNanos =
     if (conf.isAutotuneClosedLoopMode) conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L else 0L
   private val cache = new AutotuneHintCache(fetchHintFromDriver, fetchTtlNanos)
-
-  // OPTIMIZE mode is the only mode in which the shared runtime GPU budget may exceed the static
-  // cap. The executor independently clamps every driver allocation to this configured envelope.
-  RapidsAutotuneGpuAdmission.configure(
-    allowAboveStatic = conf.isAutotuneOptimizeMode,
-    maxSharedConcurrentTasks =
-      GraphOptimizerConstraints.fromConf(conf, nativeGpuTaskSlots).gpu.maxConcurrentTasks)
 
   def hintFor(key: AutotuneStageKey): AutotuneCachedHint = cache.get(key)
 
@@ -191,27 +183,6 @@ class RapidsAutotuneExecutorEndpoint(
     }
   }
 
-  def taskStarted(
-      key: AutotuneStageKey,
-      taskAttemptId: Long,
-      cachedHint: AutotuneCachedHint): Int = {
-    try {
-      RapidsAutotuneGpuAdmission.taskStarted(key, taskAttemptId, cachedHint)
-    } catch {
-      case NonFatal(e) if failOpen =>
-        logWarning("Failed to apply RAPIDS graph autotune GPU hint; continuing", e)
-        0
-    }
-  }
-
-  def taskCompleted(key: AutotuneStageKey, taskAttemptId: Long): Unit = {
-    try {
-      RapidsAutotuneGpuAdmission.taskCompleted(key, taskAttemptId)
-    } catch {
-      case NonFatal(e) if failOpen =>
-        logWarning("Failed to clear RAPIDS graph autotune GPU hint; continuing", e)
-    }
-  }
 
   def shutdown(): Unit = cache.clear()
 
