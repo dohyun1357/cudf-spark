@@ -454,9 +454,7 @@ object PreProjectSplitIterator {
 
   val KEY_NUM_PRE_SPLIT = "NUM_PRE_SPLITS"
 
-  def getSplitUntilSize: Long = BatchRuntimeHints.effectiveSplitUntilSize(
-    GpuDeviceManager.getSplitUntilSize,
-    RapidsAutotuneTaskHints.currentBatchHint)
+  def getSplitUntilSize: Long = GpuDeviceManager.getSplitUntilSize
 
   def calcMinOutputSize(cb: ColumnarBatch, boundExprs: GpuTieredProject): Long = {
     new PreSplitOutSizeEstimator(cb, boundExprs).calcMinOutputSize()

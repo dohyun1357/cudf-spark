@@ -126,13 +126,12 @@ case class GpuFileSourceScanExec(
   private lazy val selectedScanFileCount: Int =
     dynamicallySelectedPartitions.map(_.files.length).sum
 
-  // Eager scan prefetch / read-window decision logic.
+  // Eager scan prefetch decision logic.
   //
-  // There are three independent triggers:
+  // There are two independent triggers:
   //   1. the manual `applyEagerPrefetch` flag set by BucketJoinTwoSidesPrefetch (optionally
   //      requiring a minimum scan-file count, in AUTO mode);
-  //   2. the general `scan.prefetch.enabled = ALL` policy;
-  //   3. the executor-local autotune read window (LOCAL mode, Parquet only).
+  //   2. the general `scan.prefetch.enabled = ALL` policy.
   //
   // `shouldPrefetchEagerly` is the RUNTIME-EFFECTIVE decision: it gates the Hadoop-conf flags the
   // reader actually reads. `prefetchPolicyLabelsScanEager` is the LABEL view used only for the
@@ -144,36 +143,20 @@ case class GpuFileSourceScanExec(
     rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL &&
       selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles
 
-  private def shouldApplyLocalScanReadWindow: Boolean =
-    rapidsConf.isAutotuneLocalMode &&
-      !isPerFileReadEnabled &&
-      relation.fileFormat.isInstanceOf[GpuReadParquetFileFormat] &&
-      selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles
-
   private def shouldPrefetchEagerly: Boolean =
     (prefetchEagerly && (!prefetchRequiresMinScanFiles ||
       selectedScanFileCount >= rapidsConf.scanPrefetchMinScanFiles)) ||
-      shouldApplyGeneralPrefetch ||
-      shouldApplyLocalScanReadWindow
+      shouldApplyGeneralPrefetch
 
   private def prefetchPolicyLabelsScanEager: Boolean =
-    prefetchEagerly || rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL ||
-      shouldApplyLocalScanReadWindow
-
-  private val localScanInitialReadWindow: Int = ScanReadWindowSettings.MIN_WINDOW
-
-  private def localScanMaxReadWindow: Int = rapidsConf.autotuneScanReadWindowCap
+    prefetchEagerly || rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL
 
   private def effectivePrefetchWindow: Option[Int] = {
-    val configuredWindow = if (shouldApplyLocalScanReadWindow) {
-      Some(localScanInitialReadWindow)
-    } else {
-      prefetchWindow.orElse {
-        if (rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL) {
-          Some(rapidsConf.scanPrefetchMaxParallelism)
-        } else {
-          None
-        }
+    val configuredWindow = prefetchWindow.orElse {
+      if (rapidsConf.scanPrefetchMode == ScanPrefetchMode.ALL) {
+        Some(rapidsConf.scanPrefetchMaxParallelism)
+      } else {
+        None
       }
     }
     configuredWindow.map(window => math.min(window, rapidsConf.scanPrefetchMaxParallelism))
@@ -343,10 +326,7 @@ case class GpuFileSourceScanExec(
         "DataFilters" -> seqToString(dataFilters),
         "Location" -> locationDesc,
         "Eager_IO_Prefetch" -> prefetchPolicyLabelsScanEager.toString,
-        "Eager_IO_Prefetch_Window" -> effectivePrefetchWindow.map(_.toString).getOrElse("default"),
-        "Local_Scan_Read_Window" -> shouldApplyLocalScanReadWindow.toString,
-        "Local_Scan_Read_Window_Max" ->
-          (if (shouldApplyLocalScanReadWindow) localScanMaxReadWindow.toString else "default"))
+        "Eager_IO_Prefetch_Window" -> effectivePrefetchWindow.map(_.toString).getOrElse("default"))
 
     relation.bucketSpec.map { spec =>
       val bucketedKey = "Bucketed"
@@ -494,26 +474,14 @@ case class GpuFileSourceScanExec(
           // by meta-level pruning.
           bf += "readBufferSize" -> createSizeMetric(DEBUG_LEVEL, "size of read buffer")
         }
-        bf += SCAN_READ_WINDOW_INITIAL ->
-          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_INITIAL)
-        bf += SCAN_READ_WINDOW_CURRENT ->
-          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_CURRENT)
-        bf += SCAN_READ_WINDOW_MAX ->
-          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_MAX)
+        bf += SCAN_READ_WINDOW ->
+          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW)
         bf += SCAN_READ_IN_FLIGHT_MAX ->
           createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_IN_FLIGHT_MAX)
         bf += SCAN_READ_READY_MAX ->
           createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_READY_MAX)
         bf += SCAN_READ_BACKLOG_MAX ->
           createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_BACKLOG_MAX)
-        bf += SCAN_READ_WINDOW_INCREASES ->
-          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_INCREASES)
-        bf += SCAN_READ_WINDOW_DECREASES ->
-          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_DECREASES)
-        bf += SCAN_READ_WINDOW_MEMORY_DECREASES ->
-          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_MEMORY_DECREASES)
-        bf += SCAN_READ_WINDOW_SCHEDULE_DECREASES ->
-          createMetric(MODERATE_LEVEL, DESCRIPTION_SCAN_READ_WINDOW_SCHEDULE_DECREASES)
         if (ExternalSource.isSupportedFormat(relation.fileFormat.getClass)) {
           // This metric is used to post the time spent in generating the `skip_row` column
           // in Delta Lake 3.3.0+
@@ -716,13 +684,6 @@ case class GpuFileSourceScanExec(
       effectivePrefetchWindow.foreach { window =>
         hadoopConf.setInt(ScanPrefetchSettings.WINDOW_KEY, window)
       }
-    }
-    if (shouldApplyLocalScanReadWindow) {
-      hadoopConf.setBoolean(ScanReadWindowSettings.ENABLED_KEY, true)
-      hadoopConf.setInt(ScanReadWindowSettings.INITIAL_WINDOW_KEY, localScanInitialReadWindow)
-      hadoopConf.setInt(ScanReadWindowSettings.MAX_WINDOW_KEY, localScanMaxReadWindow)
-      hadoopConf.setLong(ScanReadWindowSettings.MAX_READY_BYTES_KEY,
-        rapidsConf.autotuneScanMaxReadyBytes)
     }
     val broadcastedHadoopConf =
       relation.sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))

@@ -44,8 +44,8 @@ import org.apache.spark.sql.rapids.execution.TrampolineUtil
  */
 object RapidsAutotuneDriverEndpoint extends Logging {
   private val hints = new ConcurrentHashMap[AutotuneStageKey, StageRuntimeHint]()
-  // Cumulative per-stage aggregate -- feeds the eventlog observation record and `observationFor`.
-  // Monotonic by design (lifetime totals/high-water), so it is not the optimizer's window input.
+  // Cumulative per-stage aggregate -- feeds the eventlog observation record. Monotonic by design
+  // (lifetime totals/high-water), so it is not the optimizer's window input.
   private val observations = new ConcurrentHashMap[AutotuneStageKey, StageObservationAgg]()
   private val nextHintVersion = new AtomicLong(1L)
   private val nextParallelismDecisionId = new AtomicLong(1L)
@@ -57,9 +57,9 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   @volatile private var taskCpus = 1
   @volatile private var sparkContext: SparkContext = _
   @volatile private var enabled = false
-  // The graph optimizer only runs in GRAPH/OPTIMIZE modes; OBSERVE/LOCAL never republish.
+  // The graph optimizer only evaluates decision epochs in the GRAPH/OPTIMIZE modes.
   @volatile private var optimizerEnabled = false
-  @volatile private var optimizer: GraphWideAutotuneOptimizer = _
+  @volatile private var optimizer: AnalyticalGraphWideAutotuneOptimizer = _
   // Injectable monotonic clock so optimizer update cadence is deterministically testable.
   @volatile private var nanoSource: () => Long = () => System.nanoTime()
 
@@ -120,10 +120,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     taskCpus = math.max(1, cpus)
   }
 
-  def publishDefaultNoopHint(key: AutotuneStageKey): StageRuntimeHint = synchronized {
-    publishStageHint(key, ScanRuntimeHint.empty)
-  }
-
   /** Register a graph node and publish the optimizer's complete initial joint hint. */
   def publishOptimizerHint(
       key: AutotuneStageKey,
@@ -142,7 +138,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   def stageSubmitted(key: AutotuneStageKey): Unit = {
     if (enabled && optimizer != null) {
       try {
-        applyOptimizerDecisions(optimizer.stageSubmitted(key))
+        optimizer.stageSubmitted(key)
+        publishDecisionRecords()
       } catch {
         case NonFatal(e) =>
           logWarning("RAPIDS graph optimizer stage-submission update failed", e)
@@ -153,7 +150,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   def stageCompleted(key: AutotuneStageKey): Unit = {
     if (enabled && optimizer != null) {
       try {
-        applyOptimizerDecisions(optimizer.stageCompleted(key))
+        optimizer.stageCompleted(key)
+        publishDecisionRecords()
       } catch {
         case NonFatal(e) =>
           logWarning("RAPIDS graph optimizer stage-completion update failed", e)
@@ -182,8 +180,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
 
   /**
    * Publish (once) the hint for a stage key. The first publication for a key wins and fixes its
-   * version; later calls for the same un-expired key return the existing hint so executors see a
-   * stable version for the stage attempt.
+   * version; later calls for the same key return the existing hint so executors see a stable
+   * version for the stage attempt.
    */
   def publishStageHint(
       key: AutotuneStageKey,
@@ -193,58 +191,23 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     if (!enabled) {
       StageRuntimeHint.empty(key)
     } else {
-      Option(hints.get(key))
-        .filterNot(_.isExpired(System.nanoTime()))
-        .getOrElse {
-          val hint = StageRuntimeHint(
-            executionId = key.executionId,
-            stageId = key.stageId,
-            stageAttemptId = key.stageAttemptId,
-            version = nextHintVersion.getAndIncrement(),
-            scan = scanHint,
-            shuffle = shuffleHint,
-            batch = batchHint,
-            expiresAtNanos = Long.MaxValue)
-          hints.put(key, hint)
-          hint
-        }
-    }
-  }
-
-  /**
-   * Republish an adjusted hint for a key, bumping its version so executors that re-fetch (after
-   * their cache TTL) see the newer hint. Unlike [[publishStageHint]] (first-publication-wins), this
-   * overwrites the existing entry -- it is the graph optimizer's update path. The supplied
-   * `content` carries the new knob values; this stamps a fresh version and keeps the stage-attempt
-   * expiry unchanged (`Long.MaxValue`), so the wire-level expiry semantics are untouched and the
-   * executor fetch-TTL is what drives pickup. Stays within the applicable static (GRAPH) or
-   * explicit safety-envelope (OPTIMIZE) caps by construction.
-   */
-  def republishStageHint(key: AutotuneStageKey, content: StageRuntimeHint): StageRuntimeHint =
-    synchronized {
-      if (!enabled) {
-        StageRuntimeHint.empty(key)
-      } else {
-        val hint = content.copy(
+      Option(hints.get(key)).getOrElse {
+        val hint = StageRuntimeHint(
           executionId = key.executionId,
           stageId = key.stageId,
           stageAttemptId = key.stageAttemptId,
           version = nextHintVersion.getAndIncrement(),
-          expiresAtNanos = Long.MaxValue)
+          scan = scanHint,
+          shuffle = shuffleHint,
+          batch = batchHint)
         hints.put(key, hint)
-        if (optimizer != null) {
-          optimizer.hintPublished(hint)
-        }
         hint
       }
     }
+  }
 
   def handleHintRequest(msg: RapidsAutotuneHintRequestMsg): RapidsAutotuneHintResponseMsg = {
-    val hint = if (enabled) {
-      Option(hints.get(msg.key)).filterNot(_.isExpired(System.nanoTime()))
-    } else {
-      None
-    }
+    val hint = if (enabled) Option(hints.get(msg.key)) else None
     RapidsAutotuneHintResponseMsg(msg.key, hint)
   }
 
@@ -278,8 +241,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       shuffleMaxReadyBytes = msg.shuffle.maxReadyBytes,
       shuffleCoalesceTargetBytes = msg.shuffle.coalesceTargetBytes,
       batchTargetBatchBytes = msg.batch.targetBatchBytes,
-      batchMaxBatchBytes = msg.batch.maxBatchBytes,
-      batchSplitUntilSize = msg.batch.splitUntilSize)
+      batchMaxBatchBytes = msg.batch.maxBatchBytes)
 
   /**
    * Ingest a runtime observation: update the per-stage aggregate, post an eventlog record, and (in
@@ -298,8 +260,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   }
 
   /**
-   * Closed-loop optimizer trigger. The optimizer owns its observation windows, update cadence,
-   * stage graph and joint decision. This endpoint owns only wire publication/versioning.
+   * Closed-loop optimizer trigger. The optimizer owns its observation windows, update cadence and
+   * stage graph. This endpoint owns only wire publication/versioning.
    *
    * Fully guarded: an optimizer exception is swallowed (advisory path) so it can never break
    * observation handling for other stages or the driver RPC dispatcher.
@@ -313,24 +275,12 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       if (current == null) {
         return
       }
-      applyOptimizerDecisions(optimizer.observe(msg, current, nanoSource()))
+      optimizer.observe(msg, current, nanoSource())
+      publishDecisionRecords()
     } catch {
       case NonFatal(e) =>
         logWarning("RAPIDS graph optimizer evaluation failed; leaving hint unchanged", e)
     }
-  }
-
-  private def applyOptimizerDecisions(decisions: Seq[GraphOptimizerDecision]): Unit = {
-    decisions.foreach { decision =>
-      val key = decision.hint.key
-      val published = republishStageHint(key, decision.hint)
-      logDebug(s"RAPIDS graph optimizer re-hinted stage ${key.stageId}." +
-        s"${key.stageAttemptId} to version ${published.version}; predicted task work " +
-        s"${decision.predictedCurrentNanos} -> ${decision.predictedSelectedNanos} ns; " +
-        s"scan ${published.scan}, shuffle ${published.shuffle}, " +
-        s"batch ${published.batch}")
-    }
-    publishDecisionRecords()
   }
 
   private def publishDecisionRecords(): Unit = {
@@ -357,20 +307,13 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       sampleTasks = record.sampleTasks,
       currentHintVersion = record.currentHintVersion,
       graphCurrentObjectiveNanos = record.graphCurrentObjectiveNanos,
-      graphSelectedObjectiveNanos = record.graphSelectedObjectiveNanos,
       predictedCurrentNanos = record.predictedCurrentNanos,
-      predictedSelectedNanos = record.predictedSelectedNanos,
       durationAdjoint = record.durationAdjoint,
       currentScanWindow = record.currentControl.scanWindow,
       currentGpuTasks = record.currentControl.gpuTasks,
       currentShuffleWindow = record.currentControl.shuffleWindow,
       currentShuffleBytes = record.currentControl.shuffleBytes,
       currentBatchBytes = record.currentControl.batchBytes,
-      selectedScanWindow = record.selectedControl.scanWindow,
-      selectedGpuTasks = record.selectedControl.gpuTasks,
-      selectedShuffleWindow = record.selectedControl.shuffleWindow,
-      selectedShuffleBytes = record.selectedControl.shuffleBytes,
-      selectedBatchBytes = record.selectedControl.batchBytes,
       scanWindowGradient = record.endToEndGradient.scanWindow,
       gpuTasksGradient = record.endToEndGradient.gpuTasks,
       shuffleWindowGradient = record.endToEndGradient.shuffleWindow,
@@ -381,13 +324,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       shuffleWindowFreezeReason = record.freezeReasons.shuffleWindow,
       shuffleBytesFreezeReason = record.freezeReasons.shuffleBytes,
       batchBytesFreezeReason = record.freezeReasons.batchBytes)
-
-  /**
-   * Cumulative per-stage observation aggregate for a key (eventlog/inspection view). NOTE: this is
-   * the lifetime aggregate, not the recent window the graph optimizer consumes.
-   */
-  def observationFor(key: AutotuneStageKey): Option[StageObservationAgg] =
-    Option(observations.get(key))
 
   private[rapids] def aqeCalibrationSnapshot: Option[GpuFlowAqeCalibration] = synchronized {
     val executionId = Option(sparkContext)
@@ -482,8 +418,6 @@ case class StageObservationAgg(
     totalOutputBytes: Long = 0L,
     totalShuffleReadBytes: Long = 0L,
     totalShuffleWriteBytes: Long = 0L,
-    totalInputRows: Long = 0L,
-    totalOutputRows: Long = 0L,
     maxPinnedMemoryBytes: Long = 0L,
     maxDeviceMemoryBytes: Long = 0L,
     totalRetryOrLostTimeNanos: Long = 0L) {
@@ -502,31 +436,9 @@ case class StageObservationAgg(
     totalOutputBytes = totalOutputBytes + msg.outputBytes,
     totalShuffleReadBytes = totalShuffleReadBytes + msg.shuffleReadBytes,
     totalShuffleWriteBytes = totalShuffleWriteBytes + msg.shuffleWriteBytes,
-    totalInputRows = totalInputRows + msg.inputRows,
-    totalOutputRows = totalOutputRows + msg.outputRows,
     maxPinnedMemoryBytes = math.max(maxPinnedMemoryBytes, msg.pinnedMemoryBytes),
     maxDeviceMemoryBytes = math.max(maxDeviceMemoryBytes, msg.deviceMemoryBytes),
     totalRetryOrLostTimeNanos = totalRetryOrLostTimeNanos + msg.retryOrLostTimeNanos)
-
-  /**
-   * GPU wait ratio = sum(semaphore wait) / sum(holding) across the stage's reported tasks -- a
-   * time-weighted stage ratio (not a mean of per-task ratios), retained for eventlog diagnostics.
-   */
-  def gpuWaitRatio: Double =
-    if (totalGpuHoldingNanos > 0L) {
-      totalGpuSemaphoreWaitNanos.toDouble / totalGpuHoldingNanos
-    } else {
-      0.0
-    }
-
-  /** Fraction of multithreaded shuffle-reader limiter attempts deferred by the current bound. */
-  def shuffleReadLimiterFailureRatio: Double =
-    if (totalShuffleReadLimiterAcquireCount > 0L) {
-      totalShuffleReadLimiterAcquireFailCount.toDouble /
-        totalShuffleReadLimiterAcquireCount.toDouble
-    } else {
-      0.0
-    }
 }
 
 object StageObservationAgg {
@@ -611,18 +523,6 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
       }
       case _ =>
     }
-  }
-
-  private[rapids] def publishDefaultHint(
-      executionId: Long,
-      stageId: Int,
-      stageAttemptId: Int): StageRuntimeHint = {
-    publishHintForStage(
-      executionId,
-      stageId,
-      stageAttemptId,
-      AutotuneStageShape(hasGpuScan = false, hasGpuPrefetchConsumer = false, numTasks = 0),
-      Seq.empty)
   }
 
   private[rapids] def publishHintForStage(

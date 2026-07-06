@@ -61,7 +61,8 @@ private[rapids] object GpuFlowPartitionOptimizer {
       taskSlots: Int,
       variableNanosPerByte: Double,
       fixedNanosPerTask: Double,
-      maxPartitions: Int = Int.MaxValue): Option[GpuFlowPartitionLayout] = {
+      maxPartitions: Int = Int.MaxValue,
+      maxRangeBytes: Long = Long.MaxValue): Option[GpuFlowPartitionLayout] = {
     if (partitionBytes.isEmpty || taskSlots <= 0 || variableNanosPerByte < 0.0 ||
         fixedNanosPerTask < 0.0 || currentRanges.isEmpty) {
       return None
@@ -73,10 +74,18 @@ private[rapids] object GpuFlowPartitionOptimizer {
     val candidateCounts = (waveEndpoints :+ originalPartitions :+ currentRanges.size)
       .filter(count => count > 0 && count <= originalPartitions && count <= maxPartitions)
       .distinct.sorted
+    // The current (deployed) layout is always priced; a candidate layout is eligible only when
+    // every range stays within `maxRangeBytes`, the byte region where the calibrated linear rate
+    // was actually measured. Ranges beyond it have an unidentified, possibly superlinear response.
     Some(candidateCounts.foldLeft(current) { (best, count) =>
       val candidate = layoutForRanges(partitionBytes, balancedRanges(partitionBytes, count),
         taskSlots, variableNanosPerByte, fixedNanosPerTask)
-      if (candidate.objectiveNanos < best.objectiveNanos) candidate else best
+      if (candidate.ranges.forall(_.bytes <= maxRangeBytes) &&
+          candidate.objectiveNanos < best.objectiveNanos) {
+        candidate
+      } else {
+        best
+      }
     })
   }
 
@@ -181,9 +190,10 @@ case class GpuFlowAqeParallelismRule()
       return plan
     }
     val calibration = RapidsAutotuneDriverEndpoint.aqeCalibrationSnapshot
+    val nativeBatchBytes = rapidsConf.gpuTargetBatchSizeBytes
     val replacements = mutable.HashMap.empty[Int, Seq[ShufflePartitionSpec]]
     collectGroups(plan).foreach { group =>
-      val decision = optimizeGroup(group, calibration)
+      val decision = optimizeGroup(group, calibration, nativeBatchBytes)
       RapidsAutotuneDriverEndpoint.recordParallelismDecision(decision._1)
       decision._2.foreach(replacements ++= _)
     }
@@ -198,7 +208,8 @@ case class GpuFlowAqeParallelismRule()
 
   private def optimizeGroup(
       group: Seq[StageInfo],
-      calibration: Option[GpuFlowAqeCalibration])
+      calibration: Option[GpuFlowAqeCalibration],
+      nativeBatchBytes: Long)
       : (GpuFlowParallelismDecision, Option[Map[Int, Seq[ShufflePartitionSpec]]]) = {
     val stageIds = group.map(_.stage.id)
     val originalPartitions = group.head.stage.mapStats.map(_.bytesByPartitionId.length).getOrElse(0)
@@ -224,13 +235,9 @@ case class GpuFlowAqeParallelismRule()
         if (taskSlots <= 0) {
           return (emptyDecision.copy(reason = "cluster-task-slots-unmeasured"), None)
         }
-        val variableRates = Seq(
-          divideRate(calibrated.gpuUnitNanosPerByte,
-            calibrated.referenceControl.gpuTasks),
-          divideRate(calibrated.shuffleUnitNanosPerByte,
-            calibrated.referenceControl.shuffleWindow *
-              calibrated.referenceControl.shuffleBytes)).flatten
-        if (variableRates.isEmpty) {
+        val variableRate = divideRate(calibrated.shuffleUnitNanosPerByte,
+          calibrated.referenceControl.shuffleWindow * calibrated.referenceControl.shuffleBytes)
+        if (variableRate.isEmpty) {
           return (emptyDecision.copy(taskSlots = taskSlots,
             reason = "missing-reducer-service-rate"), None)
         }
@@ -246,7 +253,7 @@ case class GpuFlowAqeParallelismRule()
         val totalBytes = combined.foldLeft(0L) { (sum, bytes) =>
           if (bytes > Long.MaxValue - sum) Long.MaxValue else sum + bytes
         }
-        val rate = variableRates.max
+        val rate = variableRate.get
         if (calibrated.fixedNanosPerTask.isEmpty) {
           return (emptyDecision.copy(taskSlots = taskSlots,
             totalBytes = totalBytes,
@@ -260,14 +267,25 @@ case class GpuFlowAqeParallelismRule()
         val currentRanges = group.head.specs.map(spec =>
           (spec.startReducerIndex, spec.endReducerIndex))
         val fixed = calibrated.fixedNanosPerTask.get
+        // The calibrated byte rate is linear evidence only inside the region it was measured in:
+        // up to the largest per-task shuffle-read load observed in this execution, floored by the
+        // native GPU batch target (below one batch, operators stay in their single-batch regime).
+        // Ranges beyond that region cross unmeasured operator thresholds where per-task cost can
+        // turn superlinear (an SF3K q21 join stage doubled per-task time for +25% bytes).
+        val identifiedRangeBytes = math.max(
+          nativeBatchBytes, calibrated.maxCalibratedTaskShuffleReadBytes)
         // Spark's current AQE layout is the identified baseline. Coalescing further has exact map
         // statistics plus measured task-wave cost. Increasing beyond it also adds driver scheduler
         // and task-launch work that is not in the executor clock, so keep that direction frozen.
         val unconstrained = GpuFlowPartitionOptimizer.optimize(
           combined.toSeq, currentRanges, taskSlots, rate, fixed).get
-        val selected = GpuFlowPartitionOptimizer.optimize(
+        val uncapped = GpuFlowPartitionOptimizer.optimize(
           combined.toSeq, currentRanges, taskSlots, rate, fixed,
           maxPartitions = currentRanges.size).get
+        val selected = GpuFlowPartitionOptimizer.optimize(
+          combined.toSeq, currentRanges, taskSlots, rate, fixed,
+          maxPartitions = currentRanges.size,
+          maxRangeBytes = identifiedRangeBytes).get
         val currentBytes = currentRanges.map { case (start, end) =>
           combined.slice(start, end).map(_.toDouble).sum
         }
@@ -290,6 +308,8 @@ case class GpuFlowAqeParallelismRule()
             ""
           } else if (unconstrained.ranges.size > currentRanges.size) {
             "higher-parallelism-response-unidentified"
+          } else if (uncapped.objectiveNanos < selected.objectiveNanos) {
+            "larger-range-response-unidentified"
           } else {
             "current-layout-optimal"
           },

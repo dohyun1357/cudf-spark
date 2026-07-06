@@ -63,8 +63,7 @@ case class SparkRapidsAutotuneHintAppliedEvent(
   shuffleMaxReadyBytes: Long = Long.MaxValue,
   shuffleCoalesceTargetBytes: Long = 0L,
   batchTargetBatchBytes: Long = 0L,
-  batchMaxBatchBytes: Long = Long.MaxValue,
-  batchSplitUntilSize: Long = 0L
+  batchMaxBatchBytes: Long = Long.MaxValue
 ) extends SparkListenerEvent
 
 /**
@@ -114,7 +113,7 @@ case class SparkRapidsAutotuneObservationEvent(
 
 /**
  * One stage row from a graph-wide analytical decision epoch. Together, rows with the same
- * `epochId` are a replay-complete snapshot of the remaining graph, selected controls, objective,
+ * `epochId` are a replay-complete snapshot of the remaining graph, current controls, objective,
  * reverse-mode sensitivity, and controls frozen because their response was not identifiable.
  */
 case class SparkRapidsAutotuneGraphDecisionEvent(
@@ -130,20 +129,13 @@ case class SparkRapidsAutotuneGraphDecisionEvent(
   sampleTasks: Long,
   currentHintVersion: Long,
   graphCurrentObjectiveNanos: Double,
-  graphSelectedObjectiveNanos: Double,
   predictedCurrentNanos: Double,
-  predictedSelectedNanos: Double,
   durationAdjoint: Double,
   currentScanWindow: Double,
   currentGpuTasks: Double,
   currentShuffleWindow: Double,
   currentShuffleBytes: Double,
   currentBatchBytes: Double,
-  selectedScanWindow: Double,
-  selectedGpuTasks: Double,
-  selectedShuffleWindow: Double,
-  selectedShuffleBytes: Double,
-  selectedBatchBytes: Double,
   scanWindowGradient: Double,
   gpuTasksGradient: Double,
   shuffleWindowGradient: Double,

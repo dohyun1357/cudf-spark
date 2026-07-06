@@ -565,7 +565,7 @@ abstract class MultiFileCloudPartitionReaderBase(
     metrics.get("numPartedFiles").foreach(_ += inputFiles.length)
 
     // limit the number we submit at once according to the config/controller if set
-    val limit = readWindowController.initialReadWindow
+    val limit = readWindowController.readWindow
     val tc = TaskContext.get
     if (!keepReadsInOrder) {
       logDebug("Not keeping reads in order")
@@ -906,10 +906,6 @@ abstract class MultiFileCloudPartitionReaderBase(
                 filterGpuIdleTime += (gpuIdleTimeInc.value * filterPct).toLong
                 bufGpuIdleTime += (gpuIdleTimeInc.value * bufferPct).toLong
                 scheduleGpuIdleTime += (gpuIdleTimeInc.value * schedulePct).toLong
-                observeReadWait(
-                  (wallClockInc.value * bufferPct).toLong,
-                  (gpuIdleTimeInc.value * bufferPct).toLong,
-                  (wallClockInc.value * schedulePct).toLong)
                 ret
               } else {
                 // Collect wall clock time only
@@ -919,10 +915,6 @@ abstract class MultiFileCloudPartitionReaderBase(
                 filterTime += (blockedTime * ret.getFilterTimePct).toLong
                 bufTime += (blockedTime * ret.getBufferTimePct).toLong
                 scheduleTime += (blockedTime * ret.getScheduleTimePct).toLong
-                observeReadWait(
-                  (blockedTime * ret.getBufferTimePct).toLong,
-                  0L,
-                  (blockedTime * ret.getScheduleTimePct).toLong)
                 ret
               }
             }
@@ -981,7 +973,7 @@ abstract class MultiFileCloudPartitionReaderBase(
       addNextTaskIfNeeded()
     } else {
       while (tasksToRun.nonEmpty && !isDone &&
-          tasks.size() < readWindowController.currentReadWindow) {
+          tasks.size() < readWindowController.readWindow) {
         addNextTaskIfNeeded()
       }
     }
@@ -991,25 +983,12 @@ abstract class MultiFileCloudPartitionReaderBase(
   private def recordReadQueueDepths(): Unit = {
     // Gate on the controller being enabled so the default/disabled read path skips the
     // ConcurrentLinkedQueue scan and iterator allocation entirely (observeReadQueue itself no-ops
-    // when disabled). Mirrors the observeReadWait wrapper below.
+    // when disabled).
     if (readWindowController.enabled) {
       readWindowController.observeReadQueue(
         inFlightReadTasks = tasks.size(),
         readyReadTasks = tasks.iterator().asScala.count(_.isDone),
         backlogReadTasks = tasksToRun.size)
-    }
-  }
-
-  private def observeReadWait(
-      bufferWaitNs: Long,
-      bufferGpuIdleNs: Long,
-      scheduleWaitNs: Long): Unit = {
-    if (readWindowController.enabled) {
-      readWindowController.observeReadWait(
-        bufferWaitNs,
-        bufferGpuIdleNs,
-        scheduleWaitNs,
-        GpuTaskMetrics.get.getHostBytesAllocated)
     }
   }
 
@@ -1549,35 +1528,19 @@ abstract class MultiFileCoalescingPartitionReaderBase(
                 readyReadTasks = activeTasks.count(_.isDone),
                 backlogReadTasks = queuedTasks.size)
             }
-            def submitNextTask(): Unit = {
-              activeTasks.enqueue(threadPool.submit(queuedTasks.dequeue()))
-              recordReadQueueDepths()
-            }
             def refillReadWindow(): Unit = {
               while (queuedTasks.nonEmpty &&
-                  activeTasks.size < readWindowController.currentReadWindow) {
-                submitNextTask()
+                  activeTasks.size < readWindowController.readWindow) {
+                activeTasks.enqueue(threadPool.submit(queuedTasks.dequeue()))
               }
               recordReadQueueDepths()
             }
-            def collectFuture(future: Future[BatchRunnerResult]): Unit = {
-              val waitStart = System.nanoTime()
-              val (blocks, bytesRead) = future.get().data
-              val waitNs = System.nanoTime() - waitStart
-              allOutputBlocks ++= blocks
-              TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
-              readWindowController.observeReadWait(
-                bufferWaitNs = waitNs,
-                bufferGpuIdleNs = 0L,
-                scheduleWaitNs = 0L,
-                hostBytesAllocated = GpuTaskMetrics.get.getHostBytesAllocated)
-            }
 
-            recordReadQueueDepths()
             refillReadWindow()
             while (activeTasks.nonEmpty) {
-              collectFuture(activeTasks.dequeue())
-              recordReadQueueDepths()
+              val (blocks, bytesRead) = activeTasks.dequeue().get().data
+              allOutputBlocks ++= blocks
+              TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
               refillReadWindow()
             }
           } else {

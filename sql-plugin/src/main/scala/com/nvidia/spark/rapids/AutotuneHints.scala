@@ -31,8 +31,6 @@ package com.nvidia.spark.rapids
  */
 case class AutotuneCachedHint(hint: StageRuntimeHint, hasHint: Boolean) {
   def version: Long = hint.version
-
-  def isExpired(nowNanos: Long): Boolean = hasHint && hint.isExpired(nowNanos)
 }
 
 object AutotuneCachedHint {
@@ -86,15 +84,6 @@ object BatchRuntimeHints {
       val ceiling = batchHint.map(_.maxBatchBytes).filter(_ > 0L).getOrElse(Long.MaxValue)
       math.max(1L, math.min(target, ceiling))
     }.getOrElse(staticTargetBytes)
-  }
-
-  def effectiveSplitUntilSize(
-      staticSplitUntilSize: Long,
-      hint: Option[BatchRuntimeHint]): Long = {
-    hint.filter(h => h.splitUntilSize > 0L && h.maxBatchBytes > 0L)
-      .map(h => math.max(GpuDeviceManager.MIN_SPLIT_UNTIL_SIZE,
-        math.min(h.splitUntilSize, h.maxBatchBytes)))
-      .getOrElse(staticSplitUntilSize)
   }
 }
 

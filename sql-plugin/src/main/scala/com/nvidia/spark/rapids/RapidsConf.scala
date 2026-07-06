@@ -327,11 +327,10 @@ object ScanPrefetchMode extends Enumeration {
 object AutotuneGraphMode extends Enumeration {
   type AutotuneGraphMode = Value
   // OBSERVE is intentionally inert (telemetry only) and is the documented default; the feature is
-  // turned off entirely via autotune.graph.enabled=false. LOCAL/GRAPH activate the controllers.
-  // GRAPH keeps every runtime knob <= its static cap. OPTIMIZE additionally lets the closed-loop
-  // model raise knobs ABOVE the static cap, bounded by the hard memory-safety envelope (the GPU
-  // semaphore's allocFraction-sized permit pool); it is the "autotuner owns the perf knobs" switch.
-  val OBSERVE, LOCAL, GRAPH, OPTIMIZE = Value
+  // turned off entirely via autotune.graph.enabled=false. GRAPH activates the driver optimizer
+  // with every runtime knob <= its static cap. OPTIMIZE additionally enables the model-driven
+  // AQE reducer-parallelism rule.
+  val OBSERVE, GRAPH, OPTIMIZE = Value
 }
 
 object RapidsConf extends Logging {
@@ -1878,10 +1877,9 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     conf("spark.rapids.sql.autotune.graph.mode")
       .doc("Autotuning mode. OBSERVE is the default no-op/telemetry mode: it emits applied-hint " +
         "eventlog records and publishes only empty (no-op) stage hints, leaving execution " +
-        "unchanged. LOCAL enables executor-local controllers under static caps. GRAPH enables " +
-        "one driver graph optimizer whose joint scan/shuffle/batch decision is bounded by " +
-        "static caps. OPTIMIZE additionally enables the model-driven AQE reducer-parallelism " +
-        "rule.")
+        "unchanged. GRAPH enables one driver graph optimizer whose joint scan/shuffle/batch " +
+        "hint is bounded by static caps. OPTIMIZE additionally enables the model-driven AQE " +
+        "reducer-parallelism rule.")
       .stringConf
       .transform(_.toUpperCase(java.util.Locale.ROOT))
       .checkValues(AutotuneGraphMode.values.map(_.toString))
@@ -1890,7 +1888,7 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
   val AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS =
     conf("spark.rapids.sql.autotune.graph.minSampleTasks")
       .doc("Minimum number of completed-task observations a stage must report before the graph " +
-        "optimizer evaluates a new joint hint. This is a sampling requirement, not a tuning " +
+        "optimizer evaluates a decision epoch. This is a sampling requirement, not a tuning " +
         "threshold. Only used in GRAPH and OPTIMIZE modes.")
       .integerConf
       .checkValue(v => v > 0, "The autotune graph min sample tasks must be greater than 0.")
@@ -1898,9 +1896,8 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val AUTOTUNE_GRAPH_UPDATE_INTERVAL_MS =
     conf("spark.rapids.sql.autotune.graph.updateIntervalMs")
-      .doc("Minimum interval, in milliseconds, between graph autotune hint updates for a stage " +
-        "and the executor hint-cache refresh TTL so later tasks pick up a republished joint " +
-        "hint. Only used in GRAPH and OPTIMIZE modes.")
+      .doc("Minimum interval, in milliseconds, between graph autotune decision epochs for a " +
+        "stage. Only used in GRAPH and OPTIMIZE modes.")
       .integerConf
       .checkValue(v => v >= 0, "The autotune graph update interval must be non-negative.")
       .createWithDefault(500)
@@ -1916,7 +1913,7 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val AUTOTUNE_SCAN_MAX_READ_WINDOW =
     conf("spark.rapids.sql.autotune.scan.maxReadWindow")
-      .doc("Hard cap for the executor-local autotune scan read window. The effective read " +
+      .doc("Hard cap for the graph autotune scan read-window hint. The effective read " +
         "window never exceeds the format-specific multiThreadedRead.maxNumFilesParallel " +
         "setting.")
       .integerConf
@@ -1925,8 +1922,7 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val AUTOTUNE_SCAN_MAX_READY_BYTES =
     conf("spark.rapids.sql.autotune.scan.maxReadyBytes")
-      .doc("Hard host-memory budget associated with the optimizer-selected scan read window. " +
-        "LOCAL mode also uses it as its legacy local-controller bound.")
+      .doc("Hard host-memory budget associated with the optimizer-selected scan read window.")
       .bytesConf(ByteUnit.BYTE)
       .checkValue(v => v > 0, "The autotune scan max ready bytes must be greater than 0.")
       .createWithDefault(Long.MaxValue)
@@ -1960,32 +1956,13 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValue(v => v > 0, "The autotune shuffle max ready bytes must be greater than 0.")
       .createWithDefault(Long.MaxValue)
 
-  val AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES =
-    conf("spark.rapids.sql.autotune.shuffle.coalesceTargetBytes")
-      .doc("Smallest shuffle coalesce target requested for graph autotuning. Cold stages " +
-        s"preserve the native '${GPU_BATCH_SIZE_BYTES.key}' target; the joint batch/shuffle " +
-        "model may select the smaller value after observations. 0 (default) keeps the native " +
-        "starting point.")
-      .bytesConf(ByteUnit.BYTE)
-      .checkValue(v => v >= 0, "The autotune shuffle coalesce target bytes must be non-negative.")
-      .createWithDefault(0L)
-
   val AUTOTUNE_BATCH_ENABLED =
     conf("spark.rapids.sql.autotune.batch.enabled")
       .doc("Enable graph autotune batch-sizing hints. When false (default), the driver publishes " +
-        "only empty (no-op) batch hints. Enabled hints drive GPU coalesce target and pre-project " +
-        "split sizing under maxBytes.")
+        "only empty (no-op) batch hints. Enabled hints drive the GPU coalesce target under " +
+        "maxBytes.")
       .booleanConf
       .createWithDefault(false)
-
-  val AUTOTUNE_BATCH_TARGET_BYTES =
-    conf("spark.rapids.sql.autotune.batch.targetBytes")
-      .doc("Smallest batch target considered by graph autotuning. Cold stages preserve the " +
-        s"native '${GPU_BATCH_SIZE_BYTES.key}' target; 0 (default) keeps that as the only " +
-        "starting candidate.")
-      .bytesConf(ByteUnit.BYTE)
-      .checkValue(v => v >= 0, "The autotune batch target bytes must be non-negative.")
-      .createWithDefault(0L)
 
   val AUTOTUNE_BATCH_MAX_BYTES =
     conf("spark.rapids.sql.autotune.batch.maxBytes")
@@ -1995,13 +1972,6 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .bytesConf(ByteUnit.BYTE)
       .checkValue(v => v > 0, "The autotune batch max bytes must be greater than 0.")
       .createWithDefault(Long.MaxValue)
-
-  val AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE =
-    conf("spark.rapids.sql.autotune.batch.splitUntilSize")
-      .doc("Graph autotune split-until-size batch hint. 0 (default) means no hint.")
-      .bytesConf(ByteUnit.BYTE)
-      .checkValue(v => v >= 0, "The autotune batch split-until size must be non-negative.")
-      .createWithDefault(0L)
 
   val ENABLE_DELTA_WRITE = conf("spark.rapids.sql.format.delta.write.enabled")
       .doc("When set to false disables Delta Lake output acceleration.")
@@ -3980,22 +3950,15 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val autotuneGraphMode: AutotuneGraphMode.Value =
     AutotuneGraphMode.withName(get(AUTOTUNE_GRAPH_MODE))
 
-  lazy val isAutotuneLocalMode: Boolean =
-    autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.LOCAL
-
   /** True in GRAPH mode (driver graph hints, every knob bounded by its static cap). */
   lazy val isAutotuneGraphMode: Boolean =
     autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.GRAPH
 
-  /** True in OPTIMIZE mode (GRAPH behavior plus explicitly bounded above-static increases). */
+  /** True in OPTIMIZE mode (GRAPH behavior plus the model-driven AQE reducer rule). */
   lazy val isAutotuneOptimizeMode: Boolean =
     autotuneGraphEnabled && autotuneGraphMode == AutotuneGraphMode.OPTIMIZE
 
-  /**
-   * True when the driver should run the graph optimizer and republish hints, and the executor
-   * hint cache should refresh on a TTL. Both GRAPH and OPTIMIZE drive the loop; they differ only in
-   * whether a knob may exceed its static cap (OPTIMIZE) or not (GRAPH).
-   */
+  /** True when the driver should run the graph optimizer (GRAPH or OPTIMIZE). */
   lazy val isAutotuneClosedLoopMode: Boolean = isAutotuneGraphMode || isAutotuneOptimizeMode
 
   lazy val autotuneGraphMinSampleTasks: Int = get(AUTOTUNE_GRAPH_MIN_SAMPLE_TASKS)
@@ -4028,18 +3991,9 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val autotuneShuffleMaxReadyBytes: Long = get(AUTOTUNE_SHUFFLE_MAX_READY_BYTES)
 
-  /** Initial shuffle hint bound: the configured static max-ready-bytes envelope. */
-  lazy val autotuneInitialShuffleMaxReadyBytes: Long = autotuneShuffleMaxReadyBytes
-
-  lazy val autotuneShuffleCoalesceTargetBytes: Long = get(AUTOTUNE_SHUFFLE_COALESCE_TARGET_BYTES)
-
   lazy val autotuneBatchEnabled: Boolean = get(AUTOTUNE_BATCH_ENABLED)
 
-  lazy val autotuneBatchTargetBytes: Long = get(AUTOTUNE_BATCH_TARGET_BYTES)
-
   lazy val autotuneBatchMaxBytes: Long = get(AUTOTUNE_BATCH_MAX_BYTES)
-
-  lazy val autotuneBatchSplitUntilSize: Long = get(AUTOTUNE_BATCH_SPLIT_UNTIL_SIZE)
 
   lazy val isDeltaWriteEnabled: Boolean = get(ENABLE_DELTA_WRITE)
 

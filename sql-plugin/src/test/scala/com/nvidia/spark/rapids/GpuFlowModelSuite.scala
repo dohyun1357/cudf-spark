@@ -20,74 +20,76 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class GpuFlowModelSuite extends AnyFunSuite {
   private val key = AutotuneStageKey(executionId = 11L, stageId = 3, stageAttemptId = 1)
+  private val baseline = GpuFlowControl(
+    scanWindow = 2.0,
+    gpuTasks = 0.0,
+    shuffleWindow = 2.0,
+    shuffleBytes = 128.0,
+    batchBytes = 256.0)
 
-  test("flow-stage analytic gradients match finite differences") {
-    val baseline = GpuFlowControl(
-      scanWindow = 2.0,
-      gpuTasks = 2.0,
-      shuffleWindow = 2.0,
-      shuffleBytes = 128.0,
-      batchBytes = 256.0)
+  test("flow-stage evaluation sums the bottleneck lane with fixed and retry work") {
     val work = GpuFlowStageWork(
       scanNanos = 1000.0,
       gpuNanos = 600.0,
       shuffleNanos = 400.0,
-      batchNanos = 200.0,
       fixedNanos = 100.0,
       retryNanos = 20.0,
       baseline = baseline)
-    val analytic = GpuFlowStageModel.evaluate(work, baseline)
-    val epsilon = 1e-6
+    val evaluation = GpuFlowStageModel.evaluate(work)
 
-    GpuFlowControl.Indices.foreach { index =>
-      val plus = baseline.updated(index, baseline.value(index) * math.exp(epsilon))
-      val minus = baseline.updated(index, baseline.value(index) * math.exp(-epsilon))
-      val finiteDifference = (
-        GpuFlowStageModel.evaluate(work, plus).predictedNanos -
-          GpuFlowStageModel.evaluate(work, minus).predictedNanos) / (2.0 * epsilon)
-      assert(math.abs(analytic.gradient.value(index) - finiteDifference) < 1e-4,
-        s"control $index: analytic=${analytic.gradient.value(index)} " +
-          s"finiteDifference=$finiteDifference")
-    }
+    assert(evaluation.predictedNanos == 1120.0)
+    // Only the critical scan lane carries sensitivity at the measured point.
+    assert(evaluation.gradient.scanWindow == -1000.0)
+    assert(evaluation.gradient.gpuTasks == 0.0)
+    assert(evaluation.gradient.shuffleWindow == 0.0)
+    assert(evaluation.gradient.shuffleBytes == 0.0)
+    assert(evaluation.gradient.batchBytes == 0.0)
+  }
+
+  test("flow-stage evaluation shares exact lane ties") {
+    val work = GpuFlowStageWork(
+      scanNanos = 500.0,
+      gpuNanos = 500.0,
+      shuffleNanos = 100.0,
+      fixedNanos = 0.0,
+      retryNanos = 0.0,
+      baseline = baseline)
+    val evaluation = GpuFlowStageModel.evaluate(work)
+
+    assert(evaluation.predictedNanos == 500.0)
+    assert(evaluation.gradient.scanWindow == -250.0)
+    assert(evaluation.gradient.gpuTasks == -250.0)
+    assert(evaluation.gradient.shuffleWindow == 0.0)
   }
 
   test("flow-graph reverse pass assigns end-to-end criticality") {
     val left = key.copy(stageId = 20)
     val right = key.copy(stageId = 21)
     val join = key.copy(stageId = 22)
-    def node(stageKey: AutotuneStageKey, parents: Seq[AutotuneStageKey], nanos: Double) =
-      GpuFlowGraphNode(stageKey, parents,
-        GpuFlowStageEvaluation(nanos, GpuFlowGradient(gpuTasks = -nanos)))
 
     val evaluation = GpuFlowModel.evaluate(Seq(
-      node(left, Seq.empty, 100.0),
-      node(right, Seq.empty, 60.0),
-      node(join, Seq(left, right), 20.0)))
+      GpuFlowGraphNode(left, Seq.empty, 100.0),
+      GpuFlowGraphNode(right, Seq.empty, 60.0),
+      GpuFlowGraphNode(join, Seq(left, right), 20.0)))
 
     assert(evaluation.objectiveNanos == 120.0)
     assert(evaluation.durationAdjoints(left) == 1.0)
     assert(evaluation.durationAdjoints(right) == 0.0)
     assert(evaluation.durationAdjoints(join) == 1.0)
-    assert(evaluation.controlGradients(left).gpuTasks == -100.0)
-    assert(evaluation.controlGradients(right).gpuTasks == 0.0)
   }
 
   test("flow-graph reverse pass shares exact critical-path ties") {
     val left = key.copy(stageId = 30)
     val right = key.copy(stageId = 31)
     val join = key.copy(stageId = 32)
-    def node(stageKey: AutotuneStageKey, parents: Seq[AutotuneStageKey], nanos: Double) =
-      GpuFlowGraphNode(stageKey, parents,
-        GpuFlowStageEvaluation(nanos, GpuFlowGradient()))
 
     val evaluation = GpuFlowModel.evaluate(Seq(
-      node(left, Seq.empty, 100.0),
-      node(right, Seq.empty, 100.0),
-      node(join, Seq(left, right), 20.0)))
+      GpuFlowGraphNode(left, Seq.empty, 100.0),
+      GpuFlowGraphNode(right, Seq.empty, 100.0),
+      GpuFlowGraphNode(join, Seq(left, right), 20.0)))
 
     assert(evaluation.durationAdjoints(left) == 0.5)
     assert(evaluation.durationAdjoints(right) == 0.5)
     assert(evaluation.durationAdjoints(join) == 1.0)
   }
-
 }

@@ -29,31 +29,22 @@ case class GraphOptimizerConstraints(
 case class ScanOptimizerBounds(
     enabled: Boolean,
     initialReadWindow: Int,
-    maxReadWindow: Int,
     maxReadyBytes: Long)
 
 case class ShuffleOptimizerBounds(
     enabled: Boolean,
     initialPrefetchWindow: Int,
-    maxPrefetchWindow: Int,
     initialReadyBytes: Long,
-    maxReadyBytes: Long,
     initialCoalesceBytes: Long)
 
 case class BatchOptimizerBounds(
     enabled: Boolean,
     initialTargetBytes: Long,
-    maxBatchBytes: Long,
-    initialSplitUntilSize: Long,
-    minimumTargetBytes: Long = 0L)
+    maxBatchBytes: Long)
 
 object GraphOptimizerConstraints {
   def fromConf(conf: RapidsConf): GraphOptimizerConstraints = {
     val nativeBatchTarget = conf.gpuTargetBatchSizeBytes
-    val configuredMinimumTargets = Seq(
-      conf.autotuneBatchTargetBytes,
-      conf.autotuneShuffleCoalesceTargetBytes).filter(_ > 0L)
-    val minimumBatchTarget = (nativeBatchTarget +: configuredMinimumTargets).min
     // The native target is already a deployed-safe point and must never be excluded by an
     // autotune envelope. Long.MaxValue is the unset sentinel, not a useful search endpoint.
     val configuredBatchMaximum = conf.autotuneBatchMaxBytes
@@ -70,36 +61,25 @@ object GraphOptimizerConstraints {
         // Start at the static envelope; the optimizer, rather than an initial per-knob policy,
         // selects any different feasible point.
         initialReadWindow = conf.autotuneScanReadWindowCap,
-        maxReadWindow = conf.autotuneScanReadWindowCap,
         maxReadyBytes = conf.autotuneScanMaxReadyBytes),
       shuffle = ShuffleOptimizerBounds(
         enabled = conf.isAutotuneClosedLoopMode && conf.autotuneShuffleEnabled,
         // A cold stage begins at the configured feasible envelope. Window 1 was an unevidenced
         // policy choice and could serialize a short stage before the first feedback epoch.
         initialPrefetchWindow = conf.autotuneShuffleMaxPrefetchWindow,
-        maxPrefetchWindow = conf.autotuneShuffleMaxPrefetchWindow,
-        initialReadyBytes = conf.autotuneInitialShuffleMaxReadyBytes,
-        maxReadyBytes = conf.shuffleMultiThreadedMaxBytesInFlight,
-        // Shuffle coalescing targets the same native GPU batch size. A smaller configured value
-        // is a model candidate, never an unconditional cold-stage override.
+        initialReadyBytes = conf.autotuneShuffleMaxReadyBytes,
+        // Shuffle coalescing targets the native GPU batch size; a cold stage never overrides it.
         initialCoalesceBytes = nativeBatchTarget),
       batch = BatchOptimizerBounds(
         enabled = conf.isAutotuneClosedLoopMode && conf.autotuneBatchEnabled,
         initialTargetBytes = nativeBatchTarget,
-        maxBatchBytes = batchMaximum,
-        initialSplitUntilSize = conf.autotuneBatchSplitUntilSize,
-        minimumTargetBytes = minimumBatchTarget))
+        maxBatchBytes = batchMaximum))
   }
 }
 
 case class AutotuneStageDescriptor(
     shape: AutotuneStageShape,
     parentStageIds: Seq[Int] = Seq.empty)
-
-case class GraphOptimizerDecision(
-    hint: StageRuntimeHint,
-    predictedCurrentNanos: Double,
-    predictedSelectedNanos: Double)
 
 private[rapids] case class GraphControlFreezeReasons(
     scanWindow: String = "",
@@ -108,41 +88,28 @@ private[rapids] case class GraphControlFreezeReasons(
     shuffleBytes: String = "",
     batchBytes: String = "")
 
-private[rapids] case class GraphStageAnalyticalState(
-    currentControl: GpuFlowControl,
-    currentGradient: GpuFlowGradient,
-    bounds: GpuFlowControlBounds,
-    freezeReasons: GraphControlFreezeReasons)
-
 private[rapids] case class GpuFlowCalibrationSample(
-    scanUnitNanos: Double,
-    scanBytes: Long,
-    gpuUnitNanos: Double,
-    gpuBytes: Long,
     shuffleUnitNanos: Double,
     shuffleBytes: Long,
-    broadcastNanos: Double,
-    broadcastBytes: Long,
-    batchUnitNanos: Double,
-    batchBytes: Long,
+    taskShuffleReadBytes: Long,
     nonGpuNanos: Double,
     ioBytes: Long,
     taskCount: Long)
 
 private[rapids] case class GpuFlowAqeCalibration(
-    scanUnitNanosPerByte: Option[Double],
-    gpuUnitNanosPerByte: Option[Double],
     shuffleUnitNanosPerByte: Option[Double],
-    broadcastNanosPerByte: Option[Double],
-    batchUnitNanosPerByte: Option[Double],
     fixedNanosPerTask: Option[Double],
     referenceControl: GpuFlowControl,
-    bounds: GpuFlowControlBounds,
     sampleWindows: Long,
     fixedNanosPerTaskStandardError: Option[Double] = None,
     fixedTaskCostSampleWindows: Long = 0L,
     fixedTaskCostReason: String = "missing-fixed-task-cost",
     fixedTaskCostSource: String = "",
+    // Largest mean per-task shuffle-read byte load observed across this execution's calibration
+    // windows. The shuffle rate identifies byte service only at task sizes it was measured at;
+    // a reducer range built beyond this region extrapolates into a possibly superlinear operator
+    // regime (a q21 join stage more than doubled per-task time for +25% bytes) and must freeze.
+    maxCalibratedTaskShuffleReadBytes: Long = 0L,
     // Cluster-wide CPU task slots from registered executors, stamped by the driver endpoint when
     // the snapshot is served. Zero means no executor census exists yet; consumers that need wave
     // arithmetic must freeze rather than substitute a per-executor quantity.
@@ -163,11 +130,10 @@ private[rapids] object GpuFlowAqeCalibration {
       } else 0.0,
       batchBytes = if (constraints.batch.enabled) constraints.batch.initialTargetBytes else 0.0)
     // A rate measured at one actuator setting identifies service demand at that operating point,
-    // not the counterfactual response to a different scan window, GPU quota, shuffle envelope, or
-    // batch size. AQE may use these rates to compare plan demand, but it must price every candidate
-    // at the deployed reference control until multi-setting response evidence exists.
-    GpuFlowAqeCalibration(None, None, None, None, None, None, reference,
-      GpuFlowControlBounds(reference, reference), sampleWindows = 0L)
+    // not the counterfactual response to a different setting. Consumers may use these rates to
+    // compare plan demand, but must price every candidate at the deployed reference control until
+    // multi-setting response evidence exists.
+    GpuFlowAqeCalibration(None, None, reference, sampleWindows = 0L)
   }
 }
 
@@ -183,16 +149,9 @@ private[rapids] class GpuFlowAqeCalibrationAccumulator(
   // A 95% normal confidence boundary is an evidence requirement, not a tuning preference. The
   // reducer rule may only use the fitted intercept when measurement uncertainty excludes zero.
   private val fixedTaskCostConfidenceZ = 1.96
-  private var scanUnitNanos = 0.0
-  private var scanBytes = 0L
-  private var gpuUnitNanos = 0.0
-  private var gpuBytes = 0L
   private var shuffleUnitNanos = 0.0
   private var shuffleBytes = 0L
-  private var broadcastNanos = 0.0
-  private var broadcastBytes = 0L
-  private var batchUnitNanos = 0.0
-  private var batchBytes = 0L
+  private var maxTaskShuffleReadBytes = 0L
   private var regressionWindows = 0L
   private var meanIoBytesPerTask = 0.0
   private var meanNonGpuNanosPerTask = 0.0
@@ -204,25 +163,12 @@ private[rapids] class GpuFlowAqeCalibrationAccumulator(
   private var windows = 0L
 
   def add(sample: GpuFlowCalibrationSample): Unit = {
-    if (sample.scanUnitNanos > 0.0 && sample.scanBytes > 0L) {
-      scanUnitNanos += sample.scanUnitNanos
-      scanBytes += sample.scanBytes
-    }
-    if (sample.gpuUnitNanos > 0.0 && sample.gpuBytes > 0L) {
-      gpuUnitNanos += sample.gpuUnitNanos
-      gpuBytes += sample.gpuBytes
-    }
     if (sample.shuffleUnitNanos > 0.0 && sample.shuffleBytes > 0L) {
       shuffleUnitNanos += sample.shuffleUnitNanos
       shuffleBytes += sample.shuffleBytes
     }
-    if (sample.broadcastNanos > 0.0 && sample.broadcastBytes > 0L) {
-      broadcastNanos += sample.broadcastNanos
-      broadcastBytes += sample.broadcastBytes
-    }
-    if (sample.batchUnitNanos > 0.0 && sample.batchBytes > 0L) {
-      batchUnitNanos += sample.batchUnitNanos
-      batchBytes += sample.batchBytes
+    if (sample.taskShuffleReadBytes > maxTaskShuffleReadBytes) {
+      maxTaskShuffleReadBytes = sample.taskShuffleReadBytes
     }
     if (sample.nonGpuNanos >= 0.0 && sample.ioBytes >= 0L && sample.taskCount > 0L) {
       val ioPerTask = sample.ioBytes.toDouble / sample.taskCount.toDouble
@@ -248,24 +194,20 @@ private[rapids] class GpuFlowAqeCalibrationAccumulator(
   }
 
   def snapshot: GpuFlowAqeCalibration = {
-    val empty = GpuFlowAqeCalibration.empty(constraints)
     val fixedTaskCost = fittedFixedTaskCost
-    empty.copy(
-      scanUnitNanosPerByte = rate(scanUnitNanos, scanBytes),
-      gpuUnitNanosPerByte = rate(gpuUnitNanos, gpuBytes),
-      shuffleUnitNanosPerByte = rate(shuffleUnitNanos, shuffleBytes),
-      broadcastNanosPerByte = rate(broadcastNanos, broadcastBytes),
-      batchUnitNanosPerByte = rate(batchUnitNanos, batchBytes),
+    GpuFlowAqeCalibration.empty(constraints).copy(
+      shuffleUnitNanosPerByte =
+        if (shuffleUnitNanos > 0.0 && shuffleBytes > 0L) {
+          Some(shuffleUnitNanos / shuffleBytes.toDouble)
+        } else None,
       fixedNanosPerTask = fixedTaskCost.estimate,
       sampleWindows = windows,
       fixedNanosPerTaskStandardError = fixedTaskCost.standardError,
       fixedTaskCostSampleWindows = fixedTaskCost.sampleWindows,
       fixedTaskCostReason = fixedTaskCost.reason,
-      fixedTaskCostSource = fixedTaskCost.source)
+      fixedTaskCostSource = fixedTaskCost.source,
+      maxCalibratedTaskShuffleReadBytes = maxTaskShuffleReadBytes)
   }
-
-  private def rate(unitNanos: Double, bytes: Long): Option[Double] =
-    if (unitNanos > 0.0 && bytes > 0L) Some(unitNanos / bytes.toDouble) else None
 
   /**
    * Fit non-GPU time/task = bytes/task * rate + fixed task cost.
@@ -339,75 +281,34 @@ private[rapids] case class GraphStageDecisionRecord(
     sampleTasks: Long,
     currentHintVersion: Long,
     graphCurrentObjectiveNanos: Double,
-    graphSelectedObjectiveNanos: Double,
     predictedCurrentNanos: Double,
-    predictedSelectedNanos: Double,
     durationAdjoint: Double,
     currentControl: GpuFlowControl,
-    selectedControl: GpuFlowControl,
     endToEndGradient: GpuFlowGradient,
     freezeReasons: GraphControlFreezeReasons)
 
-/** Best locally feasible complete hint at one calibrated operating point. */
-private[rapids] case class GraphStageCostAlternative(
-    hint: StageRuntimeHint,
-    predictedNanos: Double,
-    control: Option[GpuFlowControl] = None,
-    localGradient: GpuFlowGradient = GpuFlowGradient())
-
-/** Model-calibrated stage cost curve consumed by the graph-wide decision epoch. */
+/** Model-calibrated stage cost at the measured operating point, one graph epoch input. */
 private[rapids] case class GraphStageCostCurve(
     predictedCurrentNanos: Double,
     sampleTasks: Long,
-    alternatives: Seq[GraphStageCostAlternative],
-    analyticalState: Option[GraphStageAnalyticalState] = None,
-    calibrationSample: Option[GpuFlowCalibrationSample] = None)
+    currentControl: GpuFlowControl,
+    currentGradient: GpuFlowGradient,
+    freezeReasons: GraphControlFreezeReasons,
+    calibrationSample: GpuFlowCalibrationSample)
 
 /**
- * Single owner of initial and updated joint [[StageRuntimeHint]] values.
- *
- * Implementations receive graph lifecycle and raw task observations. They return complete hints;
- * scan, shuffle and batch decisions are never delegated to independent knob policies.
- */
-trait GraphWideAutotuneOptimizer {
-  def initialHint(key: AutotuneStageKey, descriptor: AutotuneStageDescriptor): StageRuntimeHint
-
-  def observe(
-      msg: RapidsAutotuneObservationMsg,
-      current: StageRuntimeHint,
-      nowNanos: Long): Seq[GraphOptimizerDecision]
-
-  def stageSubmitted(key: AutotuneStageKey): Seq[GraphOptimizerDecision]
-
-  def stageCompleted(key: AutotuneStageKey): Seq[GraphOptimizerDecision]
-
-  /** Feed back the version-stamped hint published by the driver endpoint. */
-  def hintPublished(hint: StageRuntimeHint): Unit
-
-  /** Release graph state after a SQL execution ends. */
-  def executionCompleted(executionId: Long): Unit
-
-  /** Drain replay-complete records produced by graph decision epochs. */
-  def drainDecisionRecords(): Seq[GraphStageDecisionRecord] = Seq.empty
-
-  /** Record one finalized Spark task setup cost for execution-local AQE calibration. */
-  def observeTaskSetup(executionId: Long, setupNanos: Long): Unit = {}
-
-  /** Calibrated resource-demand rates for one SQL execution's complete AQE plan evaluation. */
-  def aqeCalibrationSnapshot(executionId: Long): Option[GpuFlowAqeCalibration] = None
-}
-
-/**
- * Driver graph optimizer backed by a constrained analytical stage-cost model.
+ * Driver graph optimizer backed by a constrained analytical stage-cost model. Single owner of
+ * the complete initial joint [[StageRuntimeHint]]; scan, shuffle and batch decisions are never
+ * delegated to independent knob policies.
  *
  * The objective is predicted end-to-end completion of the remaining max-plus Spark DAG,
  * calibrated from measured task elapsed time and resource work. A reverse pass supplies stage
  * criticality and control gradients for eventlog reporting. User configuration and executor
- * clamps define feasibility, not policy; unidentifiable counterfactual controls remain ineligible,
- * so every continuous control is held at its measured operating point.
+ * clamps define feasibility, not policy; unidentifiable counterfactual controls remain
+ * ineligible, so every continuous control is held at its measured operating point and a decision
+ * epoch is reporting-only.
  */
-class AnalyticalGraphWideAutotuneOptimizer(
-    constraints: GraphOptimizerConstraints) extends GraphWideAutotuneOptimizer {
+class AnalyticalGraphWideAutotuneOptimizer(constraints: GraphOptimizerConstraints) {
 
   private case class StageState(
       descriptor: AutotuneStageDescriptor,
@@ -428,7 +329,8 @@ class AnalyticalGraphWideAutotuneOptimizer(
   private val aqeCalibration = mutable.HashMap.empty[Long, GpuFlowAqeCalibrationAccumulator]
   private var nextEpochId = 1L
 
-  override def initialHint(
+  /** Register a graph node and return its complete initial joint hint content. */
+  def initialHint(
       key: AutotuneStageKey,
       descriptor: AutotuneStageDescriptor): StageRuntimeHint = synchronized {
     val content = initialHintContent(key, descriptor.shape)
@@ -438,11 +340,12 @@ class AnalyticalGraphWideAutotuneOptimizer(
     content
   }
 
-  override def observe(
+  /** Ingest one task observation; a completed window records a reporting-only decision epoch. */
+  def observe(
       msg: RapidsAutotuneObservationMsg,
       current: StageRuntimeHint,
-      nowNanos: Long): Seq[GraphOptimizerDecision] = synchronized {
-    stages.get(msg.key).map { state =>
+      nowNanos: Long): Unit = synchronized {
+    stages.get(msg.key).foreach { state =>
       state.currentHint = current
       // Receiving task work is itself authoritative evidence that the stage is active. This also
       // keeps direct unit/integration users correct if a Spark stage-submitted event is delayed.
@@ -450,85 +353,86 @@ class AnalyticalGraphWideAutotuneOptimizer(
         state.active = true
       }
       // A cost calibration is valid only for the complete joint hint that produced its samples.
-      // Tasks from an older version can finish after a re-hint; mixing those observations with the
-      // new candidate would attribute elapsed/resource work to settings the task never used.
-      if (msg.hintVersion != current.version) {
-        return Seq.empty
-      }
-      if (state.windowHintVersion != msg.hintVersion) {
-        state.window = StageObservationAgg.empty
-        state.windowHintVersion = msg.hintVersion
-      }
-      state.window = state.window.merge(msg)
-      state.observedTasks += 1L
-      val enoughSamples = state.window.taskCount >= constraints.minSampleTasks
-      val intervalElapsed = state.lastEvaluationNanos == Long.MinValue ||
-        nowNanos - state.lastEvaluationNanos >= constraints.updateIntervalNanos
-      if (!enoughSamples || !intervalElapsed) {
-        Seq.empty
-      } else {
-        val observation = state.window
-        state.window = StageObservationAgg.empty
-        state.lastEvaluationNanos = nowNanos
-        state.costCurve = AnalyticalStageCostModel.costCurve(
-          observation, current, state.descriptor.shape, constraints)
-        state.costCurve.flatMap(_.calibrationSample).foreach { sample =>
-          aqeCalibration.getOrElseUpdate(msg.key.executionId,
-            new GpuFlowAqeCalibrationAccumulator(constraints)).add(sample)
+      // Tasks from an older version can finish after a re-hint; mixing those observations with
+      // the new candidate would attribute elapsed/resource work to settings the task never used.
+      if (msg.hintVersion == current.version) {
+        if (state.windowHintVersion != msg.hintVersion) {
+          state.window = StageObservationAgg.empty
+          state.windowHintVersion = msg.hintVersion
         }
-        recomputeAllocations("feedback")
+        state.window = state.window.merge(msg)
+        state.observedTasks += 1L
+        val enoughSamples = state.window.taskCount >= constraints.minSampleTasks
+        val intervalElapsed = state.lastEvaluationNanos == Long.MinValue ||
+          nowNanos - state.lastEvaluationNanos >= constraints.updateIntervalNanos
+        if (enoughSamples && intervalElapsed) {
+          val observation = state.window
+          state.window = StageObservationAgg.empty
+          state.lastEvaluationNanos = nowNanos
+          state.costCurve = AnalyticalStageCostModel.costCurve(
+            observation, current, state.descriptor.shape, constraints)
+          state.costCurve.foreach { curve =>
+            aqeCalibration.getOrElseUpdate(msg.key.executionId,
+              new GpuFlowAqeCalibrationAccumulator(constraints)).add(curve.calibrationSample)
+          }
+          recordDecisionEpoch("feedback")
+        }
       }
-    }.getOrElse(Seq.empty)
+    }
   }
 
-  override def stageSubmitted(key: AutotuneStageKey): Seq[GraphOptimizerDecision] = synchronized {
+  def stageSubmitted(key: AutotuneStageKey): Unit = synchronized {
     stages.get(key).foreach { state =>
       state.active = true
       state.completed = false
     }
-    recomputeAllocations("stage-submitted")
+    recordDecisionEpoch("stage-submitted")
   }
 
-  override def stageCompleted(key: AutotuneStageKey): Seq[GraphOptimizerDecision] = synchronized {
+  def stageCompleted(key: AutotuneStageKey): Unit = synchronized {
     stages.get(key).foreach { state =>
       state.active = false
       state.completed = true
     }
-    recomputeAllocations("stage-completed")
+    recordDecisionEpoch("stage-completed")
   }
 
-  override def hintPublished(hint: StageRuntimeHint): Unit = synchronized {
+  /** Feed back the version-stamped hint published by the driver endpoint. */
+  def hintPublished(hint: StageRuntimeHint): Unit = synchronized {
     stages.get(hint.key).foreach(_.currentHint = hint)
   }
 
-  override def executionCompleted(executionId: Long): Unit = synchronized {
+  /** Release graph state after a SQL execution ends. */
+  def executionCompleted(executionId: Long): Unit = synchronized {
     stages.retain { case (key, _) => key.executionId != executionId }
     aqeCalibration.remove(executionId)
   }
 
-  override def observeTaskSetup(executionId: Long, setupNanos: Long): Unit = synchronized {
+  /** Record one finalized Spark task setup cost for execution-local AQE calibration. */
+  def observeTaskSetup(executionId: Long, setupNanos: Long): Unit = synchronized {
     aqeCalibration.getOrElseUpdate(executionId,
       new GpuFlowAqeCalibrationAccumulator(constraints)).addTaskSetupNanos(setupNanos)
   }
 
-  override def drainDecisionRecords(): Seq[GraphStageDecisionRecord] = synchronized {
+  /** Drain replay-complete records produced by graph decision epochs. */
+  def drainDecisionRecords(): Seq[GraphStageDecisionRecord] = synchronized {
     val drained = pendingDecisionRecords.toVector
     pendingDecisionRecords.clear()
     drained
   }
 
-  override def aqeCalibrationSnapshot(
-      executionId: Long): Option[GpuFlowAqeCalibration] = synchronized {
+  /** Calibrated resource-demand rates for one SQL execution's AQE plan decisions. */
+  def aqeCalibrationSnapshot(executionId: Long): Option[GpuFlowAqeCalibration] = synchronized {
     aqeCalibration.get(executionId).map(_.snapshot).filter(_.sampleWindows > 0L)
   }
 
   /**
    * Record one graph-wide decision epoch. Every continuous control is held at its measured
-   * operating point and no shared GPU quota exists anymore, so an epoch is reporting-only: it
-   * evaluates the remaining max-plus graph at the current controls (objective, reverse-mode
-   * criticality, freeze reasons) and never republishes a hint.
+   * operating point, so an epoch is reporting-only: it evaluates the remaining max-plus graph at
+   * the current controls (objective, reverse-mode criticality, freeze reasons) and never
+   * republishes a hint.
    */
-  private def recomputeAllocations(trigger: String): Seq[GraphOptimizerDecision] = {
+  private def recordDecisionEpoch(trigger: String): Unit = {
     val inputs = stages.iterator.map { case (key, state) =>
       GraphStageAllocationInput(
         key = key,
@@ -539,18 +443,9 @@ class AnalyticalGraphWideAutotuneOptimizer(
         currentHint = state.currentHint,
         costCurve = state.costCurve)
     }.toSeq
-    recordDecisionEpoch(trigger, inputs)
-    Seq.empty
-  }
-
-  private def recordDecisionEpoch(
-      trigger: String,
-      inputs: Seq[GraphStageAllocationInput]): Unit = {
     val epochId = nextEpochId
     nextEpochId += 1L
-    val calibrated = inputs.filter { input =>
-      input.active && input.costCurve.exists(_.alternatives.nonEmpty)
-    }
+    val calibrated = inputs.filter(input => input.active && input.costCurve.isDefined)
     val flow = if (calibrated.isEmpty) None else {
       val costs = calibrated.flatMap { input =>
         input.costCurve.map { curve =>
@@ -563,12 +458,11 @@ class AnalyticalGraphWideAutotuneOptimizer(
     inputs.sortBy(input => (input.key.executionId, input.key.stageId, input.key.stageAttemptId))
       .foreach { input =>
         val curve = input.costCurve
-        val analytical = curve.flatMap(_.analyticalState)
-        val currentControl = analytical.map(_.currentControl)
+        val currentControl = curve.map(_.currentControl)
           .getOrElse(AnalyticalStageCostModel.controlFor(input.currentHint))
-        val localGradient = analytical.map(_.currentGradient).getOrElse(GpuFlowGradient())
+        val localGradient = curve.map(_.currentGradient).getOrElse(GpuFlowGradient())
         val adjoint = adjoints.getOrElse(input.key, 0.0)
-        val reasons = analytical.map(_.freezeReasons).getOrElse {
+        val reasons = curve.map(_.freezeReasons).getOrElse {
           val reason = if (input.completed) "completed-work-is-sunk"
           else if (!input.active) "stage-not-active"
           else "no-current-version-calibration"
@@ -585,12 +479,9 @@ class AnalyticalGraphWideAutotuneOptimizer(
           sampleTasks = curve.map(_.sampleTasks).getOrElse(0L),
           currentHintVersion = input.currentHint.version,
           graphCurrentObjectiveNanos = flow.map(_.objectiveNanos).getOrElse(0.0),
-          graphSelectedObjectiveNanos = flow.map(_.objectiveNanos).getOrElse(0.0),
           predictedCurrentNanos = curve.map(_.predictedCurrentNanos).getOrElse(0.0),
-          predictedSelectedNanos = curve.map(_.predictedCurrentNanos).getOrElse(0.0),
           durationAdjoint = adjoint,
           currentControl = currentControl,
-          selectedControl = currentControl,
           endToEndGradient = localGradient.scale(adjoint),
           freezeReasons = reasons)
       }
@@ -614,9 +505,7 @@ class AnalyticalGraphWideAutotuneOptimizer(
         GpuFlowGraphNode(
           key = node.key,
           parents = parents.getOrElse(node.key, Seq.empty),
-          evaluation = GpuFlowStageEvaluation(
-            predictedNanos = costs.getOrElse(node.key, 0.0),
-            gradient = GpuFlowGradient()))
+          durationNanos = costs.getOrElse(node.key, 0.0))
       }
     }.toSeq
     GpuFlowModel.evaluate(nodes)
@@ -656,10 +545,7 @@ class AnalyticalGraphWideAutotuneOptimizer(
     val batchHint = if (constraints.batch.enabled && shape.hasGpuWork) {
       BatchRuntimeHint(
         targetBatchBytes = constraints.batch.initialTargetBytes,
-        maxBatchBytes = constraints.batch.maxBatchBytes,
-        // Preserve the executor's native, pool-derived split threshold until the model selects a
-        // different batch point from observations.
-        splitUntilSize = 0L)
+        maxBatchBytes = constraints.batch.maxBatchBytes)
     } else {
       BatchRuntimeHint.empty
     }
@@ -679,35 +565,9 @@ private[rapids] case class GraphStageAllocationInput(
     currentHint: StageRuntimeHint,
     costCurve: Option[GraphStageCostCurve])
 
-/** Pure constrained optimizer used by [[AnalyticalGraphWideAutotuneOptimizer]]. */
+/** Pure stage-cost calibration used by [[AnalyticalGraphWideAutotuneOptimizer]]. */
 object AnalyticalStageCostModel {
-  def optimize(
-      observation: StageObservationAgg,
-      current: StageRuntimeHint,
-      shape: AutotuneStageShape,
-      constraints: GraphOptimizerConstraints): Option[GraphOptimizerDecision] = {
-    costCurve(observation, current, shape, constraints).flatMap { curve =>
-      val selected = curve.alternatives.reduceLeft { (left, right) =>
-        if (right.predictedNanos < left.predictedNanos ||
-            (right.predictedNanos == left.predictedNanos &&
-              hintResource(right.hint) < hintResource(left.hint))) {
-          right
-        } else {
-          left
-        }
-      }
-      if (sameHintContent(selected.hint, current)) {
-        None
-      } else {
-        Some(GraphOptimizerDecision(
-          selected.hint,
-          predictedCurrentNanos = curve.predictedCurrentNanos,
-          predictedSelectedNanos = selected.predictedNanos))
-      }
-    }
-  }
-
-  /** Build the locally optimized stage-cost curve for every legal fixed GPU quota. */
+  /** Calibrate the stage cost at the measured operating point of one observation window. */
   def costCurve(
       observation: StageObservationAgg,
       current: StageRuntimeHint,
@@ -718,91 +578,34 @@ object AnalyticalStageCostModel {
       return None
     }
 
-    val work = calibrate(observation, current, shape)
-    val currentControl = controlFor(current)
     // A single feedback window supplies one operating point. It can calibrate the work already
-    // performed, but cannot identify any actuator's counterfactual response. Keep every continuous
-    // control at that measured point. Structural AQE parallelism is optimized separately from
-    // measured map sizes and task-wave cost, so it remains eligible without fabricating a response
-    // curve for executor controls.
-    val bounds = GpuFlowControlBounds(currentControl, currentControl)
-    val currentEvaluation = GpuFlowStageModel.evaluate(work, currentControl)
-
-    // The bounds are the single measured operating point, so the only feasible continuous
-    // control is the current one. A response-identified solver replaces this once multiple
-    // operating points exist; guessing a descent direction from one point is what caused the
-    // historical q17 scan/shuffle regressions.
-    val alternatives = Seq(GraphStageCostAlternative(
-      hint = hintForCandidate(
-        current, currentControl, currentControl, constraints.batch.initialSplitUntilSize),
-      predictedNanos = currentEvaluation.predictedNanos,
-      control = Some(currentControl),
-      localGradient = currentEvaluation.gradient))
+    // performed, but cannot identify any actuator's counterfactual response, so every continuous
+    // control stays at that measured point; guessing a descent direction from one point is what
+    // caused the historical q17 scan/shuffle regressions. Structural AQE parallelism is
+    // optimized separately from measured map sizes and task-wave cost.
+    val work = calibrate(observation, current, shape)
+    val evaluation = GpuFlowStageModel.evaluate(work)
     Some(GraphStageCostCurve(
-      predictedCurrentNanos = currentEvaluation.predictedNanos,
+      predictedCurrentNanos = evaluation.predictedNanos,
       sampleTasks = observation.taskCount,
-      alternatives = alternatives,
-      analyticalState = Some(GraphStageAnalyticalState(
-        currentControl = currentControl,
-        currentGradient = currentEvaluation.gradient,
-        bounds = bounds,
-        freezeReasons = freezeReasons(work, currentControl, bounds))),
-      calibrationSample = Some(calibrationSample(observation, shape, work))))
+      currentControl = work.baseline,
+      currentGradient = evaluation.gradient,
+      freezeReasons = freezeReasons(work, work.baseline),
+      calibrationSample = calibrationSample(observation, shape, work)))
   }
-
-  private def hintForCandidate(
-      current: StageRuntimeHint,
-      currentControl: GpuFlowControl,
-      selected: GpuFlowControl,
-      configuredSplitUntilSize: Long): StageRuntimeHint = current.copy(
-    scan = if (current.scan.maxReadWindow > 0) {
-      current.scan.copy(maxReadWindow = selected.scanWindow.toInt)
-    } else current.scan,
-    shuffle = if (isActiveShuffle(current)) {
-      current.shuffle.copy(
-        prefetchWindow = selected.shuffleWindow.toInt,
-        maxReadyBytes = selected.shuffleBytes.toLong,
-        coalesceTargetBytes = selectedCoalesceBytes(current, selected))
-    } else current.shuffle,
-    batch = if (current.batch.targetBatchBytes > 0L &&
-        selected.batchBytes != currentControl.batchBytes) {
-      current.batch.copy(
-        targetBatchBytes = selected.batchBytes.toLong,
-        splitUntilSize = selectedSplitSize(
-          current, selected.batchBytes.toLong, configuredSplitUntilSize))
-    } else current.batch)
-
-  private def sameHintContent(left: StageRuntimeHint, right: StageRuntimeHint): Boolean =
-    left.scan == right.scan &&
-      left.shuffle == right.shuffle && left.batch == right.batch
-
-  private def hintResource(hint: StageRuntimeHint): Double =
-    math.max(0, hint.scan.maxReadWindow).toDouble +
-      math.max(0, hint.shuffle.prefetchWindow).toDouble +
-      math.max(0L, if (hint.shuffle.maxReadyBytes == Long.MaxValue) {
-        0L
-      } else hint.shuffle.maxReadyBytes).toDouble +
-      math.max(0L, hint.batch.targetBatchBytes).toDouble
 
   private def calibrate(
       obs: StageObservationAgg,
       current: StageRuntimeHint,
       shape: AutotuneStageShape): GpuFlowStageWork = {
     val classified = classifyNonGpuWork(obs, shape)
-    val retry = obs.totalRetryOrLostTimeNanos.toDouble
-    // One observation at one batch target cannot distinguish fixed task cost from per-batch
-    // setup. Keep batch response frozen until history contains multiple batch controls; treating
-    // the entire residual as batch work fabricates a derivative and biases AQE operator counts.
-    val batchOverhead = 0.0
     GpuFlowStageWork(
       scanNanos = classified.scanNanos,
       gpuNanos = obs.totalGpuHoldingNanos.toDouble +
         obs.totalGpuSemaphoreWaitNanos.toDouble,
       shuffleNanos = classified.shuffleNanos,
-      batchNanos = batchOverhead,
-      fixedNanos = classified.broadcastNanos +
-        classified.unclassifiedNanos,
-      retryNanos = retry,
+      fixedNanos = classified.unclassifiedNanos,
+      retryNanos = obs.totalRetryOrLostTimeNanos.toDouble,
       baseline = controlFor(current))
   }
 
@@ -811,8 +614,6 @@ object AnalyticalStageCostModel {
       scanBytes: Long,
       shuffleNanos: Double,
       shuffleBytes: Long,
-      broadcastNanos: Double,
-      broadcastBytes: Long,
       unclassifiedNanos: Double)
 
   private def classifyNonGpuWork(
@@ -831,23 +632,20 @@ object AnalyticalStageCostModel {
       observation.totalShuffleReadBytes + observation.totalShuffleWriteBytes
     } else 0L
     // Broadcast exchange build/distribution runs on the driver and is not measured by this task
-    // observation clock. Do not relabel task input/output time as broadcast service time.
-    val broadcastBytes = 0L
-    val classifiedBytes = scanBytes + shuffleBytes + broadcastBytes
+    // observation clock, so no broadcast lane exists here. Driver broadcast service remains
+    // unmeasured until it has its own clock; do not relabel task input/output time as broadcast.
+    val classifiedBytes = scanBytes + shuffleBytes
     def nanos(bytes: Long): Double = {
       if (classifiedBytes > 0L) available * bytes.toDouble / classifiedBytes.toDouble else 0.0
     }
     val scanNanos = nanos(scanBytes)
     val shuffleNanos = nanos(shuffleBytes)
-    val broadcastNanos = nanos(broadcastBytes)
     NonGpuClassification(
       scanNanos,
       scanBytes,
       shuffleNanos,
       shuffleBytes,
-      broadcastNanos,
-      broadcastBytes,
-      math.max(0.0, available - scanNanos - shuffleNanos - broadcastNanos))
+      math.max(0.0, available - scanNanos - shuffleNanos))
   }
 
   private[rapids] def controlFor(hint: StageRuntimeHint): GpuFlowControl = GpuFlowControl(
@@ -861,25 +659,22 @@ object AnalyticalStageCostModel {
 
   private def freezeReasons(
       work: GpuFlowStageWork,
-      current: GpuFlowControl,
-      bounds: GpuFlowControlBounds): GraphControlFreezeReasons = {
-    def reason(value: Double, measuredWork: Double, minimum: Double, maximum: Double): String = {
+      current: GpuFlowControl): GraphControlFreezeReasons = {
+    // A rate measured at one actuator setting identifies work at that operating point only, so a
+    // present actuator with measured work is always frozen as response-unidentified.
+    def reason(value: Double, measuredWork: Double): String = {
       if (value <= 0.0) "actuator-not-present"
       else if (measuredWork <= 0.0) "no-measured-work"
-      else if (maximum <= minimum) "single-operating-point-response-unidentified"
-      else ""
+      else "single-operating-point-response-unidentified"
     }
     GraphControlFreezeReasons(
-      scanWindow = reason(current.scanWindow, work.scanNanos,
-        bounds.minimum.scanWindow, bounds.maximum.scanWindow),
-      gpuTasks = reason(current.gpuTasks, work.gpuNanos,
-        bounds.minimum.gpuTasks, bounds.maximum.gpuTasks),
-      shuffleWindow = reason(current.shuffleWindow, work.shuffleNanos,
-        bounds.minimum.shuffleWindow, bounds.maximum.shuffleWindow),
-      shuffleBytes = reason(current.shuffleBytes, work.shuffleNanos,
-        bounds.minimum.shuffleBytes, bounds.maximum.shuffleBytes),
-      batchBytes = reason(current.batchBytes, work.batchNanos,
-        bounds.minimum.batchBytes, bounds.maximum.batchBytes))
+      scanWindow = reason(current.scanWindow, work.scanNanos),
+      gpuTasks = reason(current.gpuTasks, work.gpuNanos),
+      shuffleWindow = reason(current.shuffleWindow, work.shuffleNanos),
+      shuffleBytes = reason(current.shuffleBytes, work.shuffleNanos),
+      // One observation at one batch target cannot separate per-batch setup from fixed task
+      // cost, so batch work is never measured separately from the residual.
+      batchBytes = reason(current.batchBytes, 0.0))
   }
 
   private def calibrationSample(
@@ -887,25 +682,15 @@ object AnalyticalStageCostModel {
       shape: AutotuneStageShape,
       work: GpuFlowStageWork): GpuFlowCalibrationSample = {
     val classified = classifyNonGpuWork(observation, shape)
-    val processedBytes = Seq(
-      observation.totalInputBytes,
-      observation.totalOutputBytes,
-      classified.shuffleBytes).max
     GpuFlowCalibrationSample(
-      scanUnitNanos = work.scanNanos * work.baseline.scanWindow,
-      scanBytes = classified.scanBytes,
-      gpuUnitNanos = work.gpuNanos * work.baseline.gpuTasks,
-      gpuBytes = processedBytes,
       shuffleUnitNanos = work.shuffleNanos * work.baseline.shuffleWindow *
         work.baseline.shuffleBytes,
       shuffleBytes = classified.shuffleBytes,
-      broadcastNanos = classified.broadcastNanos,
-      broadcastBytes = classified.broadcastBytes,
-      batchUnitNanos = work.batchNanos * work.baseline.batchBytes,
-      batchBytes = processedBytes,
+      taskShuffleReadBytes =
+        observation.totalShuffleReadBytes / math.max(1L, observation.taskCount),
       nonGpuNanos = classified.scanNanos + classified.shuffleNanos +
-        classified.broadcastNanos + classified.unclassifiedNanos,
-      ioBytes = classified.scanBytes + classified.shuffleBytes + classified.broadcastBytes,
+        classified.unclassifiedNanos,
+      ioBytes = classified.scanBytes + classified.shuffleBytes,
       taskCount = observation.taskCount)
   }
 
@@ -923,25 +708,4 @@ object AnalyticalStageCostModel {
 
   private def activeBatchBytes(hint: StageRuntimeHint): Long =
     if (hint.batch.targetBatchBytes > 0L) hint.batch.targetBatchBytes else 0L
-
-  private def selectedCoalesceBytes(
-      current: StageRuntimeHint,
-      selected: GpuFlowControl): Long = {
-    if (current.shuffle.coalesceTargetBytes > 0L && selected.batchBytes > 0L) {
-      selected.batchBytes.toLong
-    } else {
-      current.shuffle.coalesceTargetBytes
-    }
-  }
-
-  private def selectedSplitSize(
-      current: StageRuntimeHint,
-      selectedBatchBytes: Long,
-      configuredSplitUntilSize: Long): Long = {
-    if (configuredSplitUntilSize > 0L) {
-      math.min(current.batch.maxBatchBytes, selectedBatchBytes)
-    } else {
-      current.batch.splitUntilSize
-    }
-  }
 }

@@ -26,55 +26,23 @@ import org.apache.spark.internal.Logging
 /**
  * Executor-local cache of per-stage hints.
  *
- * `get` memoizes the driver response per stage key and refetches it once the cached entry is stale;
- * `fetchHint` is the (RPC) loader. `put` is the driver-push primitive (pre-populate/refresh a hint
- * without a round-trip) for future graph-mode use.
- *
- * An entry is stale when either the hint itself has expired (stage-attempt expiry, carried on the
- * wire as `expiresAtNanos`) OR the entry is older than `fetchTtlNanos`. The fetch TTL is a SEPARATE
- * mechanism from wire expiry: in GRAPH mode the driver republishes higher-version hints mid-query
- * (the Phase 6 closed loop), and the TTL is what makes a long stage's later tasks (and downstream
- * tasks) re-fetch and pick up the newer version. It does not touch `expiresAtNanos`, so the
- * stage-attempt expiry semantics are unchanged. `fetchTtlNanos = 0` disables the TTL (refresh on
- * expiry only),
- * preserving pre-Slice-2 behavior for OBSERVE/LOCAL modes. `nowNanos` is injectable for testing.
+ * `get` memoizes the driver response per stage key; `fetchHint` is the (RPC) loader. A stage
+ * attempt's hint is published once on the driver and released with its SQL execution, so a cached
+ * entry never needs refreshing.
  */
-class AutotuneHintCache(
-    fetchHint: AutotuneStageKey => AutotuneCachedHint,
-    fetchTtlNanos: Long = 0L,
-    nowNanos: () => Long = () => System.nanoTime()) {
-
-  private case class Entry(hint: AutotuneCachedHint, fetchedAtNanos: Long) {
-    def isStale(now: Long): Boolean =
-      hint.isExpired(now) || (fetchTtlNanos > 0L && (now - fetchedAtNanos) >= fetchTtlNanos)
-  }
-
-  private val hints = new ConcurrentHashMap[AutotuneStageKey, Entry]()
+class AutotuneHintCache(fetchHint: AutotuneStageKey => AutotuneCachedHint) {
+  private val hints = new ConcurrentHashMap[AutotuneStageKey, AutotuneCachedHint]()
 
   def get(key: AutotuneStageKey): AutotuneCachedHint = {
-    val now = nowNanos()
     val existing = hints.get(key)
-    if (existing != null && !existing.isStale(now)) {
-      existing.hint
+    if (existing != null) {
+      existing
     } else {
-      val fetched = Entry(fetchHint(key), now)
-      val previous = if (existing == null) {
-        hints.putIfAbsent(key, fetched)
-      } else if (hints.replace(key, existing, fetched)) {
-        null
-      } else {
-        hints.get(key)
-      }
-      if (previous == null) {
-        fetched.hint
-      } else {
-        previous.hint
-      }
+      // Fetch outside any map lock; a racing duplicate fetch is harmless and first-put wins.
+      val fetched = fetchHint(key)
+      val previous = hints.putIfAbsent(key, fetched)
+      if (previous == null) fetched else previous
     }
-  }
-
-  def put(hint: StageRuntimeHint): Unit = {
-    hints.put(hint.key, Entry(AutotuneCachedHint(hint, hasHint = true), nowNanos()))
   }
 
   def clear(): Unit = hints.clear()
@@ -90,13 +58,9 @@ class AutotuneHintCache(
 class RapidsAutotuneExecutorEndpoint(
     pluginContext: PluginContext,
     conf: RapidsConf) extends Logging {
-  private val executorId = pluginContext.executorID()
+  val executorId: String = pluginContext.executorID()
   private val failOpen = conf.autotuneFailOpen
-  // Only the closed-loop modes (GRAPH, OPTIMIZE) republish hints mid-query, so only there does the
-  // cache need a refresh TTL; OBSERVE/LOCAL keep the pre-Slice-2 "refresh on expiry only" behavior.
-  private val fetchTtlNanos =
-    if (conf.isAutotuneClosedLoopMode) conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L else 0L
-  private val cache = new AutotuneHintCache(fetchHintFromDriver, fetchTtlNanos)
+  private val cache = new AutotuneHintCache(fetchHintFromDriver)
 
   def hintFor(key: AutotuneStageKey): AutotuneCachedHint = cache.get(key)
 
@@ -129,56 +93,14 @@ class RapidsAutotuneExecutorEndpoint(
    * Report a runtime observation for a completed task back to the driver (fire-and-forget). Feeds
    * the driver graph optimizer; advisory, so a dropped report never affects correctness.
    */
-  def reportObservation(
-      key: AutotuneStageKey,
-      taskAttemptId: Long,
-      partitionId: Int,
-      hintVersion: Long,
-      gpuSemaphoreWaitNanos: Long,
-      gpuHoldingNanos: Long,
-      hostMemoryBytes: Long,
-      spillBytes: Long,
-      shuffleReadLimiterAcquireCount: Long = 0L,
-      shuffleReadLimiterAcquireFailCount: Long = 0L,
-      taskDurationNanos: Long = 0L,
-      inputBytes: Long = 0L,
-      outputBytes: Long = 0L,
-      shuffleReadBytes: Long = 0L,
-      shuffleWriteBytes: Long = 0L,
-      inputRows: Long = 0L,
-      outputRows: Long = 0L,
-      pinnedMemoryBytes: Long = 0L,
-      deviceMemoryBytes: Long = 0L,
-      retryOrLostTimeNanos: Long = 0L): Unit = {
+  def reportObservation(msg: RapidsAutotuneObservationMsg): Unit = {
     try {
-      pluginContext.send(RapidsAutotuneObservationMsg(
-        executorId = executorId,
-        key = key,
-        taskAttemptId = taskAttemptId,
-        partitionId = partitionId,
-        hintVersion = hintVersion,
-        gpuSemaphoreWaitNanos = gpuSemaphoreWaitNanos,
-        gpuHoldingNanos = gpuHoldingNanos,
-        hostMemoryBytes = hostMemoryBytes,
-        spillBytes = spillBytes,
-        shuffleReadLimiterAcquireCount = shuffleReadLimiterAcquireCount,
-        shuffleReadLimiterAcquireFailCount = shuffleReadLimiterAcquireFailCount,
-        taskDurationNanos = taskDurationNanos,
-        inputBytes = inputBytes,
-        outputBytes = outputBytes,
-        shuffleReadBytes = shuffleReadBytes,
-        shuffleWriteBytes = shuffleWriteBytes,
-        inputRows = inputRows,
-        outputRows = outputRows,
-        pinnedMemoryBytes = pinnedMemoryBytes,
-        deviceMemoryBytes = deviceMemoryBytes,
-        retryOrLostTimeNanos = retryOrLostTimeNanos))
+      pluginContext.send(msg)
     } catch {
       case NonFatal(e) if failOpen =>
         logWarning("Failed to report RAPIDS graph autotune observation; continuing", e)
     }
   }
-
 
   def shutdown(): Unit = cache.clear()
 

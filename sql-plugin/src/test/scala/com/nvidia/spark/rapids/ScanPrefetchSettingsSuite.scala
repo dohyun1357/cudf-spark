@@ -16,8 +16,6 @@
 
 package com.nvidia.spark.rapids
 
-import java.util.concurrent.TimeUnit
-
 import org.apache.hadoop.conf.Configuration
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -58,7 +56,7 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
       RapidsConf.SCAN_PREFETCH_MAX_PARALLELISM.key -> "3",
       RapidsConf.SCAN_PREFETCH_MIN_SCAN_FILES.key -> "2",
       RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> "local",
+      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> "graph",
       RapidsConf.AUTOTUNE_SCAN_MAX_READ_WINDOW.key -> "4",
       RapidsConf.AUTOTUNE_SCAN_MAX_READY_BYTES.key -> "16m",
       RapidsConf.AUTOTUNE_FAIL_OPEN.key -> "true"))
@@ -66,9 +64,11 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
     assert(conf.scanPrefetchMaxParallelism == 3)
     assert(conf.scanPrefetchMinScanFiles == 2)
     assert(conf.autotuneGraphEnabled)
-    assert(conf.autotuneGraphMode == AutotuneGraphMode.LOCAL)
-    assert(conf.isAutotuneLocalMode)
+    assert(conf.autotuneGraphMode == AutotuneGraphMode.GRAPH)
+    assert(conf.isAutotuneGraphMode && conf.isAutotuneClosedLoopMode)
     assert(conf.autotuneScanMaxReadWindow == 4)
+    // The effective cap is the tighter of the autotune and general prefetch caps.
+    assert(conf.autotuneScanReadWindowCap == 3)
     assert(conf.autotuneScanMaxReadyBytes == 16L * 1024L * 1024L)
     assert(conf.autotuneFailOpen)
 
@@ -96,22 +96,7 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
     val settings = ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed = 4,
       inputFileCount = 10)
     assert(!settings.enabled)
-    assert(settings.initialWindow == 2)
-    assert(settings.maxWindow == 2)
-  }
-
-  test("scan read window settings honor initial and max caps when enabled") {
-    val conf = new Configuration(false)
-    conf.setBoolean(ScanReadWindowSettings.ENABLED_KEY, true)
-    conf.setInt(ScanReadWindowSettings.INITIAL_WINDOW_KEY, 2)
-    conf.setInt(ScanReadWindowSettings.MAX_WINDOW_KEY, 8)
-    conf.setLong(ScanReadWindowSettings.MAX_READY_BYTES_KEY, 1024L)
-    val settings = ScanReadWindowSettings.fromConf(conf, maxNumFileProcessed = 4,
-      inputFileCount = 3)
-    assert(settings.enabled)
-    assert(settings.initialWindow == 2)
-    assert(settings.maxWindow == 3)
-    assert(settings.maxReadyBytes == 1024L)
+    assert(settings.readWindow == 2)
   }
 
   test("scan read window settings honor graph scan hint caps") {
@@ -123,12 +108,7 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
     val settings = ScanReadWindowSettings.fromHint(
       hint, maxReadWindowCap = 4, inputFileCount = 3)
 
-    assert(settings.contains(ScanReadWindowSettings(
-      enabled = true,
-      initialWindow = 3,
-      maxWindow = 3,
-      maxReadyBytes = 1024L,
-      adaptive = false)))
+    assert(settings.contains(ScanReadWindowSettings(enabled = true, readWindow = 3)))
 
     assert(ScanReadWindowSettings.fromHint(
       hint.copy(maxReadWindow = 0), maxReadWindowCap = 4, inputFileCount = 3).isEmpty)
@@ -138,78 +118,27 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
       hint, maxReadWindowCap = 4, inputFileCount = 0).isEmpty)
   }
 
-  test("scan read window controller increases on consumer read wait") {
-    val settings = ScanReadWindowSettings(
-      enabled = true,
-      initialWindow = 1,
-      maxWindow = 3,
-      maxReadyBytes = Long.MaxValue)
-    val controller = new ScanReadWindowController(settings)
-    controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
-    assert(controller.currentReadWindow == 2)
-    controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
-    assert(controller.currentReadWindow == 3)
-    controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
-    assert(controller.currentReadWindow == 3)
-  }
-
   test("graph scan hints apply a fixed optimizer-selected target") {
     val settings = ScanReadWindowSettings.fromHint(
       ScanRuntimeHint(true, minReadWindow = 1, maxReadWindow = 8, maxReadyBytes = 1024L),
       maxReadWindowCap = 8,
       inputFileCount = 6).get
     val controller = new ScanReadWindowController(settings)
-    assert(controller.currentReadWindow == 6)
-    controller.observeReadWait(
-      bufferWaitNs = TimeUnit.MILLISECONDS.toNanos(10),
-      bufferGpuIdleNs = 10L,
-      scheduleWaitNs = 0L,
-      hostBytesAllocated = 0L)
-    assert(controller.currentReadWindow == 6)
-    controller.observeReadWait(
-      bufferWaitNs = 0L,
-      bufferGpuIdleNs = 0L,
-      scheduleWaitNs = 10L,
-      hostBytesAllocated = Long.MaxValue)
-    assert(controller.currentReadWindow == 6)
+    assert(controller.enabled)
+    assert(controller.readWindow == 6)
   }
 
-  test("scan read window controller decreases on memory or schedule pressure") {
-    val settings = ScanReadWindowSettings(
-      enabled = true,
-      initialWindow = 4,
-      maxWindow = 8,
-      maxReadyBytes = 100L)
-    val controller = new ScanReadWindowController(settings)
-    controller.observeReadWait(0L, 0L, 0L, 101L)
-    assert(controller.currentReadWindow == 2)
-    controller.observeReadWait(1L, 0L, 2L, 0L)
-    assert(controller.currentReadWindow == 1)
-  }
-
-  test("scan read window controller records decision metrics") {
+  test("scan read window controller records queue-depth evidence metrics") {
     val metricKeys = Seq(
-      GpuMetric.SCAN_READ_WINDOW_INITIAL,
-      GpuMetric.SCAN_READ_WINDOW_CURRENT,
-      GpuMetric.SCAN_READ_WINDOW_MAX,
+      GpuMetric.SCAN_READ_WINDOW,
       GpuMetric.SCAN_READ_IN_FLIGHT_MAX,
       GpuMetric.SCAN_READ_READY_MAX,
-      GpuMetric.SCAN_READ_BACKLOG_MAX,
-      GpuMetric.SCAN_READ_WINDOW_INCREASES,
-      GpuMetric.SCAN_READ_WINDOW_DECREASES,
-      GpuMetric.SCAN_READ_WINDOW_MEMORY_DECREASES,
-      GpuMetric.SCAN_READ_WINDOW_SCHEDULE_DECREASES)
+      GpuMetric.SCAN_READ_BACKLOG_MAX)
     val metrics = metricKeys.map(_ -> new LocalGpuMetric()).toMap
-    val settings = ScanReadWindowSettings(
-      enabled = true,
-      initialWindow = 1,
-      maxWindow = 4,
-      maxReadyBytes = 100L)
+    val settings = ScanReadWindowSettings(enabled = true, readWindow = 4)
     val controller = new ScanReadWindowController(settings, metrics)
 
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_INITIAL).value == 1)
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_CURRENT).value == 1)
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_MAX).value == 1)
+    assert(metrics(GpuMetric.SCAN_READ_WINDOW).value == 4)
 
     controller.observeReadQueue(inFlightReadTasks = 2, readyReadTasks = 1,
       backlogReadTasks = 5)
@@ -218,35 +147,16 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
     assert(metrics(GpuMetric.SCAN_READ_IN_FLIGHT_MAX).value == 2)
     assert(metrics(GpuMetric.SCAN_READ_READY_MAX).value == 3)
     assert(metrics(GpuMetric.SCAN_READ_BACKLOG_MAX).value == 5)
-
-    controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
-    assert(controller.currentReadWindow == 2)
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_CURRENT).value == 2)
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_MAX).value == 2)
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_INCREASES).value == 1)
-
-    controller.observeReadWait(0L, 0L, 1L, 101L)
-    assert(controller.currentReadWindow == 1)
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_CURRENT).value == 1)
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_DECREASES).value == 1)
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_MEMORY_DECREASES).value == 1)
-    assert(metrics(GpuMetric.SCAN_READ_WINDOW_SCHEDULE_DECREASES).value == 1)
   }
 
-  test("disabled scan read window controller does not record decision metrics") {
+  test("disabled scan read window controller does not record metrics") {
     val metricKeys = Seq(
-      GpuMetric.SCAN_READ_WINDOW_INITIAL,
-      GpuMetric.SCAN_READ_WINDOW_CURRENT,
-      GpuMetric.SCAN_READ_WINDOW_MAX,
+      GpuMetric.SCAN_READ_WINDOW,
       GpuMetric.SCAN_READ_IN_FLIGHT_MAX,
       GpuMetric.SCAN_READ_READY_MAX,
       GpuMetric.SCAN_READ_BACKLOG_MAX)
     val metrics = metricKeys.map(_ -> new LocalGpuMetric()).toMap
-    val settings = ScanReadWindowSettings(
-      enabled = false,
-      initialWindow = 4,
-      maxWindow = 4,
-      maxReadyBytes = Long.MaxValue)
+    val settings = ScanReadWindowSettings(enabled = false, readWindow = 4)
     val controller = new ScanReadWindowController(settings, metrics)
 
     controller.observeReadQueue(inFlightReadTasks = 2, readyReadTasks = 1,
@@ -266,43 +176,10 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
     assert(!settings.enabled)
     val controller = new ScanReadWindowController(settings)
     assert(!controller.enabled)
-    assert(controller.initialReadWindow == 4)
-    assert(controller.currentReadWindow == 4)
+    assert(controller.readWindow == 4)
 
     val fewerFiles = ScanReadWindowSettings.fromConf(
       conf, maxNumFileProcessed = 4, inputFileCount = 3)
-    assert(new ScanReadWindowController(fewerFiles).initialReadWindow == 3)
-  }
-
-  test("scan read window controller cools down after a decrease before re-increasing") {
-    val settings = ScanReadWindowSettings(
-      enabled = true,
-      initialWindow = 4,
-      maxWindow = 8,
-      maxReadyBytes = 100L)
-    val controller = new ScanReadWindowController(settings)
-
-    // Memory pressure halves the window and arms a one-read cooldown.
-    controller.observeReadWait(0L, 0L, 0L, 101L)
-    assert(controller.currentReadWindow == 2)
-    // The next observation is an increase signal but is swallowed by the cooldown.
-    controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
-    assert(controller.currentReadWindow == 2)
-    // Cooldown elapsed: the window can grow again.
-    controller.observeReadWait(TimeUnit.MILLISECONDS.toNanos(2), 0L, 0L, 0L)
-    assert(controller.currentReadWindow == 3)
-  }
-
-  test("scan read window controller increases on GPU-idle wait without buffer wait") {
-    val settings = ScanReadWindowSettings(
-      enabled = true,
-      initialWindow = 1,
-      maxWindow = 3,
-      maxReadyBytes = Long.MaxValue)
-    val controller = new ScanReadWindowController(settings)
-
-    controller.observeReadWait(bufferWaitNs = 0L, bufferGpuIdleNs = 5L, scheduleWaitNs = 0L,
-      hostBytesAllocated = 0L)
-    assert(controller.currentReadWindow == 2)
+    assert(new ScanReadWindowController(fewerFiles).readWindow == 3)
   }
 }

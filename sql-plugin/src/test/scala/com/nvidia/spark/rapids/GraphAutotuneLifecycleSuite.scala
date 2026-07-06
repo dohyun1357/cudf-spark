@@ -26,8 +26,8 @@ class GraphAutotuneLifecycleSuite extends AnyFunSuite {
     val otherKey = key.copy(executionId = key.executionId + 1, stageId = 4)
     RapidsAutotuneDriverEndpoint.init(null, conf)
     try {
-      val first = RapidsAutotuneDriverEndpoint.publishDefaultNoopHint(key)
-      val other = RapidsAutotuneDriverEndpoint.publishDefaultNoopHint(otherKey)
+      val first = RapidsAutotuneDriverEndpoint.publishStageHint(key, ScanRuntimeHint.empty)
+      val other = RapidsAutotuneDriverEndpoint.publishStageHint(otherKey, ScanRuntimeHint.empty)
       RapidsAutotuneDriverEndpoint.handleObservation(
         RapidsAutotuneObservationMsg(
           executorId = "exec-1",
@@ -39,10 +39,8 @@ class GraphAutotuneLifecycleSuite extends AnyFunSuite {
           gpuHoldingNanos = 2L,
           hostMemoryBytes = 3L))
 
-      assert(RapidsAutotuneDriverEndpoint.observationFor(key).nonEmpty)
       RapidsAutotuneDriverEndpoint.executionCompleted(key.executionId)
 
-      assert(RapidsAutotuneDriverEndpoint.observationFor(key).isEmpty)
       assert(RapidsAutotuneDriverEndpoint.handleHintRequest(
         RapidsAutotuneHintRequestMsg("exec-1", key)).hint.isEmpty)
       assert(RapidsAutotuneDriverEndpoint.handleHintRequest(

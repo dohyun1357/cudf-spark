@@ -22,24 +22,18 @@ class GpuFlowAqeParallelismSuite extends AnyFunSuite {
   private val constraints = GraphOptimizerConstraints(
     minSampleTasks = 1L,
     updateIntervalNanos = 0L,
-    scan = ScanOptimizerBounds(false, 0, 0, 0L),
-    shuffle = ShuffleOptimizerBounds(false, 0, 0, 0L, 0L, 0L),
-    batch = BatchOptimizerBounds(false, 0L, 0L, 0L))
+    scan = ScanOptimizerBounds(false, 0, 0L),
+    shuffle = ShuffleOptimizerBounds(false, 0, 0L, 0L),
+    batch = BatchOptimizerBounds(false, 0L, 0L))
 
   private def calibrationSample(
       nonGpuNanos: Double,
       ioBytes: Long,
-      tasks: Long): GpuFlowCalibrationSample = GpuFlowCalibrationSample(
-    scanUnitNanos = 0.0,
-    scanBytes = 0L,
-    gpuUnitNanos = 0.0,
-    gpuBytes = 0L,
+      tasks: Long,
+      taskShuffleReadBytes: Long = 0L): GpuFlowCalibrationSample = GpuFlowCalibrationSample(
     shuffleUnitNanos = 0.0,
     shuffleBytes = 0L,
-    broadcastNanos = 0.0,
-    broadcastBytes = 0L,
-    batchUnitNanos = 0.0,
-    batchBytes = 0L,
+    taskShuffleReadBytes = taskShuffleReadBytes,
     nonGpuNanos = nonGpuNanos,
     ioBytes = ioBytes,
     taskCount = tasks)
@@ -81,6 +75,35 @@ class GpuFlowAqeParallelismSuite extends AnyFunSuite {
 
     assert(selected.ranges.map(range =>
       (range.startReducerIndex, range.endReducerIndex)) == current)
+  }
+
+  test("ranges beyond the identified byte region are never selected") {
+    val bytes = Seq.fill(8)(10L)
+    val current = bytes.indices.map(index => (index, index + 1))
+    // Balanced 4-range layouts carry 20 bytes per range; a 10-byte region excludes them, so the
+    // wave-cheaper coalesce is rejected and the current identity layout is retained.
+    val capped = GpuFlowPartitionOptimizer.optimize(
+      bytes, current, taskSlots = 4, variableNanosPerByte = 1.0,
+      fixedNanosPerTask = 100.0, maxPartitions = 8, maxRangeBytes = 10L).get
+    val uncapped = GpuFlowPartitionOptimizer.optimize(
+      bytes, current, taskSlots = 4, variableNanosPerByte = 1.0,
+      fixedNanosPerTask = 100.0, maxPartitions = 8).get
+
+    assert(uncapped.ranges.size == 4)
+    assert(capped.ranges.size == 8)
+    assert(capped.ranges.map(range =>
+      (range.startReducerIndex, range.endReducerIndex)) == current)
+  }
+
+  test("calibration snapshot carries the largest observed per-task shuffle-read load") {
+    val accumulator = new GpuFlowAqeCalibrationAccumulator(constraints)
+    accumulator.add(calibrationSample(1000.0, 100L, 10L, taskShuffleReadBytes = 64L))
+    accumulator.add(calibrationSample(1000.0, 100L, 10L, taskShuffleReadBytes = 256L))
+    accumulator.add(calibrationSample(1000.0, 100L, 10L, taskShuffleReadBytes = 128L))
+
+    assert(accumulator.snapshot.maxCalibratedTaskShuffleReadBytes == 256L)
+    assert(new GpuFlowAqeCalibrationAccumulator(constraints)
+      .snapshot.maxCalibratedTaskShuffleReadBytes == 0L)
   }
 
   test("parallelism solve can freeze candidates above Spark's current layout") {

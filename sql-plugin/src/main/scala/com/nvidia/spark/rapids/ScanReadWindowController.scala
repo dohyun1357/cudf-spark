@@ -16,12 +16,8 @@
 
 package com.nvidia.spark.rapids
 
-import java.util.concurrent.TimeUnit
-
 import com.nvidia.spark.rapids.GpuMetric._
 import org.apache.hadoop.conf.Configuration
-
-import org.apache.spark.internal.Logging
 
 /**
  * Executor-local scan read-window actuator for the graph-wide autotuner.
@@ -31,15 +27,15 @@ import org.apache.spark.internal.Logging
  * area is easy to find and evolve. Three pieces:
  *
  *   - [[ScanPrefetchSettings]]: the eager-prefetch Hadoop-conf keys and the initial-fanout
- *     computation shared by the Parquet/ORC/Avro cloud readers (Phase 1.5 general prefetch).
- *   - [[ScanReadWindowSettings]]: the resolved, bounded read-window envelope a reader runs under,
- *     built either from Hadoop conf ([[ScanReadWindowSettings.fromConf]], LOCAL mode) or from a
- *     driver [[ScanRuntimeHint]] ([[ScanReadWindowSettings.fromHint]], GRAPH mode).
- *   - [[ScanReadWindowController]]: the per-reader actuator. LOCAL mode retains its AIMD behavior;
- *     GRAPH/OPTIMIZE tasks apply the optimizer's selected window directly and only record metrics.
+ *     computation shared by the Parquet/ORC/Avro cloud readers.
+ *   - [[ScanReadWindowSettings]]: the resolved read window a reader runs under, either the
+ *     pre-existing static fanout ([[ScanReadWindowSettings.fromConf]]) or a driver
+ *     [[ScanRuntimeHint]] ([[ScanReadWindowSettings.fromHint]], GRAPH/OPTIMIZE modes).
+ *   - [[ScanReadWindowController]]: applies the fixed selected window and records queue-depth
+ *     evidence metrics. The driver optimizer owns tuning; no executor-local tuner exists.
  *
- * The whole feature is default-off: when disabled the settings collapse to the pre-existing static
- * fanout and the controller is inert, so reader behavior is unchanged.
+ * The whole feature is default-off: without a hint the settings collapse to the pre-existing
+ * static fanout and the controller is inert, so reader behavior is unchanged.
  */
 object ScanPrefetchSettings {
   val ENABLED_KEY = "rapids.sql.scan.prefetch"
@@ -60,74 +56,34 @@ object ScanPrefetchSettings {
 }
 
 /**
- * Resolved read-window envelope for a single multi-file reader.
- *
- * When `enabled` is false the controller is inert and only `initialWindow` is consulted (as the
- * static initial fanout); `maxWindow`/`maxReadyBytes` are ignored. See
- * [[ScanReadWindowSettings.disabled]] for the all-zero inert instance and
- * [[ScanReadWindowSettings.fromConf]] for the fanout-preserving disabled instance used by the
- * cloud reader.
+ * Resolved read window for a single multi-file reader. When `enabled` is false the controller is
+ * inert and `readWindow` is the pre-existing static initial fanout.
  */
 case class ScanReadWindowSettings(
     enabled: Boolean,
-    initialWindow: Int,
-    maxWindow: Int,
-    maxReadyBytes: Long,
-    adaptive: Boolean = true)
+    readWindow: Int)
 
 object ScanReadWindowSettings {
-  val ENABLED_KEY = "rapids.sql.autotune.scan.readWindow.enabled"
-  val INITIAL_WINDOW_KEY = "rapids.sql.autotune.scan.readWindow.initial"
-  val MAX_WINDOW_KEY = "rapids.sql.autotune.scan.readWindow.max"
-  val MAX_READY_BYTES_KEY = "rapids.sql.autotune.scan.maxReadyBytes"
-
   val MIN_WINDOW = 1
 
-  /**
-   * Inert all-zero settings. Used as the no-hint fallback for the coalescing reader, which never
-   * reads the window values while disabled. The cloud reader instead uses [[fromConf]], which
-   * preserves the static initial fanout it consults unconditionally.
-   */
-  val disabled: ScanReadWindowSettings =
-    ScanReadWindowSettings(enabled = false, initialWindow = 0, maxWindow = 0,
-      maxReadyBytes = Long.MaxValue)
+  /** Inert all-zero settings for readers that consult the window only when enabled. */
+  val disabled: ScanReadWindowSettings = ScanReadWindowSettings(enabled = false, readWindow = 0)
 
-  private def positiveOrElse(value: Int, fallback: Int): Int =
-    if (value > 0) value else fallback
-
-  private def positiveLongOrElse(value: Long, fallback: Long): Long =
-    if (value > 0) value else fallback
-
+  /** Inert settings preserving the reader's static initial fanout as the window. */
   def fromConf(
       conf: Configuration,
       maxNumFileProcessed: Int,
       inputFileCount: Int): ScanReadWindowSettings = {
-    val existingInitialFanout =
-      ScanPrefetchSettings.initialFanout(conf, maxNumFileProcessed, inputFileCount)
-    if (!conf.getBoolean(ENABLED_KEY, false)) {
-      ScanReadWindowSettings(
-        enabled = false,
-        initialWindow = existingInitialFanout,
-        maxWindow = existingInitialFanout,
-        maxReadyBytes = Long.MaxValue)
-    } else {
-      val configuredMaxWindow =
-        positiveOrElse(conf.getInt(MAX_WINDOW_KEY, maxNumFileProcessed), maxNumFileProcessed)
-      val maxWindow = Seq(maxNumFileProcessed, inputFileCount, configuredMaxWindow).min
-      val configuredInitial =
-        positiveOrElse(conf.getInt(INITIAL_WINDOW_KEY, MIN_WINDOW), MIN_WINDOW)
-      val initialWindow =
-        if (maxWindow > 0) math.min(math.max(configuredInitial, MIN_WINDOW), maxWindow) else 0
-      val maxReadyBytes =
-        positiveLongOrElse(conf.getLong(MAX_READY_BYTES_KEY, Long.MaxValue), Long.MaxValue)
-      ScanReadWindowSettings(
-        enabled = true,
-        initialWindow = initialWindow,
-        maxWindow = maxWindow,
-        maxReadyBytes = maxReadyBytes)
-    }
+    ScanReadWindowSettings(
+      enabled = false,
+      readWindow = ScanPrefetchSettings.initialFanout(conf, maxNumFileProcessed, inputFileCount))
   }
 
+  /**
+   * The optimizer-selected fixed read window for this task, bounded by the static cap and the
+   * input file count. In graph modes `maxReadWindow` is the optimizer-selected target, not an
+   * envelope for a second executor-local tuner; it applies immediately.
+   */
   def fromHint(
       hint: ScanRuntimeHint,
       maxReadWindowCap: Int,
@@ -135,81 +91,46 @@ object ScanReadWindowSettings {
     if (hint.maxReadWindow <= 0 || maxReadWindowCap <= 0 || inputFileCount <= 0) {
       None
     } else {
-      val maxWindow = Seq(maxReadWindowCap, inputFileCount, hint.maxReadWindow).min
-      val maxReadyBytes =
-        positiveLongOrElse(hint.maxReadyBytes, Long.MaxValue)
       Some(ScanReadWindowSettings(
         enabled = true,
-        // In graph modes maxReadWindow is the optimizer-selected target, not an envelope for a
-        // second executor-local tuner. Apply it immediately for this task.
-        initialWindow = maxWindow,
-        maxWindow = maxWindow,
-        maxReadyBytes = maxReadyBytes,
-        adaptive = false))
+        readWindow = Seq(maxReadWindowCap, inputFileCount, hint.maxReadWindow).min))
     }
   }
 }
 
 /**
- * Per-reader actuator for the scan read window.
- *
- * LOCAL mode feeds it consumer-side signals ([[observeReadWait]]) and uses its historical AIMD
- * behavior. GRAPH/OPTIMIZE settings have `adaptive=false`: the driver optimizer owns tuning, and
- * this class applies the selected fixed target while continuing to record queue-depth evidence.
+ * Per-reader application of the scan read window plus queue-depth evidence.
  *
  * Threading: a controller instance is owned by one reader and only touched from that reader's
  * task thread (the async read runners never call back in), so its mutable `var`s need no locking.
  *
- * Metric note: the gauge-style metrics (initial/current/max, in-flight/ready/backlog max) are
- * written as per-task absolute values into Spark SUM accumulators via [[updateMetricValue]]. Spark
- * sums each task's final value across the tasks of a scan node, so the per-node value shown in the
+ * Metric note: the gauge-style metrics (window, in-flight/ready/backlog max) are written as
+ * per-task absolute values into Spark SUM accumulators via [[updateMetricValue]]. Spark sums each
+ * task's final value across the tasks of a scan node, so the per-node value shown in the
  * UI/eventlog is the sum of per-task values (sum-of-per-task-maxima for the *_MAX family), not a
- * global gauge/max. The increase/decrease metrics are true counters and sum correctly. Offline
- * tooling (`performance/autotuner`) re-aggregates these per scan.
+ * global gauge/max. Offline tooling (`performance/autotuner`) re-aggregates these per scan.
  */
 class ScanReadWindowController(
     settings: ScanReadWindowSettings,
-    metrics: Map[String, GpuMetric] = Map.empty) extends Logging {
-  private val MIN_WAIT_NS_FOR_INCREASE = TimeUnit.MILLISECONDS.toNanos(1)
-
-  private var readWindow = settings.initialWindow
-  private var increaseCooldownReads = 0
-  private var maxObservedReadWindow = 0
+    metrics: Map[String, GpuMetric] = Map.empty) {
   private var maxObservedInFlightReads = 0
   private var maxObservedReadyReads = 0
   private var maxObservedBacklogReads = 0
 
-  private val readWindowInitialMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_INITIAL, NoopMetric)
-  private val readWindowCurrentMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_CURRENT, NoopMetric)
-  private val readWindowMaxMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_MAX, NoopMetric)
   private val inFlightReadMaxMetric =
     metrics.getOrElse(SCAN_READ_IN_FLIGHT_MAX, NoopMetric)
   private val readyReadMaxMetric =
     metrics.getOrElse(SCAN_READ_READY_MAX, NoopMetric)
   private val backlogReadMaxMetric =
     metrics.getOrElse(SCAN_READ_BACKLOG_MAX, NoopMetric)
-  private val readWindowIncreaseMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_INCREASES, NoopMetric)
-  private val readWindowDecreaseMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_DECREASES, NoopMetric)
-  private val readWindowMemoryDecreaseMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_MEMORY_DECREASES, NoopMetric)
-  private val readWindowScheduleDecreaseMetric =
-    metrics.getOrElse(SCAN_READ_WINDOW_SCHEDULE_DECREASES, NoopMetric)
 
   if (settings.enabled) {
-    updateMetricValue(readWindowInitialMetric, readWindow)
-    recordCurrentReadWindow()
+    updateMetricValue(metrics.getOrElse(SCAN_READ_WINDOW, NoopMetric), settings.readWindow)
   }
 
   def enabled: Boolean = settings.enabled
 
-  def initialReadWindow: Int = readWindow
-
-  def currentReadWindow: Int = readWindow
+  def readWindow: Int = settings.readWindow
 
   def observeReadQueue(
       inFlightReadTasks: Int,
@@ -224,56 +145,6 @@ class ScanReadWindowController(
       readyReadMaxMetric, maxObservedReadyReads, readyReadTasks)
     maxObservedBacklogReads = setMaxMetric(
       backlogReadMaxMetric, maxObservedBacklogReads, backlogReadTasks)
-  }
-
-  def observeReadWait(
-      bufferWaitNs: Long,
-      bufferGpuIdleNs: Long,
-      scheduleWaitNs: Long,
-      hostBytesAllocated: Long): Unit = {
-    if (!settings.enabled || !settings.adaptive || settings.maxWindow <= 0) {
-      return
-    }
-
-    val memoryPressureHigh = hostBytesAllocated > settings.maxReadyBytes
-    val scheduleWaitHigh = scheduleWaitNs > bufferWaitNs && scheduleWaitNs > 0
-    if (memoryPressureHigh || scheduleWaitHigh) {
-      // Multiplicative decrease. At the floor (readWindow == MIN_WINDOW) the window cannot shrink
-      // further, so the decrease block (and its post-decrease cooldown) is intentionally skipped;
-      // the controller may re-grow on the next non-pressure observation.
-      val nextWindow = math.max(ScanReadWindowSettings.MIN_WINDOW, readWindow / 2)
-      if (nextWindow < readWindow) {
-        logDebug(s"decrease scan read window from $readWindow to $nextWindow " +
-          s"(hostBytes=$hostBytesAllocated, maxReadyBytes=${settings.maxReadyBytes}, " +
-          s"bufferWaitNs=$bufferWaitNs, scheduleWaitNs=$scheduleWaitNs)")
-        readWindow = nextWindow
-        readWindowDecreaseMetric += 1
-        if (memoryPressureHigh) {
-          readWindowMemoryDecreaseMetric += 1
-        }
-        if (scheduleWaitHigh) {
-          readWindowScheduleDecreaseMetric += 1
-        }
-        recordCurrentReadWindow()
-        increaseCooldownReads = 1
-      }
-    } else if (increaseCooldownReads > 0) {
-      increaseCooldownReads -= 1
-    } else if (readWindow < settings.maxWindow &&
-        (bufferWaitNs >= MIN_WAIT_NS_FOR_INCREASE || bufferGpuIdleNs > 0)) {
-      val nextWindow = readWindow + 1
-      logDebug(s"increase scan read window from $readWindow to $nextWindow " +
-        s"(bufferWaitNs=$bufferWaitNs, bufferGpuIdleNs=$bufferGpuIdleNs)")
-      readWindow = nextWindow
-      readWindowIncreaseMetric += 1
-      recordCurrentReadWindow()
-    }
-  }
-
-  private def recordCurrentReadWindow(): Unit = {
-    updateMetricValue(readWindowCurrentMetric, readWindow)
-    maxObservedReadWindow = setMaxMetric(
-      readWindowMaxMetric, maxObservedReadWindow, readWindow)
   }
 
   private def setMaxMetric(metric: GpuMetric, currentMax: Int, observed: Int): Int = {
