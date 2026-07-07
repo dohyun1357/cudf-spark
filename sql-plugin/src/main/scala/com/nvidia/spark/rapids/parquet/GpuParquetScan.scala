@@ -22,6 +22,7 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.channels.SeekableByteChannel
 import java.nio.charset.StandardCharsets
 import java.util.{Collections, Locale}
+import java.util.concurrent.{Callable, ExecutionException}
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
@@ -38,7 +39,7 @@ import com.nvidia.spark.rapids.RapidsConf.ParquetFooterReaderType
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
 import com.nvidia.spark.rapids.filecache.FileCache
-import com.nvidia.spark.rapids.fileio.hadoop.HadoopFileIO
+import com.nvidia.spark.rapids.fileio.hadoop.{HadoopFileIO, HadoopInputFile}
 import com.nvidia.spark.rapids.io.async._
 import com.nvidia.spark.rapids.jni.{DateTimeRebase, ParquetFooter, RmmSpark}
 import com.nvidia.spark.rapids.jni.fileio.{RapidsFileIO, RapidsInputFile}
@@ -257,8 +258,103 @@ object GpuParquetScan {
   }
 
   /**
+   * The destination offset of every range is computed before any byte is read, so range
+   * reads commute and can execute concurrently. Sub-ranges of at most this many bytes are
+   * read as independent units.
+   */
+  private val PARALLEL_READ_SUB_RANGE_SIZE: Long = 16L * 1024 * 1024
+
+  /**
+   * Do not bother parallelizing reads below this total size; a single stream is cheaper
+   * than the scheduling overhead.
+   */
+  private val PARALLEL_READ_MIN_TOTAL_SIZE: Long = 8L * 1024 * 1024
+
+  /** Threads used to execute concurrent sub-range reads of the same file. */
+  private val PARALLEL_READ_NUM_THREADS: Int = 16
+
+  private lazy val parallelReadPool = {
+    val pool = TrampolineUtil.newDaemonCachedThreadPool(
+      "parquet parallel range reader", PARALLEL_READ_NUM_THREADS)
+    pool.allowCoreThreadTimeOut(true)
+    pool
+  }
+
+  private case class SubRangeRead(inputOffset: Long, outputOffset: Long, length: Long)
+
+  /**
+   * Read the given ranges concurrently in sub-range units, each on its own stream,
+   * writing directly into the corresponding disjoint slice of `output`. All submitted
+   * sub-reads are drained (successfully or not) before this method returns, so `output`
+   * can never be written after the call completes, even on failure or task interruption.
+   */
+  private def readRangesParallel(
+      inputFile: RapidsInputFile,
+      output: HostMemoryBuffer,
+      ranges: Seq[CopyRange]): Unit = {
+    val subRanges = ranges.flatMap { r =>
+      var consumed = 0L
+      val subs = scala.collection.mutable.ArrayBuffer[SubRangeRead]()
+      while (consumed < r.getLength) {
+        val len = math.min(PARALLEL_READ_SUB_RANGE_SIZE, r.getLength - consumed)
+        subs += SubRangeRead(r.getInputOffset + consumed, r.getOutputOffset + consumed, len)
+        consumed += len
+      }
+      subs
+    }
+    val futures = subRanges.map { s =>
+      parallelReadPool.submit(new Callable[Unit] {
+        override def call(): Unit = {
+          withResource(inputFile.open()) { in =>
+            in.seek(s.inputOffset)
+            output.copyFromStream(s.outputOffset, in, s.length)
+          }
+        }
+      })
+    }
+    // Drain every future even on failure or interrupt; record the first real error.
+    var firstError: Throwable = null
+    var interrupted = false
+    futures.foreach { f =>
+      var done = false
+      while (!done) {
+        try {
+          f.get()
+          done = true
+        } catch {
+          case _: InterruptedException =>
+            // Keep draining so no sub-read can touch `output` after we return; the
+            // remaining work is bounded by the sub-range size.
+            interrupted = true
+          case e: ExecutionException =>
+            done = true
+            if (firstError == null) {
+              firstError = Option(e.getCause).getOrElse(e)
+            }
+          case e: Throwable =>
+            done = true
+            if (firstError == null) {
+              firstError = e
+            }
+        }
+      }
+    }
+    if (interrupted) {
+      Thread.currentThread().interrupt()
+    }
+    if (firstError != null) {
+      throw firstError
+    }
+  }
+
+  /**
    * Read the given byte ranges from `inputFile` into `output` using the
    * vectored API. Returns the total number of bytes read.
+   *
+   * For plain Hadoop filesystems the ranges are read concurrently in sub-range units:
+   * the coalesced buffer layout is fully precomputed, so the reads commute, and a single
+   * sequential stream leaves both the IO queue and the reader CPU underused. Filesystems
+   * with their own optimized readVectored (e.g. S3) keep using it.
    *
    * Wall time is accumulated to READ_FS_TIME. WRITE_BUFFER_TIME has no
    * analog on this path -- readVectored writes directly into `output` in
@@ -273,10 +369,17 @@ object GpuParquetScan {
     if (ranges.isEmpty) {
       0L
     } else {
+      val total = ranges.map(_.getLength).sum
+      val parallelizable = inputFile.isInstanceOf[HadoopInputFile] &&
+        total >= PARALLEL_READ_MIN_TOTAL_SIZE
       metrics.getOrElse(READ_FS_TIME, NoopMetric).ns {
-        inputFile.readVectored(output, ranges.asJava)
+        if (parallelizable) {
+          readRangesParallel(inputFile, output, ranges)
+        } else {
+          inputFile.readVectored(output, ranges.asJava)
+        }
       }
-      ranges.map(_.getLength).sum
+      total
     }
   }
 
