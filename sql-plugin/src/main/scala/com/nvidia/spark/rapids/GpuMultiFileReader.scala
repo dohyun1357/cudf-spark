@@ -179,7 +179,25 @@ trait MultiFileReaderFunctions {
     "msg=method getAllStatistics in class FileSystem is deprecated"
   )
   protected def fileSystemBytesRead(): Long = {
-    FileSystem.getAllStatistics.asScala.map(_.getThreadStatistics.getBytesRead).sum
+    // Hadoop's thread statistics only see reads performed on this thread, so add the
+    // bytes that helper threads read on this thread's behalf (parallel range reads).
+    // Both terms are monotonically increasing, so callers' delta computations remain
+    // correct.
+    FileSystem.getAllStatistics.asScala.map(_.getThreadStatistics.getBytesRead).sum +
+      MultiFileReaderFunctions.offThreadBytesRead.get()
+  }
+}
+
+object MultiFileReaderFunctions {
+  // Monotonic per-thread count of bytes read by helper threads on behalf of this thread.
+  // See fileSystemBytesRead().
+  private val offThreadBytesRead: ThreadLocal[java.lang.Long] = new ThreadLocal[java.lang.Long] {
+    override def initialValue(): java.lang.Long = 0L
+  }
+
+  /** Record bytes read by helper threads on behalf of the current thread. */
+  def addOffThreadBytesRead(bytes: Long): Unit = {
+    offThreadBytesRead.set(offThreadBytesRead.get() + bytes)
   }
 }
 

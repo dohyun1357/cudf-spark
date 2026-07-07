@@ -375,6 +375,9 @@ object GpuParquetScan {
       metrics.getOrElse(READ_FS_TIME, NoopMetric).ns {
         if (parallelizable) {
           readRangesParallel(inputFile, output, ranges)
+          // The sub-reads ran on helper threads, so their bytes are invisible to this
+          // thread's Hadoop statistics; record them for fileSystemBytesRead().
+          MultiFileReaderFunctions.addOffThreadBytesRead(total)
         } else {
           inputFile.readVectored(output, ranges.asJava)
         }
