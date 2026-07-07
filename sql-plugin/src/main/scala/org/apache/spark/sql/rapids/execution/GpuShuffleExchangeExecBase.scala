@@ -176,8 +176,21 @@ abstract class GpuShuffleExchangeExecBase(
     child: SparkPlan) extends Exchange with ShimUnaryExecNode with GpuExec {
   import GpuMetric._
 
-  private lazy val kudoMode = RapidsConf.ShuffleKudoMode.withName(
-    RapidsConf.SHUFFLE_KUDO_WRITE_MODE.get(child.conf))
+  private lazy val usesKudoCompression = gpuOutputPartitioning match {
+    case gpuPartitioning: GpuPartitioning => gpuPartitioning.usesKudoCompression
+    case _ => false
+  }
+  private lazy val kudoMode = {
+    val configured = RapidsConf.ShuffleKudoMode.withName(
+      RapidsConf.SHUFFLE_KUDO_WRITE_MODE.get(child.conf))
+    // GPU-compressed shuffle payloads arrive at the serializer as pre-serialized bytes
+    // (SlicedSerializedColumnVector), which the GPU-mode serializer writes verbatim.
+    if (usesKudoCompression) {
+      RapidsConf.ShuffleKudoMode.GPU
+    } else {
+      configured
+    }
+  }
   private lazy val useKudo = RapidsConf.SHUFFLE_KUDO_SERIALIZER_ENABLED.get(child.conf)
   private lazy val kudoBufferCopyMeasurementEnabled = RapidsConf
     .SHUFFLE_KUDO_SERIALIZER_MEASURE_BUFFER_COPY_ENABLED

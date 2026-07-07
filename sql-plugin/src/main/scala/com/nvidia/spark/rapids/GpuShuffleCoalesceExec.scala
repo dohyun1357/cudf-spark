@@ -22,8 +22,9 @@ import java.util.concurrent.{Future, TimeUnit}
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
-import ai.rapids.cudf.{DeviceMemoryBuffer, HostMemoryBuffer, JCudfSerialization,
-  MemoryBuffer, NvtxColor, NvtxRange}
+import ai.rapids.cudf.{BaseDeviceMemoryBuffer, Cuda, DeviceMemoryBuffer, DeviceMemoryBufferView,
+  HostMemoryBuffer, JCudfSerialization, MemoryBuffer, NvtxColor, NvtxRange}
+import ai.rapids.cudf.nvcomp.BatchedZstdDecompressor
 import ai.rapids.cudf.JCudfSerialization.HostConcatResult
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.FileUtils.createTempFile
@@ -274,6 +275,9 @@ object GpuShuffleCoalesceUtils {
   def getSerializedBufferSize(cb: ColumnarBatch): Long = {
     assert(cb.numCols() == 1)
     cb.column(0) match {
+      // Use the uncompressed size for GPU-compressed records so join sizing decisions
+      // reflect GPU-relevant bytes.
+      case col: KudoSerializedTableColumn if col.isCompressed => col.uncompressedDataLen
       case col: KudoSerializedTableColumn => col.spillableKudoTable.length
       case serCol: SerializedTableColumn => {
         val hmb = serCol.hostBuffer
@@ -355,12 +359,10 @@ class KudoTableOperator(kudo: Option[KudoSerializer], readOption: CoalesceReadOp
   require(kudo != null, "kudo serializer should not be null")
 
   override def getDataLen(column: KudoSerializedTableColumn): Long =
-    column.spillableKudoTable.header
-    .getTotalDataLen
+    column.uncompressedDataLen
 
   override def getNumRows(column: KudoSerializedTableColumn): Int =
-    column.spillableKudoTable.header
-    .getNumRows
+    column.numRowsInTable
 
   private def buildMergeOptions(): MergeOptions = {
     val dumpOption = readOption.kudoDebugMode
@@ -376,6 +378,8 @@ class KudoTableOperator(kudo: Option[KudoSerializer], readOption: CoalesceReadOp
 
   override def concat(columns: Array[KudoSerializedTableColumn]): CoalescedHostResult = {
     require(columns.nonEmpty, "no tables to be concatenated")
+    require(columns.forall(!_.isCompressed),
+      "GPU-compressed kudo records require the kudo GPU read mode")
     val numCols = columns.head.spillableKudoTable.header.getNumColumns
     if (numCols == 0) {
       val totalRowsNum = columns.map(getNumRows).sum
@@ -395,15 +399,120 @@ class KudoGpuTableOperator(dataTypes: Array[DataType])
   extends SerializedTableOperator[KudoSerializedTableColumn, ColumnarBatch] {
 
   override def getDataLen(column: KudoSerializedTableColumn): Long =
-    column.spillableKudoTable.header
-      .getTotalDataLen
+    column.uncompressedDataLen
 
   override def getNumRows(column: KudoSerializedTableColumn): Int =
-    column.spillableKudoTable.header
-      .getNumRows
+    column.numRowsInTable
 
   override def concat(columns: Array[KudoSerializedTableColumn]): ColumnarBatch = {
     require(columns.nonEmpty, "no tables to be concatenated")
+    if (columns.exists(_.isCompressed)) {
+      concatWithDecompress(columns)
+    } else {
+      concatRaw(columns)
+    }
+  }
+
+  /**
+   * Concatenates a batch that contains at least one GPU-compressed record. The raw
+   * (decompressed) layout expected by KudoGpuSerializer.assembleFromDeviceRaw is a single
+   * device buffer of back-to-back kudo records plus a size_t offsets vector. Compressed
+   * records are copied to the device still compressed and inflated directly into their
+   * slot in the raw buffer with one batched nvcomp zstd call; plain records (either
+   * incompressible fallbacks or mixed-in uncompressed records) are staged on the host as
+   * [header][payload] and copied into their slot directly.
+   */
+  private def concatWithDecompress(columns: Array[KudoSerializedTableColumn]): ColumnarBatch = {
+    val numCols = columns.find(!_.isCompressed)
+      .map(_.spillableKudoTable.header.getNumColumns.toLong)
+    require(numCols.forall(_ > 0), "row-count-only records cannot be compressed")
+    val chunkSizes = columns.flatMap(_.compressedMeta.map(_.chunkSize)).distinct
+    require(chunkSizes.length == 1,
+      s"mixed compression chunk sizes in one shuffle batch: ${chunkSizes.mkString(",")}")
+    val chunkSize = chunkSizes.head
+
+    val rawSizes = columns.map { c =>
+      if (c.isCompressed) {
+        c.compressedMeta.get.uncompressedLength
+      } else {
+        val header = c.spillableKudoTable.header
+        header.getSerializedSize.toLong + header.getTotalDataLen.toLong
+      }
+    }
+    val rawOffsets = rawSizes.scanLeft(0L)(_ + _)
+    val totalRaw = rawOffsets.last
+
+    withResource(columns.safeMap(_.spillableKudoTable.getHostBuffer())) { hostBufs =>
+      val compIdx = columns.indices.filter(columns(_).isCompressed).toArray
+      val compSizes = compIdx.map(i => hostBufs(i).getLength)
+      val compOffsets = compSizes.scanLeft(0L)(_ + _)
+      val totalComp = compOffsets.last
+      val rawIdx = columns.indices.filterNot(columns(_).isCompressed).toArray
+
+      // Stage all compressed blobs into one host buffer for a single H2D copy.
+      val hostComp = HostMemoryBuffer.allocate(totalComp)
+      withResource(hostComp) { _ =>
+        compIdx.zipWithIndex.foreach { case (i, k) =>
+          hostComp.copyFromHostBuffer(compOffsets(k), hostBufs(i), 0, hostBufs(i).getLength)
+        }
+        // Stage any plain records as [header][payload] in raw form. Size is clamped to at
+        // least one byte because zero-byte allocations are not universally supported.
+        val rawStageSizes = rawIdx.map(i => rawSizes(i))
+        val rawStageOffsets = rawStageSizes.scanLeft(0L)(_ + _)
+        val hostRawStage = HostMemoryBuffer.allocate(math.max(rawStageOffsets.last, 1L))
+        withResource(hostRawStage) { _ =>
+          rawIdx.zipWithIndex.foreach { case (i, k) =>
+            val header = columns(i).spillableKudoTable.header
+            val off = rawStageOffsets(k)
+            header.writeTo(hostRawStage, off)
+            hostRawStage.copyFromHostBuffer(off + header.getSerializedSize, hostBufs(i), 0,
+              hostBufs(i).getLength)
+          }
+
+          val offsetsBufSize = 8L * (columns.length + 1)
+          withResource(HostMemoryBuffer.allocate(offsetsBufSize)) { offsetsHost =>
+            rawOffsets.zipWithIndex.foreach { case (off, i) =>
+              offsetsHost.setLong(i * 8L, off)
+            }
+
+            withResource(DeviceMemoryBuffer.allocate(totalRaw)) { rawDev =>
+              withResource(DeviceMemoryBuffer.allocate(totalComp)) { compDev =>
+                compDev.copyFromHostBuffer(hostComp)
+                // Copy plain records straight into their raw slots.
+                rawIdx.zipWithIndex.foreach { case (i, k) =>
+                  rawDev.copyFromHostBufferAsync(rawOffsets(i), hostRawStage,
+                    rawStageOffsets(k), rawStageSizes(k), Cuda.DEFAULT_STREAM)
+                }
+                // Inflate all compressed records into their raw slots in one batched call.
+                if (compIdx.nonEmpty) {
+                  val inputs: Array[BaseDeviceMemoryBuffer] = compIdx.zipWithIndex.map {
+                    case (_, k) => new DeviceMemoryBufferView(
+                      compDev.getAddress + compOffsets(k), compSizes(k)): BaseDeviceMemoryBuffer
+                  }
+                  val outputs: Array[BaseDeviceMemoryBuffer] = compIdx.map { i =>
+                    new DeviceMemoryBufferView(rawDev.getAddress + rawOffsets(i),
+                      rawSizes(i)): BaseDeviceMemoryBuffer
+                  }
+                  new BatchedZstdDecompressor(chunkSize)
+                    .decompressAsync(inputs, outputs, Cuda.DEFAULT_STREAM)
+                }
+                withResource(DeviceMemoryBuffer.allocate(offsetsBufSize)) { offsetsDev =>
+                  offsetsDev.copyFromHostBuffer(offsetsHost)
+                  val schema = GpuColumnVector.from(dataTypes)
+                  withResource(KudoGpuSerializer.assembleFromDeviceRaw(
+                      schema, rawDev, offsetsDev)) { table =>
+                    GpuColumnVector.from(table, dataTypes)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private def concatRaw(columns: Array[KudoSerializedTableColumn]): ColumnarBatch = {
     val numCols = columns.head.spillableKudoTable.header.getNumColumns
     if (numCols == 0) {
       val totalRowsNum = columns.map(getNumRows).sum

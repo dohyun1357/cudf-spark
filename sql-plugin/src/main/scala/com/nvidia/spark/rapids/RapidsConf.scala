@@ -2453,6 +2453,20 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
     .stringConf
     .createWithDefault(ShuffleKudoMode.GPU.toString)
 
+  val SHUFFLE_KUDO_COMPRESSION_CODEC =
+    conf("spark.rapids.shuffle.kudo.serializer.compression.codec")
+    .doc("Codec used to compress the kudo-serialized shuffle payload on the GPU before it " +
+      "is copied to the host. \"zstd\": compress each partition's serialized bytes with " +
+      "batched nvcomp ZSTD on the device; partitions that do not shrink are written " +
+      "uncompressed. \"none\": disable device-side shuffle payload compression. Only " +
+      "applies when the Kudo serializer is enabled with GPU read mode and the built-in " +
+      "Spark sort shuffle is in use.")
+    .internal()
+    .startupOnly()
+    .stringConf
+    .checkValues(Set("none", "zstd"))
+    .createWithDefault("zstd")
+
   val SHUFFLE_KUDO_SERIALIZER_MEASURE_BUFFER_COPY_ENABLED =
     conf("spark.rapids.shuffle.kudo.serializer.measure.buffer.copy.enabled")
     .doc("Enable or disable measuring buffer copy time when using Kudo serializer for the shuffle.")
@@ -3899,6 +3913,20 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   def shuffleKudoGpuSerializerReadEnabled: Boolean = shuffleKudoSerializerEnabled &&
     shuffleKudoReadMode == ShuffleKudoMode.GPU
+
+  lazy val shuffleKudoCompressionCodec: String = get(SHUFFLE_KUDO_COMPRESSION_CODEC)
+
+  /**
+   * Device-side compression of the kudo-serialized shuffle payload. Requires the kudo
+   * serializer with GPU read mode so the payload is decompressed on the device during
+   * shuffle read. Callers must additionally ensure the built-in Spark sort shuffle is in
+   * use (see GpuPartitioning) since the RapidsShuffleManager paths have their own
+   * compression handling.
+   */
+  def shuffleKudoCompressionRequested: Boolean =
+    shuffleKudoCompressionCodec != "none" &&
+      shuffleKudoSerializerEnabled &&
+      shuffleKudoReadMode == ShuffleKudoMode.GPU
 
   lazy val shimsProviderOverride: Option[String] = get(SHIMS_PROVIDER_OVERRIDE)
 

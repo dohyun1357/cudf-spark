@@ -33,6 +33,19 @@ class SpillableKudoTable(val header: KudoTableHeader,
     }
   }
 
+  /**
+   * Get the host buffer without constructing a KudoTable. This is required for
+   * GPU-compressed payloads which carry no parsed kudo header (see KudoCompressedMeta).
+   * The caller is responsible for closing the returned buffer.
+   */
+  def getHostBuffer(): HostMemoryBuffer = {
+    if (shb == null) {
+      null
+    } else {
+      shb.getHostBuffer()
+    }
+  }
+
   override def toString: String =
     "SpillableKudoTable{header=" + this.header + ", shb=" + this.shb + '}'
 

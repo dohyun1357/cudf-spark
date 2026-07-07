@@ -659,13 +659,57 @@ private class KudoGpuSerializerInstance(
 }
 
 /**
+ * Stream framing constants and helpers for kudo shuffle records whose payload was
+ * compressed on the GPU (see GpuPartitioning.sliceSerializeCompressOnGpu). A compressed
+ * record replaces the plain kudo record ([KUD0 header][payload]) in the shuffle stream
+ * with:
+ *
+ *   int  magic = KUDZ
+ *   int  numRows
+ *   int  chunkSize          uncompressed chunk size used by the batched compressor
+ *   long uncompressedLength length of the raw kudo record (header + payload)
+ *   int  compressedLength   length of the nvcomp blob that follows
+ *   byte[compressedLength]  nvcomp batched-zstd blob (chunk metadata + chunks)
+ *
+ * All integral fields are big-endian to match the DataInput/DataOutput framing used by
+ * the kudo header. Decompressing the blob yields the exact raw kudo record bytes, so a
+ * batch of decompressed records laid out back to back matches the layout expected by
+ * KudoGpuSerializer.assembleFromDeviceRaw.
+ */
+object KudoCompressedFrame {
+  /** Magic number "KUDZ" in ASCII, distinct from the kudo header magic "KUD0". */
+  val MAGIC: Int = 0x4B55445A
+  /** Frame header bytes preceding the compressed blob. */
+  val FRAME_HEADER_BYTES: Long = 4L + 4L + 4L + 8L + 4L
+  /** Codec identifier for batched nvcomp zstd. */
+  val CODEC_ZSTD: String = "zstd"
+}
+
+/**
+ * Metadata describing the GPU-compressed payload carried by a
+ * [[KudoSerializedTableColumn]]. When present, the column's host buffer holds an nvcomp
+ * batched-zstd blob instead of the raw kudo record, and there is no parsed kudo header.
+ *
+ * @param numRows number of rows in the serialized table
+ * @param uncompressedLength length in bytes of the raw kudo record after decompression
+ * @param chunkSize uncompressed chunk size that was used by the batched compressor
+ */
+case class KudoCompressedMeta(numRows: Int, uncompressedLength: Long, chunkSize: Int)
+
+/**
  * A special `ColumnVector` that describes a serialized table read from shuffle using
  * [[KudoSerializer]].
  *
  * This appears in a `ColumnarBatch` to pass serialized tables to [[GpuShuffleCoalesceExec]]
  * which should always appear in the query plan immediately after a shuffle.
+ *
+ * When `compressedMeta` is set the host buffer contains a GPU-compressed record (see
+ * [[KudoCompressedFrame]]) and `spillableKudoTable.header` is null; such columns are only
+ * produced when the kudo GPU read mode is enabled and must be decompressed on the device
+ * before use.
  */
-case class KudoSerializedTableColumn(spillableKudoTable: SpillableKudoTable)
+case class KudoSerializedTableColumn(spillableKudoTable: SpillableKudoTable,
+    compressedMeta: Option[KudoCompressedMeta] = None)
   extends GpuColumnVectorBase(NullType) with SizeProvider {
   override def close(): Unit = {
     if (spillableKudoTable != null) {
@@ -682,6 +726,16 @@ case class KudoSerializedTableColumn(spillableKudoTable: SpillableKudoTable)
   } else {
     spillableKudoTable.length
   }
+
+  def isCompressed: Boolean = compressedMeta.isDefined
+
+  /** Number of rows regardless of whether the payload is compressed. */
+  def numRowsInTable: Int = compressedMeta.map(_.numRows)
+    .getOrElse(spillableKudoTable.header.getNumRows)
+
+  /** Uncompressed data length regardless of whether the payload is compressed. */
+  def uncompressedDataLen: Long = compressedMeta.map(_.uncompressedLength)
+    .getOrElse(spillableKudoTable.header.getTotalDataLen.toLong)
 }
 
 object KudoSerializedTableColumn {
@@ -700,6 +754,20 @@ object KudoSerializedTableColumn {
   }
 
   /**
+   * Build a `ColumnarBatch` consisting of a single [[KudoSerializedTableColumn]] holding a
+   * GPU-compressed kudo record.
+   *
+   * @param meta the compressed payload metadata
+   * @param hostBuffer buffer holding the nvcomp blob, ownership is transferred
+   * @return columnar batch to be passed to [[GpuShuffleCoalesceExec]]
+   */
+  def fromCompressed(meta: KudoCompressedMeta, hostBuffer: HostMemoryBuffer): ColumnarBatch = {
+    val kudoTable = SpillableKudoTable(null, hostBuffer)
+    val column = new KudoSerializedTableColumn(kudoTable, Some(meta))
+    new ColumnarBatch(Array(column), meta.numRows)
+  }
+
+  /**
    * This is for debugging kudo Shuffle errors, e.g. numRows < 0 in kudo Shuffle read.
    * It is disabled by default for performance.
    */
@@ -710,6 +778,9 @@ object KudoSerializedTableColumn {
 class KudoSerializedBatchIterator(dIn: DataInputStream, deserTime: GpuMetric)
   extends BaseSerializedTableIterator {
   private[this] var nextHeader: Option[KudoTableHeader] = None
+  // Set instead of nextHeader when the next record is a GPU-compressed kudo record
+  // (KudoCompressedFrame). Holds the parsed frame metadata and the compressed length.
+  private[this] var nextCompressed: Option[(KudoCompressedMeta, Int)] = None
   private[this] var streamClosed: Boolean = false
 
   // When KudoSerializedBatchIterator is often handling small kudo tables, it is more efficient
@@ -738,25 +809,51 @@ class KudoSerializedBatchIterator(dIn: DataInputStream, deserTime: GpuMetric)
     }
   }
 
+  private def closeStream(): Unit = {
+    dIn.close()
+    sharedBuffer.foreach(_.close())
+    sharedBuffer = None
+    streamClosed = true
+    nextHeader = None
+    nextCompressed = None
+  }
+
   override def peekNextBatchSize(): Option[Long] = deserTime.ns {
     if (streamClosed) {
       None
     } else {
-      if (nextHeader.isEmpty) {
+      if (nextHeader.isEmpty && nextCompressed.isEmpty) {
         NvtxRegistry.READ_HEADER {
-          val header = Option(KudoTableHeader.readFrom(dIn).orElse(null))
-          if (header.isDefined) {
-            nextHeader = header
-          } else {
-            dIn.close()
-            sharedBuffer.foreach(_.close())
-            sharedBuffer = None
-            streamClosed = true
-            nextHeader = None
+          // Records are either plain kudo records (magic "KUD0") or GPU-compressed
+          // records (magic "KUDZ"), so peek the magic to decide how to parse.
+          dIn.mark(4)
+          val magic = try {
+            Some(dIn.readInt())
+          } catch {
+            case _: java.io.EOFException => None
+          }
+          magic match {
+            case None =>
+              closeStream()
+            case Some(KudoCompressedFrame.MAGIC) =>
+              val numRows = dIn.readInt()
+              val chunkSize = dIn.readInt()
+              val uncompressedLength = dIn.readLong()
+              val compressedLength = dIn.readInt()
+              nextCompressed = Some(
+                (KudoCompressedMeta(numRows, uncompressedLength, chunkSize), compressedLength))
+            case Some(_) =>
+              dIn.reset()
+              val header = Option(KudoTableHeader.readFrom(dIn).orElse(null))
+              if (header.isDefined) {
+                nextHeader = header
+              } else {
+                closeStream()
+              }
           }
         }
       }
-      nextHeader.map(_.getTotalDataLen)
+      nextHeader.map(_.getTotalDataLen.toLong).orElse(nextCompressed.map(_._1.uncompressedLength))
     }
   }
 
@@ -765,6 +862,20 @@ class KudoSerializedBatchIterator(dIn: DataInputStream, deserTime: GpuMetric)
       // This buffer will later be concatenated into another host buffer before being
       // sent to the GPU, so no need to use pinned memory for these buffers.
       HostMemoryBuffer.allocate(size, false)
+    }
+  }
+
+  private def readCompressedBatch(): ColumnarBatch = deserTime.ns {
+    NvtxRegistry.READ_BATCH {
+      val (meta, compressedLength) = nextCompressed.get
+      nextCompressed = None
+      // Compressed records bypass the shared-buffer optimization: they are decompressed
+      // on the device, so the host buffer is short-lived and typically not tiny.
+      val buffer = allocateHostWithRetry(compressedLength)
+      closeOnExcept(buffer) { _ =>
+        buffer.copyFromStream(0, dIn, compressedLength)
+        KudoSerializedTableColumn.fromCompressed(meta, buffer)
+      }
     }
   }
 
@@ -832,13 +943,17 @@ class KudoSerializedBatchIterator(dIn: DataInputStream, deserTime: GpuMetric)
 
   override def hasNext: Boolean = {
     peekNextBatchSize()
-    nextHeader.isDefined
+    nextHeader.isDefined || nextCompressed.isDefined
   }
 
   override def next(): (Int, ColumnarBatch) = {
     if (!hasNext) {
       throw new NoSuchElementException("Walked off of the end...")
     }
-    (0, readNextBatch())
+    if (nextCompressed.isDefined) {
+      (0, readCompressedBatch())
+    } else {
+      (0, readNextBatch())
+    }
   }
 }

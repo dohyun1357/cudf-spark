@@ -238,6 +238,8 @@ object DumpUtils extends Logging {
         case kudoCol: KudoSerializedTableColumn =>
           require(kudoSerializer.isDefined,
             "KudoSerializer must be provided when handling KudoSerializedTableColumn")
+          require(!kudoCol.isCompressed,
+            "debug dump of GPU-compressed kudo records is not supported")
           deserializeKudoSerializedTableColumn(kudoSerializer.get, kudoCol)
         case _ =>
           GpuColumnVector.from(columnarBatch)
