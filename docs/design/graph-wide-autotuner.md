@@ -120,10 +120,13 @@ The model refuses to price what it has not measured:
   zero-crossing-confidence fits freeze the decision.
 - **Dispatch response.** Until a launch-spacing measurement exists, candidates above Spark's
   current layout are frozen (`higher-parallelism-response-unidentified`).
-- **Sub-batch region.** Re-split candidates must keep at least one native GPU batch per range;
-  below one batch per task, per-task response leaves the identified region
-  (`sub-batch-range-response-unidentified`). This also makes micro-exchange splits
-  structurally impossible.
+- **Sub-batch region.** Re-split candidates must keep their mean range size at or above one
+  native GPU batch. Fixed and launch costs are already charged for every range, so the mean
+  identifies the candidate's typical per-task regime without rejecting a balanced layout only
+  because its remainder range is smaller. A mean below one batch per task leaves the response
+  unidentified (`sub-batch-range-response-unidentified`) and makes micro-exchange splits
+  structurally impossible. The byte-region guard remains a per-range limit because an oversized
+  remainder can cross an operator cost cliff on its own.
 - **Continuous executor controls** (scan read-ahead window, shuffle prefetch/ready bytes,
   batch size) are all held at the deployed operating point and report
   `single-operating-point-response-unidentified`: a single-point observation cannot identify
@@ -159,11 +162,11 @@ Authority is asymmetric, matching the measured risk:
   they have exact map statistics and measured wave costs.
 - **Re-splits above Spark's layout** (never above the map-side partition count — contiguous
   ranges cannot subdivide map partitions) additionally require the measured dispatch response
-  and the sub-batch floor. Pricing smaller-than-measured tasks at the calibrated rate is
-  conservative for this direction: on matched-stage evidence across four operating points,
-  per-byte service does not improve as tasks shrink toward the batch-size floor once fixed and
-  launch costs are charged separately, so the modeled wave-alignment benefit understates the
-  measured one.
+  and a mean range size of at least one native GPU batch. Pricing smaller-than-measured tasks at
+  the calibrated rate is conservative for this direction: on matched-stage evidence across four
+  operating points, per-byte service does not improve as tasks shrink toward the batch-size floor
+  once fixed and launch costs are charged separately, so the modeled wave-alignment benefit
+  understates the measured one.
 - **Larger-than-measured ranges** stay frozen behind the byte-region envelope regardless of
   how attractive the wave arithmetic looks; the measured superlinear cliffs live there.
 
