@@ -40,10 +40,14 @@ trait GpuPartitioning extends Partitioning {
     val rapidsConf = new RapidsConf(SQLConf.get)
     val useGpuShuffle = GpuShuffleEnv.useGPUShuffle(rapidsConf)
     val useMtShuffle = GpuShuffleEnv.useMultiThreadedShuffle(rapidsConf)
-    // Device-side payload compression is only wired into the built-in Spark sort shuffle
-    // path; the RapidsShuffleManager paths manage compression on their own.
+    // Device-side payload compression is wired into the shuffle paths that move the
+    // kudo-serialized bytes verbatim: the built-in Spark sort shuffle and the
+    // RapidsShuffleManager MULTITHREADED writer (records are opaque bytes to its
+    // limiter/spill/merge pipeline, and the read side dispatches per record on the
+    // KUD0/KUDZ magic regardless of the manager). The UCX/CACHE_ONLY GPU-transport
+    // paths manage compression on their own and stay excluded.
     val kudoCompression = if (rapidsConf.shuffleKudoCompressionRequested &&
-        !useGpuShuffle && !useMtShuffle) {
+        !useGpuShuffle) {
       rapidsConf.shuffleKudoCompressionCodec
     } else {
       "none"
