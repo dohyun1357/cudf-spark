@@ -113,8 +113,6 @@ case class GpuFileSourceScanExec(
   private var prefetchWindow: Option[Int] = None
   private var prefetchRequiresMinScanFiles = false
 
-  def applyEagerPrefetch(): Unit = applyEagerPrefetch(None)
-
   def applyEagerPrefetch(
       prefetchWindow: Option[Int],
       requireMinScanFiles: Boolean = false): Unit = {

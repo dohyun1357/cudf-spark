@@ -56,14 +56,10 @@ case class SparkRapidsAutotuneHintAppliedEvent(
   hintVersion: Long,
   hasHint: Boolean,
   scanEagerPrefetch: Boolean,
-  scanMinReadWindow: Int,
   scanMaxReadWindow: Int,
   scanMaxReadyBytes: Long,
   shufflePrefetchWindow: Int = 0,
-  shuffleMaxReadyBytes: Long = Long.MaxValue,
-  shuffleCoalesceTargetBytes: Long = 0L,
-  batchTargetBatchBytes: Long = 0L,
-  batchMaxBatchBytes: Long = Long.MaxValue
+  shuffleMaxReadyBytes: Long = Long.MaxValue
 ) extends SparkListenerEvent
 
 /**
@@ -132,20 +128,14 @@ case class SparkRapidsAutotuneGraphDecisionEvent(
   predictedCurrentNanos: Double,
   durationAdjoint: Double,
   currentScanWindow: Double,
-  currentGpuTasks: Double,
   currentShuffleWindow: Double,
   currentShuffleBytes: Double,
-  currentBatchBytes: Double,
-  scanWindowGradient: Double,
-  gpuTasksGradient: Double,
-  shuffleWindowGradient: Double,
-  shuffleBytesGradient: Double,
-  batchBytesGradient: Double,
+  scanGradient: Double,
+  gpuGradient: Double,
+  shuffleGradient: Double,
   scanWindowFreezeReason: String,
-  gpuTasksFreezeReason: String,
   shuffleWindowFreezeReason: String,
-  shuffleBytesFreezeReason: String,
-  batchBytesFreezeReason: String
+  shuffleBytesFreezeReason: String
 ) extends SparkListenerEvent
 
 /** One model-selected reducer-parallelism decision at AQE query-stage optimization time. */

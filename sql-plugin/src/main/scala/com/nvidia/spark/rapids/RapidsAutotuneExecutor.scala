@@ -81,8 +81,7 @@ class RapidsAutotuneExecutorEndpoint(
         hintVersion = cachedHint.version,
         hasHint = cachedHint.hasHint,
         scan = cachedHint.hint.scan,
-        shuffle = cachedHint.hint.shuffle,
-        batch = cachedHint.hint.batch))
+        shuffle = cachedHint.hint.shuffle))
     } catch {
       case NonFatal(e) if failOpen =>
         logWarning("Failed to report RAPIDS graph autotune applied hint; continuing", e)

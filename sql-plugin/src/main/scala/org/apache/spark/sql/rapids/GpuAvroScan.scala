@@ -251,7 +251,7 @@ case class GpuAvroMultiFilePartitionReaderFactory(
       maxGpuColumnSizeBytes)
     // NOTE: Initialize must happen after the initialization of the reader, to ensure everything
     // inside the reader being fully initialized.
-    if (conf.getBoolean(ScanPrefetchSettings.ENABLED_KEY, false)) {
+    if (conf.getBoolean("rapids.sql.scan.prefetch", false)) {
       reader.eagerPrefetchInit()
     }
     reader

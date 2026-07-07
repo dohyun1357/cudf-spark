@@ -963,14 +963,8 @@ case class GpuCoalesceBatches(child: SparkPlan, goal: CoalesceGoal)
       goal match {
         case sizeGoal: CoalesceSizeGoal =>
           batches.mapPartitions { iter =>
-            val taskGoal = sizeGoal match {
-              case TargetSize(staticTarget) =>
-                TargetSize(BatchRuntimeHints.effectiveTargetBatchBytes(
-                  staticTarget, RapidsAutotuneTaskHints.currentBatchHint))
-              case _ => sizeGoal
-            }
             new GpuCompressionAwareCoalesceIterator(
-              iter, dataTypes, taskGoal, decompressMemoryTarget,
+              iter, dataTypes, sizeGoal, decompressMemoryTarget,
               numInputRows, numInputBatches, numOutputRows, numOutputBatches, NoopMetric,
               concatTime, opTime, "GpuCoalesceBatches",
               localCodecConfigs)

@@ -23,8 +23,7 @@ class GpuFlowAqeParallelismSuite extends AnyFunSuite {
     minSampleTasks = 1L,
     updateIntervalNanos = 0L,
     scan = ScanOptimizerBounds(false, 0, 0L),
-    shuffle = ShuffleOptimizerBounds(false, 0, 0L, 0L),
-    batch = BatchOptimizerBounds(false, 0L, 0L))
+    shuffle = ShuffleOptimizerBounds(false, 0, 0L))
 
   private def calibrationSample(
       nonGpuNanos: Double,

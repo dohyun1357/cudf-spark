@@ -23,8 +23,7 @@ case class GraphOptimizerConstraints(
     minSampleTasks: Long,
     updateIntervalNanos: Long,
     scan: ScanOptimizerBounds,
-    shuffle: ShuffleOptimizerBounds,
-    batch: BatchOptimizerBounds)
+    shuffle: ShuffleOptimizerBounds)
 
 case class ScanOptimizerBounds(
     enabled: Boolean,
@@ -34,25 +33,10 @@ case class ScanOptimizerBounds(
 case class ShuffleOptimizerBounds(
     enabled: Boolean,
     initialPrefetchWindow: Int,
-    initialReadyBytes: Long,
-    initialCoalesceBytes: Long)
-
-case class BatchOptimizerBounds(
-    enabled: Boolean,
-    initialTargetBytes: Long,
-    maxBatchBytes: Long)
+    initialReadyBytes: Long)
 
 object GraphOptimizerConstraints {
   def fromConf(conf: RapidsConf): GraphOptimizerConstraints = {
-    val nativeBatchTarget = conf.gpuTargetBatchSizeBytes
-    // The native target is already a deployed-safe point and must never be excluded by an
-    // autotune envelope. Long.MaxValue is the unset sentinel, not a useful search endpoint.
-    val configuredBatchMaximum = conf.autotuneBatchMaxBytes
-    val batchMaximum = if (configuredBatchMaximum == Long.MaxValue) {
-      nativeBatchTarget
-    } else {
-      math.max(nativeBatchTarget, configuredBatchMaximum)
-    }
     GraphOptimizerConstraints(
       minSampleTasks = conf.autotuneGraphMinSampleTasks.toLong,
       updateIntervalNanos = conf.autotuneGraphUpdateIntervalMs.toLong * 1000000L,
@@ -67,13 +51,7 @@ object GraphOptimizerConstraints {
         // A cold stage begins at the configured feasible envelope. Window 1 was an unevidenced
         // policy choice and could serialize a short stage before the first feedback epoch.
         initialPrefetchWindow = conf.autotuneShuffleMaxPrefetchWindow,
-        initialReadyBytes = conf.autotuneShuffleMaxReadyBytes,
-        // Shuffle coalescing targets the native GPU batch size; a cold stage never overrides it.
-        initialCoalesceBytes = nativeBatchTarget),
-      batch = BatchOptimizerBounds(
-        enabled = conf.isAutotuneClosedLoopMode && conf.autotuneBatchEnabled,
-        initialTargetBytes = nativeBatchTarget,
-        maxBatchBytes = batchMaximum))
+        initialReadyBytes = conf.autotuneShuffleMaxReadyBytes))
   }
 }
 
@@ -83,10 +61,8 @@ case class AutotuneStageDescriptor(
 
 private[rapids] case class GraphControlFreezeReasons(
     scanWindow: String = "",
-    gpuTasks: String = "",
     shuffleWindow: String = "",
-    shuffleBytes: String = "",
-    batchBytes: String = "")
+    shuffleBytes: String = "")
 
 private[rapids] case class GpuFlowCalibrationSample(
     shuffleUnitNanos: Double,
@@ -125,16 +101,12 @@ private[rapids] object GpuFlowAqeCalibration {
   def empty(constraints: GraphOptimizerConstraints): GpuFlowAqeCalibration = {
     val reference = GpuFlowControl(
       scanWindow = if (constraints.scan.enabled) constraints.scan.initialReadWindow else 0.0,
-      // The GPU admission hint surface was removed; the gpu dimension stays in the model as the
-      // disabled (zero) actuator, matching the configuration validated by ablation.
-      gpuTasks = 0.0,
       shuffleWindow = if (constraints.shuffle.enabled) {
         constraints.shuffle.initialPrefetchWindow
       } else 0.0,
       shuffleBytes = if (constraints.shuffle.enabled) {
         constraints.shuffle.initialReadyBytes
-      } else 0.0,
-      batchBytes = if (constraints.batch.enabled) constraints.batch.initialTargetBytes else 0.0)
+      } else 0.0)
     // A rate measured at one actuator setting identifies service demand at that operating point,
     // not the counterfactual response to a different setting. Consumers may use these rates to
     // compare plan demand, but must price every candidate at the deployed reference control until
@@ -304,7 +276,7 @@ private[rapids] case class GraphStageCostCurve(
 
 /**
  * Driver graph optimizer backed by a constrained analytical stage-cost model. Single owner of
- * the complete initial joint [[StageRuntimeHint]]; scan, shuffle and batch decisions are never
+ * the complete initial joint [[StageRuntimeHint]]; scan and shuffle decisions are never
  * delegated to independent knob policies.
  *
  * The objective is predicted end-to-end completion of the remaining max-plus Spark DAG,
@@ -472,7 +444,7 @@ class AnalyticalGraphWideAutotuneOptimizer(constraints: GraphOptimizerConstraint
           val reason = if (input.completed) "completed-work-is-sunk"
           else if (!input.active) "stage-not-active"
           else "no-current-version-calibration"
-          GraphControlFreezeReasons(reason, reason, reason, reason, reason)
+          GraphControlFreezeReasons(reason, reason, reason)
         }
         pendingDecisionRecords += GraphStageDecisionRecord(
           epochId = epochId,
@@ -534,7 +506,6 @@ class AnalyticalGraphWideAutotuneOptimizer(constraints: GraphOptimizerConstraint
         constraints.scan.initialReadWindow > 0) {
       ScanRuntimeHint(
         eagerPrefetch = true,
-        minReadWindow = ScanReadWindowSettings.MIN_WINDOW,
         maxReadWindow = constraints.scan.initialReadWindow,
         maxReadyBytes = constraints.scan.maxReadyBytes)
     } else {
@@ -543,22 +514,13 @@ class AnalyticalGraphWideAutotuneOptimizer(constraints: GraphOptimizerConstraint
     val shuffleHint = if (constraints.shuffle.enabled && shape.isShuffleStage) {
       ShuffleRuntimeHint(
         prefetchWindow = constraints.shuffle.initialPrefetchWindow,
-        maxReadyBytes = constraints.shuffle.initialReadyBytes,
-        coalesceTargetBytes = constraints.shuffle.initialCoalesceBytes)
+        maxReadyBytes = constraints.shuffle.initialReadyBytes)
     } else {
       ShuffleRuntimeHint.empty
     }
-    val batchHint = if (constraints.batch.enabled && shape.hasGpuWork) {
-      BatchRuntimeHint(
-        targetBatchBytes = constraints.batch.initialTargetBytes,
-        maxBatchBytes = constraints.batch.maxBatchBytes)
-    } else {
-      BatchRuntimeHint.empty
-    }
     StageRuntimeHint.empty(key).copy(
       scan = scanHint,
-      shuffle = shuffleHint,
-      batch = batchHint)
+      shuffle = shuffleHint)
   }
 }
 
@@ -589,7 +551,8 @@ object AnalyticalStageCostModel {
     // control stays at that measured point; guessing a descent direction from one point is what
     // caused the historical q17 scan/shuffle regressions. Structural AQE parallelism is
     // optimized separately from measured map sizes and task-wave cost.
-    val work = calibrate(observation, current, shape)
+    val classified = classifyNonGpuWork(observation, shape)
+    val work = calibrate(observation, current, classified)
     val evaluation = GpuFlowStageModel.evaluate(work)
     Some(GraphStageCostCurve(
       predictedCurrentNanos = evaluation.predictedNanos,
@@ -597,14 +560,13 @@ object AnalyticalStageCostModel {
       currentControl = work.baseline,
       currentGradient = evaluation.gradient,
       freezeReasons = freezeReasons(work, work.baseline),
-      calibrationSample = calibrationSample(observation, shape, work)))
+      calibrationSample = calibrationSample(observation, classified, work)))
   }
 
   private def calibrate(
       obs: StageObservationAgg,
       current: StageRuntimeHint,
-      shape: AutotuneStageShape): GpuFlowStageWork = {
-    val classified = classifyNonGpuWork(obs, shape)
+      classified: NonGpuClassification): GpuFlowStageWork = {
     GpuFlowStageWork(
       scanNanos = classified.scanNanos,
       gpuNanos = obs.totalGpuHoldingNanos.toDouble +
@@ -656,12 +618,8 @@ object AnalyticalStageCostModel {
 
   private[rapids] def controlFor(hint: StageRuntimeHint): GpuFlowControl = GpuFlowControl(
     scanWindow = activeScanWindow(hint).toDouble,
-    // The GPU admission hint surface was removed; report the gpu control dimension as the
-    // disabled (zero) actuator.
-    gpuTasks = 0.0,
     shuffleWindow = activeShuffleWindow(hint).toDouble,
-    shuffleBytes = activeShuffleBytes(hint).toDouble,
-    batchBytes = activeBatchBytes(hint).toDouble)
+    shuffleBytes = activeShuffleBytes(hint).toDouble)
 
   private def freezeReasons(
       work: GpuFlowStageWork,
@@ -675,19 +633,14 @@ object AnalyticalStageCostModel {
     }
     GraphControlFreezeReasons(
       scanWindow = reason(current.scanWindow, work.scanNanos),
-      gpuTasks = reason(current.gpuTasks, work.gpuNanos),
       shuffleWindow = reason(current.shuffleWindow, work.shuffleNanos),
-      shuffleBytes = reason(current.shuffleBytes, work.shuffleNanos),
-      // One observation at one batch target cannot separate per-batch setup from fixed task
-      // cost, so batch work is never measured separately from the residual.
-      batchBytes = reason(current.batchBytes, 0.0))
+      shuffleBytes = reason(current.shuffleBytes, work.shuffleNanos))
   }
 
   private def calibrationSample(
       observation: StageObservationAgg,
-      shape: AutotuneStageShape,
+      classified: NonGpuClassification,
       work: GpuFlowStageWork): GpuFlowCalibrationSample = {
-    val classified = classifyNonGpuWork(observation, shape)
     GpuFlowCalibrationSample(
       shuffleUnitNanos = work.shuffleNanos * work.baseline.shuffleWindow *
         work.baseline.shuffleBytes,
@@ -712,6 +665,4 @@ object AnalyticalStageCostModel {
   private def activeShuffleBytes(hint: StageRuntimeHint): Long =
     if (isActiveShuffle(hint)) hint.shuffle.maxReadyBytes else 0L
 
-  private def activeBatchBytes(hint: StageRuntimeHint): Long =
-    if (hint.batch.targetBatchBytes > 0L) hint.batch.targetBatchBytes else 0L
 }

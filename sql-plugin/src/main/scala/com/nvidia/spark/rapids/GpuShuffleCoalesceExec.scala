@@ -97,15 +97,11 @@ case class GpuShuffleCoalesceExec(child: SparkPlan, targetBatchByteSize: Long)
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val metricsMap = allMetrics
-    val staticTargetSize = targetBatchByteSize
+    val targetSize = targetBatchByteSize
     val dataTypes = GpuColumnVector.extractTypes(schema)
     val readOption = CoalesceReadOption(conf)
 
     child.executeColumnar().mapPartitions { iter =>
-      val targetSize = BatchRuntimeHints.effectiveShuffleCoalesceTargetBytes(
-        staticTargetSize,
-        RapidsAutotuneTaskHints.currentShuffleHint,
-        RapidsAutotuneTaskHints.currentBatchHint)
       getGpuShuffleCoalesceIterator(iter, targetSize, dataTypes,
         readOption, metricsMap)
     }
@@ -956,3 +952,4 @@ class GpuShuffleCoalesceIterator(iter: Iterator[CoalescedHostResult],
     }
   }
 }
+

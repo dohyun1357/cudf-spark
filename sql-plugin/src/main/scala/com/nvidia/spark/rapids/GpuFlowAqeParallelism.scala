@@ -178,10 +178,10 @@ private[rapids] object GpuFlowPartitionOptimizer {
         modeled.size.toDouble * launchNanosPerTask)
   }
 
-  private def saturatingSum(values: Seq[Long]): Long =
+  private[rapids] def saturatingSum(values: Seq[Long]): Long =
     values.foldLeft(0L)((sum, value) => saturatingAdd(sum, math.max(0L, value)))
 
-  private def saturatingAdd(left: Long, right: Long): Long =
+  private[rapids] def saturatingAdd(left: Long, right: Long): Long =
     if (right > Long.MaxValue - left) Long.MaxValue else left + right
 }
 
@@ -204,7 +204,7 @@ case class GpuFlowAqeParallelismRule()
 
   override def apply(plan: SparkPlan): SparkPlan = {
     val rapidsConf = new RapidsConf(plan.conf)
-    if (!rapidsConf.autotuneGraphEnabled || !rapidsConf.isAutotuneOptimizeMode) {
+    if (!rapidsConf.isAutotuneOptimizeMode) {
       return plan
     }
     val calibration = RapidsAutotuneDriverEndpoint.aqeCalibrationSnapshot
@@ -263,14 +263,11 @@ case class GpuFlowAqeParallelismRule()
         group.foreach { info =>
           info.stage.mapStats.get.bytesByPartitionId.zipWithIndex.foreach {
             case (bytes, index) =>
-              combined(index) = if (bytes > Long.MaxValue - combined(index)) {
-                Long.MaxValue
-              } else combined(index) + math.max(0L, bytes)
+              combined(index) =
+                GpuFlowPartitionOptimizer.saturatingAdd(combined(index), math.max(0L, bytes))
           }
         }
-        val totalBytes = combined.foldLeft(0L) { (sum, bytes) =>
-          if (bytes > Long.MaxValue - sum) Long.MaxValue else sum + bytes
-        }
+        val totalBytes = GpuFlowPartitionOptimizer.saturatingSum(combined.toSeq)
         val rate = variableRate.get
         if (calibrated.fixedNanosPerTask.isEmpty) {
           return (emptyDecision.copy(taskSlots = taskSlots,
@@ -355,13 +352,9 @@ case class GpuFlowAqeParallelismRule()
           Some(group.map { info =>
             val stageBytes = info.stage.mapStats.get.bytesByPartitionId
             val specs: Seq[ShufflePartitionSpec] = selected.ranges.map { range =>
-              val bytes = stageBytes.slice(
-                range.startReducerIndex, range.endReducerIndex).foldLeft(0L) { (sum, raw) =>
-                val value = math.max(0L, raw)
-                if (value > Long.MaxValue - sum) Long.MaxValue else sum + value
-              }
-              CoalescedPartitionSpec(
-                range.startReducerIndex, range.endReducerIndex, math.max(0L, bytes))
+              val bytes = GpuFlowPartitionOptimizer.saturatingSum(
+                stageBytes.slice(range.startReducerIndex, range.endReducerIndex).toSeq)
+              CoalescedPartitionSpec(range.startReducerIndex, range.endReducerIndex, bytes)
             }
             info.stage.id -> specs
           }.toMap)

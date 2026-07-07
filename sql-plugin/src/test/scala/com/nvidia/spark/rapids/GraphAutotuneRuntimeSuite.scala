@@ -72,22 +72,17 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       stageId = key.stageId,
       stageAttemptId = key.stageAttemptId,
       version = 7L,
-      scan = ScanRuntimeHint(eagerPrefetch = true, minReadWindow = 1,
-        maxReadWindow = 4, maxReadyBytes = 1024L))
+      scan = ScanRuntimeHint(eagerPrefetch = true, maxReadWindow = 4, maxReadyBytes = 1024L))
 
     assert(hint.key == key)
   }
 
-  test("shuffle and batch runtime hints default to empty no-op") {
+  test("shuffle runtime hints default to empty no-op") {
     assert(ShuffleRuntimeHint.empty.prefetchWindow == 0)
     assert(ShuffleRuntimeHint.empty.maxReadyBytes == Long.MaxValue)
-    assert(ShuffleRuntimeHint.empty.coalesceTargetBytes == 0L)
-    assert(BatchRuntimeHint.empty.targetBatchBytes == 0L)
-    assert(BatchRuntimeHint.empty.maxBatchBytes == Long.MaxValue)
 
     val empty = StageRuntimeHint.empty(key)
     assert(empty.shuffle == ShuffleRuntimeHint.empty)
-    assert(empty.batch == BatchRuntimeHint.empty)
   }
 
   test("hint cache memoizes no-hint responses by stage key") {
@@ -124,11 +119,9 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
   test("task hint state exposes only applied hints") {
     val scanHint = ScanRuntimeHint(
       eagerPrefetch = true,
-      minReadWindow = 1,
       maxReadWindow = 4,
       maxReadyBytes = 1024L)
-    val shuffleHint = ShuffleRuntimeHint(
-      prefetchWindow = 2, maxReadyBytes = 4096L, coalesceTargetBytes = 1024L)
+    val shuffleHint = ShuffleRuntimeHint(prefetchWindow = 2, maxReadyBytes = 4096L)
     val hint = AutotuneCachedHint(StageRuntimeHint(
       executionId = key.executionId,
       stageId = key.stageId,
@@ -157,7 +150,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
   test("shuffle read actuator only tightens the static bytes-in-flight cap") {
     val staticCap = 128L * 1024 * 1024
     def hint(b: Long): Option[ShuffleRuntimeHint] =
-      Some(ShuffleRuntimeHint(prefetchWindow = 0, maxReadyBytes = b, coalesceTargetBytes = 0L))
+      Some(ShuffleRuntimeHint(prefetchWindow = 0, maxReadyBytes = b))
 
     // Disabled -> static unchanged, even with a tightening hint present.
     assert(ShuffleReadHints.effectiveMaxBytesInFlight(staticCap, hint(64L), enabled = false) ==
@@ -181,8 +174,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
   }
 
   test("shuffle prefetch actuator enforces the optimizer-selected outstanding-work window") {
-    val hint = Some(ShuffleRuntimeHint(
-      prefetchWindow = 4, maxReadyBytes = 128L, coalesceTargetBytes = 0L))
+    val hint = Some(ShuffleRuntimeHint(prefetchWindow = 4, maxReadyBytes = 128L))
     assert(ShuffleReadHints.effectivePrefetchWindow(hint) == 4)
     assert(ShuffleReadHints.effectivePrefetchWindow(None) == Integer.MAX_VALUE)
     assert(ShuffleReadHints.blocksToDrain(4, outstandingBlocks = 1L, readyBlocks = 10) == 3)
@@ -244,10 +236,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true",
       RapidsConf.SHUFFLE_MULTITHREADED_MAX_BYTES_IN_FLIGHT.key -> "2048",
       RapidsConf.AUTOTUNE_SHUFFLE_MAX_READY_BYTES.key -> "2048",
-      RapidsConf.AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW.key -> "6",
-      RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true",
-      RapidsConf.GPU_BATCH_SIZE_BYTES.key -> "8192",
-      RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "16384"))
+      RapidsConf.AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW.key -> "6"))
     val optimizer = new AnalyticalGraphWideAutotuneOptimizer(
       GraphOptimizerConstraints.fromConf(conf))
     val shape = AutotuneStageShape(
@@ -256,32 +245,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
 
     // Cold hints begin at deployed/native settings or the configured feasible envelope, not at
     // an unevidenced low-resource point.
-    assert(hint.scan == ScanRuntimeHint(true, 1, 8, 1024L))
-    assert(hint.shuffle == ShuffleRuntimeHint(6, 2048L, 8192L))
-    assert(hint.batch == BatchRuntimeHint(8192L, 16384L))
-  }
-
-  test("native batch size remains in the optimizer domain") {
-    val oneGiB = 1024L * 1024L * 1024L
-    val conf = new RapidsConf(Map(
-      RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
-      RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true",
-      RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true",
-      RapidsConf.GPU_BATCH_SIZE_BYTES.key -> "1g",
-      RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "512m"))
-
-    val constraints = GraphOptimizerConstraints.fromConf(conf)
-    // A configured maximum below the native target never excludes the deployed-safe point.
-    assert(constraints.batch.initialTargetBytes == oneGiB)
-    assert(constraints.batch.maxBatchBytes == oneGiB)
-
-    val optimizer = new AnalyticalGraphWideAutotuneOptimizer(constraints)
-    val shape = AutotuneStageShape(
-      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 200, hasShuffle = true)
-    val hint = optimizer.initialHint(key, AutotuneStageDescriptor(shape))
-    assert(hint.shuffle.coalesceTargetBytes == oneGiB)
-    assert(hint.batch == BatchRuntimeHint(oneGiB, oneGiB))
+    assert(hint.scan == ScanRuntimeHint(true, 8, 1024L))
+    assert(hint.shuffle == ShuffleRuntimeHint(6, 2048L))
   }
 
   test("each autotune subsystem gates independently for mechanism ablation") {
@@ -289,13 +254,11 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
       RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.OPTIMIZE.toString,
       RapidsConf.AUTOTUNE_SCAN_ENABLED.key -> "false",
-      RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "false",
-      RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true"))
+      RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true"))
 
     val constraints = GraphOptimizerConstraints.fromConf(conf)
     assert(!constraints.scan.enabled)
-    assert(!constraints.shuffle.enabled)
-    assert(constraints.batch.enabled)
+    assert(constraints.shuffle.enabled)
 
     // A disabled subsystem publishes only the empty no-op hint for its actuator, while an
     // enabled sibling subsystem still publishes its own hint.
@@ -304,8 +267,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 200, hasShuffle = true)
     val hint = optimizer.initialHint(key, AutotuneStageDescriptor(shape))
     assert(hint.scan == ScanRuntimeHint.empty)
-    assert(hint.shuffle == ShuffleRuntimeHint.empty)
-    assert(hint.batch.targetBatchBytes > 0L)
+    assert(hint.shuffle.maxReadyBytes > 0L)
   }
 
   test("driver endpoint publishes stable positive no-op hints") {
@@ -323,7 +285,6 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(!first.scan.eagerPrefetch)
       assert(first.scan.maxReadWindow == 0)
       assert(first.shuffle == ShuffleRuntimeHint.empty)
-      assert(first.batch == BatchRuntimeHint.empty)
 
       val response = RapidsAutotuneDriverEndpoint.handleHintRequest(
         RapidsAutotuneHintRequestMsg("exec-1", key))
@@ -394,8 +355,6 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(second.exists(_.scan == ScanRuntimeHint.empty))
       assert(first.exists(_.shuffle == ShuffleRuntimeHint.empty))
       assert(second.exists(_.shuffle == ShuffleRuntimeHint.empty))
-      assert(first.exists(_.batch == BatchRuntimeHint.empty))
-      assert(second.exists(_.batch == BatchRuntimeHint.empty))
     } finally {
       RapidsAutotuneDriverEndpoint.shutdown()
     }
@@ -419,7 +378,6 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       assert(hint.version == 1L)
       assert(hint.scan == ScanRuntimeHint(
         eagerPrefetch = true,
-        minReadWindow = 1,
         maxReadWindow = 4,
         maxReadyBytes = 1024L))
 
@@ -436,12 +394,10 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val conf = new RapidsConf(Map(RapidsConf.AUTOTUNE_FAIL_OPEN.key -> "true"))
     val endpoint = new RapidsAutotuneExecutorEndpoint(ctx, conf)
     val scanHint = ScanRuntimeHint(
-      eagerPrefetch = true, minReadWindow = 1, maxReadWindow = 4, maxReadyBytes = 2048L)
-    val shuffleHint = ShuffleRuntimeHint(
-      prefetchWindow = 6, maxReadyBytes = 4096L, coalesceTargetBytes = 1024L)
-    val batchHint = BatchRuntimeHint(targetBatchBytes = 4096L, maxBatchBytes = 8192L)
+      eagerPrefetch = true, maxReadWindow = 4, maxReadyBytes = 2048L)
+    val shuffleHint = ShuffleRuntimeHint(prefetchWindow = 6, maxReadyBytes = 4096L)
     val cached = AutotuneCachedHint(StageRuntimeHint.empty(key).copy(
-      version = 9L, scan = scanHint, shuffle = shuffleHint, batch = batchHint),
+      version = 9L, scan = scanHint, shuffle = shuffleHint),
       hasHint = true)
 
     endpoint.recordAppliedHint(key, taskAttemptId = 42L, partitionId = 5, cached)
@@ -456,7 +412,6 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
         assert(msg.hasHint)
         assert(msg.scan == scanHint)
         assert(msg.shuffle == shuffleHint)
-        assert(msg.batch == batchHint)
       case other => fail(s"unexpected message sent to driver: $other")
     }
   }
@@ -471,10 +426,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
       hintVersion = 9L,
       hasHint = true,
       scan = ScanRuntimeHint(
-        eagerPrefetch = true, minReadWindow = 1, maxReadWindow = 4, maxReadyBytes = 2048L),
-      shuffle = ShuffleRuntimeHint(
-        prefetchWindow = 6, maxReadyBytes = 4096L, coalesceTargetBytes = 1024L),
-      batch = BatchRuntimeHint(targetBatchBytes = 7000L, maxBatchBytes = 8192L))
+        eagerPrefetch = true, maxReadWindow = 4, maxReadyBytes = 2048L),
+      shuffle = ShuffleRuntimeHint(prefetchWindow = 6, maxReadyBytes = 4096L))
 
     val event = RapidsAutotuneDriverEndpoint.toAppliedEvent(msg)
 
@@ -487,26 +440,19 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(event.hintVersion == 9L)
     assert(event.hasHint)
     assert(event.scanEagerPrefetch)
-    assert(event.scanMinReadWindow == 1)
     assert(event.scanMaxReadWindow == 4)
     assert(event.scanMaxReadyBytes == 2048L)
     assert(event.shufflePrefetchWindow == 6)
     assert(event.shuffleMaxReadyBytes == 4096L)
-    assert(event.shuffleCoalesceTargetBytes == 1024L)
-    assert(event.batchTargetBatchBytes == 7000L)
-    assert(event.batchMaxBatchBytes == 8192L)
   }
 
-  test("stage hint listener publishes bounded shuffle and batch hints for shuffle stages") {
+  test("stage hint listener publishes bounded shuffle hints for shuffle stages") {
     val conf = new RapidsConf(Map(
       RapidsConf.AUTOTUNE_GRAPH_ENABLED.key -> "true",
       RapidsConf.AUTOTUNE_GRAPH_MODE.key -> AutotuneGraphMode.GRAPH.toString,
       RapidsConf.AUTOTUNE_SHUFFLE_ENABLED.key -> "true",
       RapidsConf.AUTOTUNE_SHUFFLE_MAX_PREFETCH_WINDOW.key -> "6",
-      RapidsConf.AUTOTUNE_SHUFFLE_MAX_READY_BYTES.key -> "2048",
-      RapidsConf.AUTOTUNE_BATCH_ENABLED.key -> "true",
-      RapidsConf.GPU_BATCH_SIZE_BYTES.key -> "4096",
-      RapidsConf.AUTOTUNE_BATCH_MAX_BYTES.key -> "8192"))
+      RapidsConf.AUTOTUNE_SHUFFLE_MAX_READY_BYTES.key -> "2048"))
     RapidsAutotuneDriverEndpoint.init(null, conf)
     try {
       val listener = new RapidsAutotuneStageHintListener(conf)
@@ -516,10 +462,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
         key.executionId, key.stageId, key.stageAttemptId, shuffleStage)
 
       assert(hint.version == 1L)
-      assert(hint.shuffle ==
-        ShuffleRuntimeHint(prefetchWindow = 6, maxReadyBytes = 2048L,
-          coalesceTargetBytes = 4096L))
-      assert(hint.batch == BatchRuntimeHint(targetBatchBytes = 4096L, maxBatchBytes = 8192L))
+      assert(hint.shuffle == ShuffleRuntimeHint(prefetchWindow = 6, maxReadyBytes = 2048L))
       // A shuffle-only stage is not a scan-prefetch candidate, so the scan slot stays empty.
       assert(hint.scan == ScanRuntimeHint.empty)
 
@@ -617,9 +560,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     updateIntervalNanos = intervalNanos,
     scan = ScanOptimizerBounds(enabled = true, initialReadWindow = 2, maxReadyBytes = 4096L),
     shuffle = ShuffleOptimizerBounds(enabled = true, initialPrefetchWindow = 1,
-      initialReadyBytes = 128L, initialCoalesceBytes = 256L),
-    batch = BatchOptimizerBounds(enabled = true, initialTargetBytes = 256L,
-      maxBatchBytes = 1024L))
+      initialReadyBytes = 128L))
 
   private def optimizerObservation(
       stageKey: AutotuneStageKey,
@@ -654,8 +595,8 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val shape = AutotuneStageShape(
       hasGpuScan = true, hasGpuPrefetchConsumer = true, numTasks = 50, hasShuffle = true)
     val current = StageRuntimeHint.empty(key).copy(
-      scan = ScanRuntimeHint(true, 1, 2, 4096L),
-      shuffle = ShuffleRuntimeHint(1, 128L, 0L))
+      scan = ScanRuntimeHint(true, 2, 4096L),
+      shuffle = ShuffleRuntimeHint(1, 128L))
     val observation = StageObservationAgg.empty
       .merge(optimizerObservation(key, 1L, wait = 0L, holding = 2000L,
         duration = 10000L, input = 1000L, output = 500L, shuffleRead = 500L))
@@ -673,24 +614,6 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(reasons.scanWindow == "single-operating-point-response-unidentified")
     assert(reasons.shuffleWindow == "single-operating-point-response-unidentified")
     assert(reasons.shuffleBytes == "single-operating-point-response-unidentified")
-  }
-
-  test("single-setting observations do not invent a batch-size response") {
-    val constraints = optimizerConstraints()
-    val shape = AutotuneStageShape(
-      hasGpuScan = false, hasGpuPrefetchConsumer = true, numTasks = 50)
-    val current = StageRuntimeHint.empty(key).copy(
-      batch = BatchRuntimeHint(256L, 1024L))
-    val observation = StageObservationAgg.empty
-      .merge(optimizerObservation(key, 1L, wait = 0L, holding = 1000L,
-        duration = 5000L, input = 4096L, output = 4096L))
-      .merge(optimizerObservation(key, 2L, wait = 0L, holding = 1000L,
-        duration = 5000L, input = 4096L, output = 4096L))
-
-    val curve = AnalyticalStageCostModel.costCurve(
-      observation, current, shape, constraints).get
-    assert(curve.currentControl.batchBytes == 256.0)
-    assert(curve.freezeReasons.batchBytes == "no-measured-work")
   }
 
   test("optimizer state owns sample windows and update cadence") {
@@ -731,7 +654,7 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     val cold = optimizer.drainDecisionRecords()
     assert(cold.size == 1)
     assert(cold.head.trigger == "stage-submitted")
-    assert(cold.head.freezeReasons.gpuTasks == "no-current-version-calibration")
+    assert(cold.head.freezeReasons.scanWindow == "no-current-version-calibration")
 
     val first = optimizerObservation(key, 1L, wait = 1000L, holding = 100L,
       duration = 1100L, input = 0L, output = 0L)
@@ -745,17 +668,16 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(record.trigger == "feedback")
     assert(record.graphCurrentObjectiveNanos > 0.0)
     assert(record.durationAdjoint == 1.0)
-    // GPU service time is still measured and reported even though the gpu actuator is gone.
-    assert(record.currentControl.gpuTasks == 0.0)
-    assert(record.endToEndGradient.gpuTasks < 0.0)
-    assert(record.freezeReasons.gpuTasks == "actuator-not-present")
+    // GPU service time is still measured and reported through its lane gradient even though
+    // there is no gpu actuator control.
+    assert(record.endToEndGradient.gpu < 0.0)
 
     val event = RapidsAutotuneDriverEndpoint.toDecisionEvent(record)
     assert(event.epochId == record.epochId)
     assert(event.parentStageIds == Seq(1))
-    assert(event.currentGpuTasks == record.currentControl.gpuTasks)
-    assert(event.gpuTasksGradient == record.endToEndGradient.gpuTasks)
-    assert(event.gpuTasksFreezeReason == "actuator-not-present")
+    assert(event.gpuGradient == record.endToEndGradient.gpu)
+    assert(event.scanGradient == record.endToEndGradient.scan)
+    assert(event.shuffleGradient == record.endToEndGradient.shuffle)
   }
 
   test("optimizer calibrates only observations from the current complete hint version") {
@@ -850,13 +772,4 @@ class GraphAutotuneRuntimeSuite extends AnyFunSuite {
     assert(late.forall(record => record.completed && !record.active))
   }
 
-  test("batch runtime hint helpers clamp and fail open") {
-    val batch = BatchRuntimeHint(targetBatchBytes = 1024L, maxBatchBytes = 768L)
-    val shuffle = ShuffleRuntimeHint(prefetchWindow = 0, maxReadyBytes = 1L,
-      coalesceTargetBytes = 2048L)
-    assert(BatchRuntimeHints.effectiveTargetBatchBytes(256L, Some(batch)) == 768L)
-    assert(BatchRuntimeHints.effectiveShuffleCoalesceTargetBytes(
-      256L, Some(shuffle), Some(batch)) == 768L)
-    assert(BatchRuntimeHints.effectiveTargetBatchBytes(256L, None) == 256L)
-  }
 }

@@ -22,10 +22,8 @@ class GpuFlowModelSuite extends AnyFunSuite {
   private val key = AutotuneStageKey(executionId = 11L, stageId = 3, stageAttemptId = 1)
   private val baseline = GpuFlowControl(
     scanWindow = 2.0,
-    gpuTasks = 0.0,
     shuffleWindow = 2.0,
-    shuffleBytes = 128.0,
-    batchBytes = 256.0)
+    shuffleBytes = 128.0)
 
   test("flow-stage evaluation sums the bottleneck lane with fixed and retry work") {
     val work = GpuFlowStageWork(
@@ -39,11 +37,9 @@ class GpuFlowModelSuite extends AnyFunSuite {
 
     assert(evaluation.predictedNanos == 1120.0)
     // Only the critical scan lane carries sensitivity at the measured point.
-    assert(evaluation.gradient.scanWindow == -1000.0)
-    assert(evaluation.gradient.gpuTasks == 0.0)
-    assert(evaluation.gradient.shuffleWindow == 0.0)
-    assert(evaluation.gradient.shuffleBytes == 0.0)
-    assert(evaluation.gradient.batchBytes == 0.0)
+    assert(evaluation.gradient.scan == -1000.0)
+    assert(evaluation.gradient.gpu == 0.0)
+    assert(evaluation.gradient.shuffle == 0.0)
   }
 
   test("flow-stage evaluation shares exact lane ties") {
@@ -57,9 +53,9 @@ class GpuFlowModelSuite extends AnyFunSuite {
     val evaluation = GpuFlowStageModel.evaluate(work)
 
     assert(evaluation.predictedNanos == 500.0)
-    assert(evaluation.gradient.scanWindow == -250.0)
-    assert(evaluation.gradient.gpuTasks == -250.0)
-    assert(evaluation.gradient.shuffleWindow == 0.0)
+    assert(evaluation.gradient.scan == -250.0)
+    assert(evaluation.gradient.gpu == -250.0)
+    assert(evaluation.gradient.shuffle == 0.0)
   }
 
   test("flow-graph reverse pass assigns end-to-end criticality") {

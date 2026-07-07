@@ -102,7 +102,6 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
   test("scan read window settings honor graph scan hint caps") {
     val hint = ScanRuntimeHint(
       eagerPrefetch = true,
-      minReadWindow = 2,
       maxReadWindow = 8,
       maxReadyBytes = 1024L)
     val settings = ScanReadWindowSettings.fromHint(
@@ -120,7 +119,7 @@ class ScanPrefetchSettingsSuite extends AnyFunSuite {
 
   test("graph scan hints apply a fixed optimizer-selected target") {
     val settings = ScanReadWindowSettings.fromHint(
-      ScanRuntimeHint(true, minReadWindow = 1, maxReadWindow = 8, maxReadyBytes = 1024L),
+      ScanRuntimeHint(true, maxReadWindow = 8, maxReadyBytes = 1024L),
       maxReadWindowCap = 8,
       inputFileCount = 6).get
     val controller = new ScanReadWindowController(settings)

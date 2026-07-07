@@ -879,8 +879,8 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
     recordAutotuneHintForTask(tc)
     // Set the priority for the task as soon as it is launched
     TaskPriority.getTaskPriority(tc.taskAttemptId())
-    onTaskCompletion(tc, taskContext => {
-      TaskPriority.taskDone(taskContext.taskAttemptId())
+    onTaskCompletion(tc, tc => {
+      TaskPriority.taskDone(tc.taskAttemptId())
       RapidsAutotuneTaskHints.clearCurrentHint()
     })
     extraExecutorPlugins.foreach(_.onTaskStart())

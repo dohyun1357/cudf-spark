@@ -1877,8 +1877,8 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     conf("spark.rapids.sql.autotune.graph.mode")
       .doc("Autotuning mode. OBSERVE is the default no-op/telemetry mode: it emits applied-hint " +
         "eventlog records and publishes only empty (no-op) stage hints, leaving execution " +
-        "unchanged. GRAPH enables one driver graph optimizer whose joint scan/shuffle/batch " +
-        "hint is bounded by static caps. OPTIMIZE additionally enables the model-driven AQE " +
+        "unchanged. GRAPH enables one driver graph optimizer whose joint scan/shuffle hint " +
+        "is bounded by static caps. OPTIMIZE additionally enables the model-driven AQE " +
         "reducer-parallelism rule.")
       .stringConf
       .transform(_.toUpperCase(java.util.Locale.ROOT))
@@ -1937,7 +1937,7 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     conf("spark.rapids.sql.autotune.shuffle.enabled")
       .doc("Enable graph autotune shuffle hints. When false (default), the driver publishes " +
         "only empty (no-op) shuffle hints. The multithreaded reader consumes prefetch-window " +
-        "and max-ready-bytes; shuffle coalescing consumes coalesce-target bytes.")
+        "and max-ready-bytes.")
       .booleanConf
       .createWithDefault(false)
 
@@ -1954,23 +1954,6 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
         "tighten the static shuffle bytes-in-flight cap.")
       .bytesConf(ByteUnit.BYTE)
       .checkValue(v => v > 0, "The autotune shuffle max ready bytes must be greater than 0.")
-      .createWithDefault(Long.MaxValue)
-
-  val AUTOTUNE_BATCH_ENABLED =
-    conf("spark.rapids.sql.autotune.batch.enabled")
-      .doc("Enable graph autotune batch-sizing hints. When false (default), the driver publishes " +
-        "only empty (no-op) batch hints. Enabled hints drive the GPU coalesce target under " +
-        "maxBytes.")
-      .booleanConf
-      .createWithDefault(false)
-
-  val AUTOTUNE_BATCH_MAX_BYTES =
-    conf("spark.rapids.sql.autotune.batch.maxBytes")
-      .doc("Largest batch target considered by graph autotuning. The native " +
-        s"'${GPU_BATCH_SIZE_BYTES.key}' target is always included because it is already a safe " +
-        "deployed point.")
-      .bytesConf(ByteUnit.BYTE)
-      .checkValue(v => v > 0, "The autotune batch max bytes must be greater than 0.")
       .createWithDefault(Long.MaxValue)
 
   val ENABLE_DELTA_WRITE = conf("spark.rapids.sql.format.delta.write.enabled")
@@ -3991,9 +3974,7 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val autotuneShuffleMaxReadyBytes: Long = get(AUTOTUNE_SHUFFLE_MAX_READY_BYTES)
 
-  lazy val autotuneBatchEnabled: Boolean = get(AUTOTUNE_BATCH_ENABLED)
 
-  lazy val autotuneBatchMaxBytes: Long = get(AUTOTUNE_BATCH_MAX_BYTES)
 
   lazy val isDeltaWriteEnabled: Boolean = get(ENABLE_DELTA_WRITE)
 

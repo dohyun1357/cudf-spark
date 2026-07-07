@@ -67,8 +67,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   // The graph optimizer only evaluates decision epochs in the GRAPH/OPTIMIZE modes.
   @volatile private var optimizerEnabled = false
   @volatile private var optimizer: AnalyticalGraphWideAutotuneOptimizer = _
-  // Injectable monotonic clock so optimizer update cadence is deterministically testable.
-  @volatile private var nanoSource: () => Long = () => System.nanoTime()
 
   def init(sc: SparkContext, conf: RapidsConf): Unit = synchronized {
     enabled = conf.autotuneGraphEnabled
@@ -76,7 +74,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     sparkContext = if (enabled) sc else null
     optimizer = new AnalyticalGraphWideAutotuneOptimizer(
       GraphOptimizerConstraints.fromConf(conf))
-    nanoSource = () => System.nanoTime()
     hints.clear()
     observations.clear()
     executorCores.clear()
@@ -96,7 +93,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     optimizerEnabled = false
     sparkContext = null
     optimizer = null
-    nanoSource = () => System.nanoTime()
     hints.clear()
     observations.clear()
     executorCores.clear()
@@ -160,11 +156,6 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     }
   }
 
-  /** Test-only: inject a deterministic monotonic clock for optimizer update cadence. */
-  private[rapids] def setNanoSourceForTest(source: () => Long): Unit = synchronized {
-    nanoSource = source
-  }
-
   /** Test-only: override the task-CPU divisor used by the cluster slot census. */
   private[rapids] def setTaskCpusForTest(cpus: Int): Unit = synchronized {
     taskCpus = math.max(1, cpus)
@@ -178,8 +169,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       StageRuntimeHint.empty(key)
     } else {
       val content = optimizer.initialHint(key, descriptor)
-      val published = publishStageHint(
-        key, content.scan, content.shuffle, content.batch)
+      val published = publishStageHint(key, content.scan, content.shuffle)
       optimizer.hintPublished(published)
       published
     }
@@ -236,8 +226,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   def publishStageHint(
       key: AutotuneStageKey,
       scanHint: ScanRuntimeHint,
-      shuffleHint: ShuffleRuntimeHint = ShuffleRuntimeHint.empty,
-      batchHint: BatchRuntimeHint = BatchRuntimeHint.empty): StageRuntimeHint = synchronized {
+      shuffleHint: ShuffleRuntimeHint = ShuffleRuntimeHint.empty): StageRuntimeHint = synchronized {
     if (!enabled) {
       StageRuntimeHint.empty(key)
     } else {
@@ -248,8 +237,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
           stageAttemptId = key.stageAttemptId,
           version = nextHintVersion.getAndIncrement(),
           scan = scanHint,
-          shuffle = shuffleHint,
-          batch = batchHint)
+          shuffle = shuffleHint)
         hints.put(key, hint)
         hint
       }
@@ -284,18 +272,15 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       hintVersion = msg.hintVersion,
       hasHint = msg.hasHint,
       scanEagerPrefetch = msg.scan.eagerPrefetch,
-      scanMinReadWindow = msg.scan.minReadWindow,
       scanMaxReadWindow = msg.scan.maxReadWindow,
       scanMaxReadyBytes = msg.scan.maxReadyBytes,
       shufflePrefetchWindow = msg.shuffle.prefetchWindow,
-      shuffleMaxReadyBytes = msg.shuffle.maxReadyBytes,
-      shuffleCoalesceTargetBytes = msg.shuffle.coalesceTargetBytes,
-      batchTargetBatchBytes = msg.batch.targetBatchBytes,
-      batchMaxBatchBytes = msg.batch.maxBatchBytes)
+      shuffleMaxReadyBytes = msg.shuffle.maxReadyBytes)
 
   /**
    * Ingest a runtime observation: update the per-stage aggregate, post an eventlog record, and (in
-   * a closed-loop mode) run the graph optimizer, possibly republishing a complete joint hint.
+   * a closed-loop mode) feed the graph optimizer's observation window for its next reporting-only
+   * decision epoch.
    */
   def handleObservation(msg: RapidsAutotuneObservationMsg): Unit = {
     if (!enabled) {
@@ -325,7 +310,7 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       if (current == null) {
         return
       }
-      optimizer.observe(msg, current, nanoSource())
+      optimizer.observe(msg, current, System.nanoTime())
       publishDecisionRecords()
     } catch {
       case NonFatal(e) =>
@@ -360,20 +345,14 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       predictedCurrentNanos = record.predictedCurrentNanos,
       durationAdjoint = record.durationAdjoint,
       currentScanWindow = record.currentControl.scanWindow,
-      currentGpuTasks = record.currentControl.gpuTasks,
       currentShuffleWindow = record.currentControl.shuffleWindow,
       currentShuffleBytes = record.currentControl.shuffleBytes,
-      currentBatchBytes = record.currentControl.batchBytes,
-      scanWindowGradient = record.endToEndGradient.scanWindow,
-      gpuTasksGradient = record.endToEndGradient.gpuTasks,
-      shuffleWindowGradient = record.endToEndGradient.shuffleWindow,
-      shuffleBytesGradient = record.endToEndGradient.shuffleBytes,
-      batchBytesGradient = record.endToEndGradient.batchBytes,
+      scanGradient = record.endToEndGradient.scan,
+      gpuGradient = record.endToEndGradient.gpu,
+      shuffleGradient = record.endToEndGradient.shuffle,
       scanWindowFreezeReason = record.freezeReasons.scanWindow,
-      gpuTasksFreezeReason = record.freezeReasons.gpuTasks,
       shuffleWindowFreezeReason = record.freezeReasons.shuffleWindow,
-      shuffleBytesFreezeReason = record.freezeReasons.shuffleBytes,
-      batchBytesFreezeReason = record.freezeReasons.batchBytes)
+      shuffleBytesFreezeReason = record.freezeReasons.shuffleBytes)
 
   private[rapids] def aqeCalibrationSnapshot: Option[GpuFlowAqeCalibration] = synchronized {
     val executionId = Option(sparkContext)
@@ -621,8 +600,7 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
     if (hint.version > 0) {
       logDebug(s"Published RAPIDS graph autotune hint version ${hint.version} " +
         s"for execution $executionId, stage ${key.stageId}.${key.stageAttemptId}, " +
-        s"scan hint ${hint.scan}, shuffle hint ${hint.shuffle}, " +
-        s"batch hint ${hint.batch}")
+        s"scan hint ${hint.scan}, shuffle hint ${hint.shuffle}")
     }
     hint
   }

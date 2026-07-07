@@ -64,8 +64,6 @@ case class ScanReadWindowSettings(
     readWindow: Int)
 
 object ScanReadWindowSettings {
-  val MIN_WINDOW = 1
-
   /** Inert all-zero settings for readers that consult the window only when enabled. */
   val disabled: ScanReadWindowSettings = ScanReadWindowSettings(enabled = false, readWindow = 0)
 

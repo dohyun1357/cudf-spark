@@ -41,38 +41,24 @@ case class AutotuneStageKey(
 
 case class ScanRuntimeHint(
     eagerPrefetch: Boolean,
-    minReadWindow: Int,
     maxReadWindow: Int,
     maxReadyBytes: Long)
 
 object ScanRuntimeHint {
   val empty: ScanRuntimeHint = ScanRuntimeHint(
     eagerPrefetch = false,
-    minReadWindow = 0,
     maxReadWindow = 0,
     maxReadyBytes = Long.MaxValue)
 }
 
 case class ShuffleRuntimeHint(
     prefetchWindow: Int,
-    maxReadyBytes: Long,
-    coalesceTargetBytes: Long)
+    maxReadyBytes: Long)
 
 object ShuffleRuntimeHint {
   val empty: ShuffleRuntimeHint = ShuffleRuntimeHint(
     prefetchWindow = 0,
-    maxReadyBytes = Long.MaxValue,
-    coalesceTargetBytes = 0L)
-}
-
-case class BatchRuntimeHint(
-    targetBatchBytes: Long,
-    maxBatchBytes: Long)
-
-object BatchRuntimeHint {
-  val empty: BatchRuntimeHint = BatchRuntimeHint(
-    targetBatchBytes = 0L,
-    maxBatchBytes = Long.MaxValue)
+    maxReadyBytes = Long.MaxValue)
 }
 
 case class StageRuntimeHint(
@@ -81,8 +67,7 @@ case class StageRuntimeHint(
     stageAttemptId: Int,
     version: Long,
     scan: ScanRuntimeHint,
-    shuffle: ShuffleRuntimeHint = ShuffleRuntimeHint.empty,
-    batch: BatchRuntimeHint = BatchRuntimeHint.empty) {
+    shuffle: ShuffleRuntimeHint = ShuffleRuntimeHint.empty) {
   def key: AutotuneStageKey = AutotuneStageKey(executionId, stageId, stageAttemptId)
 }
 
@@ -93,8 +78,7 @@ object StageRuntimeHint {
     stageAttemptId = key.stageAttemptId,
     version = 0L,
     scan = ScanRuntimeHint.empty,
-    shuffle = ShuffleRuntimeHint.empty,
-    batch = BatchRuntimeHint.empty)
+    shuffle = ShuffleRuntimeHint.empty)
 }
 
 case class RapidsAutotuneHintRequestMsg(
@@ -113,8 +97,7 @@ case class RapidsAutotuneHintAppliedMsg(
     hintVersion: Long,
     hasHint: Boolean,
     scan: ScanRuntimeHint,
-    shuffle: ShuffleRuntimeHint,
-    batch: BatchRuntimeHint)
+    shuffle: ShuffleRuntimeHint)
 
 /**
  * Executor -> driver runtime observation reported (fire-and-forget) at task completion. Feeds the

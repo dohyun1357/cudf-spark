@@ -26,10 +26,8 @@ import scala.collection.mutable
  */
 private[rapids] case class GpuFlowControl(
     scanWindow: Double,
-    gpuTasks: Double,
     shuffleWindow: Double,
-    shuffleBytes: Double,
-    batchBytes: Double)
+    shuffleBytes: Double)
 
 /** Calibrated work at the controls that produced an observation window. */
 private[rapids] case class GpuFlowStageWork(
@@ -40,19 +38,19 @@ private[rapids] case class GpuFlowStageWork(
     retryNanos: Double,
     baseline: GpuFlowControl)
 
-/** Derivative of stage latency with respect to log(control). */
+/**
+ * Derivative of stage latency with respect to log(load) of each concurrent service lane. Batch
+ * work is never measured separately from the residual, so there is no batch lane; both shuffle
+ * controls act on the single shuffle lane.
+ */
 private[rapids] case class GpuFlowGradient(
-    scanWindow: Double = 0.0,
-    gpuTasks: Double = 0.0,
-    shuffleWindow: Double = 0.0,
-    shuffleBytes: Double = 0.0,
-    batchBytes: Double = 0.0) {
+    scan: Double = 0.0,
+    gpu: Double = 0.0,
+    shuffle: Double = 0.0) {
   def scale(factor: Double): GpuFlowGradient = GpuFlowGradient(
-    scanWindow * factor,
-    gpuTasks * factor,
-    shuffleWindow * factor,
-    shuffleBytes * factor,
-    batchBytes * factor)
+    scan * factor,
+    gpu * factor,
+    shuffle * factor)
 }
 
 private[rapids] case class GpuFlowStageEvaluation(
@@ -86,10 +84,9 @@ private[rapids] object GpuFlowStageModel {
     GpuFlowStageEvaluation(
       predictedNanos = bottleneck + work.fixedNanos + work.retryNanos,
       gradient = GpuFlowGradient(
-        scanWindow = laneGradient(scan),
-        gpuTasks = laneGradient(gpu),
-        shuffleWindow = laneGradient(shuffle),
-        shuffleBytes = laneGradient(shuffle)))
+        scan = laneGradient(scan),
+        gpu = laneGradient(gpu),
+        shuffle = laneGradient(shuffle)))
   }
 }
 

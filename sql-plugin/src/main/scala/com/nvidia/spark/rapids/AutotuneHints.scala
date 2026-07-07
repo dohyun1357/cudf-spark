@@ -59,32 +59,6 @@ object RapidsAutotuneTaskHints {
 
   def currentShuffleHint: Option[ShuffleRuntimeHint] =
     Option(currentHint.get()).filter(_.hasHint).map(_.hint.shuffle)
-
-  def currentBatchHint: Option[BatchRuntimeHint] =
-    Option(currentHint.get()).filter(_.hasHint).map(_.hint.batch)
-}
-
-/** Task-local resolution of optimizer-owned batch/coalesce targets. */
-object BatchRuntimeHints {
-  def effectiveTargetBatchBytes(
-      staticTargetBytes: Long,
-      hint: Option[BatchRuntimeHint]): Long = {
-    hint.filter(h => h.targetBatchBytes > 0L && h.maxBatchBytes > 0L)
-      .map(h => math.max(1L, math.min(h.targetBatchBytes, h.maxBatchBytes)))
-      .getOrElse(staticTargetBytes)
-  }
-
-  def effectiveShuffleCoalesceTargetBytes(
-      staticTargetBytes: Long,
-      shuffleHint: Option[ShuffleRuntimeHint],
-      batchHint: Option[BatchRuntimeHint]): Long = {
-    val requested = shuffleHint.map(_.coalesceTargetBytes).filter(_ > 0L)
-      .orElse(batchHint.map(_.targetBatchBytes).filter(_ > 0L))
-    requested.map { target =>
-      val ceiling = batchHint.map(_.maxBatchBytes).filter(_ > 0L).getOrElse(Long.MaxValue)
-      math.max(1L, math.min(target, ceiling))
-    }.getOrElse(staticTargetBytes)
-  }
 }
 
 /**
