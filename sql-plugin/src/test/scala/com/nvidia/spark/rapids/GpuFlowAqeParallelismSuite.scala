@@ -183,6 +183,101 @@ class GpuFlowAqeParallelismSuite extends AnyFunSuite {
     assert(calibration.fixedTaskCostReason == "uncertain-fixed-task-cost-fit")
   }
 
+  test("variable makespan is wave-quantized, not the packing lower bound") {
+    // Five balanced tasks on four slots run two full waves: the second wave lasts one whole task,
+    // not the quarter task the max(total/slots, largest) packing bound charged. The wave-cheaper
+    // coalesce is taken only inside the identified byte region.
+    val bytes = Seq.fill(5)(10L)
+    val current = bytes.indices.map(index => (index, index + 1))
+    val open = GpuFlowPartitionOptimizer.optimize(
+      bytes, current, taskSlots = 4, variableNanosPerByte = 1.0,
+      fixedNanosPerTask = 100.0).get
+    val enveloped = GpuFlowPartitionOptimizer.optimize(
+      bytes, current, taskSlots = 4, variableNanosPerByte = 1.0,
+      fixedNanosPerTask = 100.0, maxRangeBytes = 10L).get
+
+    // One 20-byte range and three 10-byte ranges in a single wave: 20 + 100.
+    assert(open.ranges.size == 4)
+    assert(open.ranges.map(_.bytes) == Seq(20L, 10L, 10L, 10L))
+    assert(open.objectiveNanos == 120.0)
+    // The identified region excludes 20-byte ranges; the retained current layout is priced as
+    // two full waves of byte service (10 + 10) plus two fixed-cost waves, not 12.5 + 200.
+    assert(enveloped.ranges.map(range =>
+      (range.startReducerIndex, range.endReducerIndex)) == current)
+    assert(enveloped.objectiveNanos == 220.0)
+  }
+
+  test("measured launch response unlocks re-splits above the current layout") {
+    // One 80-byte range on eight slots re-splits to eight singleton tasks in one wave when
+    // dispatch is measured cheap; the sub-batch floor freezes that re-split instead.
+    val bytes = Seq.fill(8)(10L)
+    val current = Seq((0, 8))
+    val fine = GpuFlowPartitionOptimizer.optimize(
+      bytes, current, taskSlots = 8, variableNanosPerByte = 1.0,
+      fixedNanosPerTask = 1.0, launchNanosPerTask = 0.0,
+      maxPartitions = 8).get
+    val floored = GpuFlowPartitionOptimizer.optimize(
+      bytes, current, taskSlots = 8, variableNanosPerByte = 1.0,
+      fixedNanosPerTask = 1.0, launchNanosPerTask = 0.0,
+      maxPartitions = 8, minSplitRangeBytes = 16L).get
+
+    assert(fine.ranges.size == 8)
+    assert(fine.objectiveNanos == 11.0)
+    assert(floored.ranges.map(range =>
+      (range.startReducerIndex, range.endReducerIndex)) == current)
+  }
+
+  test("serial dispatch cost is charged per task and can retain the current layout") {
+    val bytes = Seq.fill(8)(10L)
+    val current = Seq((0, 8))
+    val cheapDispatch = GpuFlowPartitionOptimizer.optimize(
+      bytes, current, taskSlots = 4, variableNanosPerByte = 1.0,
+      fixedNanosPerTask = 1.0, launchNanosPerTask = 10.0,
+      maxPartitions = 8).get
+    val dearDispatch = GpuFlowPartitionOptimizer.optimize(
+      bytes, current, taskSlots = 4, variableNanosPerByte = 1.0,
+      fixedNanosPerTask = 1.0, launchNanosPerTask = 30.0,
+      maxPartitions = 8).get
+
+    // At 10 ns per launch the four-range split still wins (20 + 1 + 40 versus 80 + 1 + 10); at
+    // 30 ns per launch every finer layout costs more than the single measured-dispatch task.
+    assert(cheapDispatch.ranges.size == 4)
+    assert(dearDispatch.ranges.map(range =>
+      (range.startReducerIndex, range.endReducerIndex)) == current)
+  }
+
+  test("initial-burst launch spacing requires a census and enough gaps") {
+    val endpoint = RapidsAutotuneDriverEndpoint
+    // Twenty launches on ten slots: the burst is the first ten, spanning nine 1 ms gaps.
+    val spacing = endpoint.initialBurstLaunchSpacingNanos(
+      (0L until 20L).toSeq.reverse, taskSlots = 10)
+    assert(spacing.contains(1.0e6))
+    // No slot census, or fewer than eight dispatch gaps, is not a measurement.
+    assert(endpoint.initialBurstLaunchSpacingNanos((0L until 20L).toSeq, 0).isEmpty)
+    assert(endpoint.initialBurstLaunchSpacingNanos((0L until 8L).toSeq, 10).isEmpty)
+    assert(endpoint.initialBurstLaunchSpacingNanos((0L until 20L).toSeq, 8).isEmpty)
+  }
+
+  test("recorded stage launch spacings serve their median and reset on shutdown") {
+    val endpoint = RapidsAutotuneDriverEndpoint
+    endpoint.shutdown()
+    assert(endpoint.serialLaunchNanosPerTask.isEmpty)
+    endpoint.recordStageLaunchSpacing(2.0e6)
+    endpoint.recordStageLaunchSpacing(5.0e5)
+    endpoint.recordStageLaunchSpacing(1.0e6)
+    endpoint.recordStageLaunchSpacing(-1.0)
+    endpoint.recordStageLaunchSpacing(Double.NaN)
+    assert(endpoint.serialLaunchNanosPerTask.contains(1.0e6))
+    endpoint.shutdown()
+    assert(endpoint.serialLaunchNanosPerTask.isEmpty)
+  }
+
+  test("calibration snapshot does not fabricate a serial launch response") {
+    val calibration = new GpuFlowAqeCalibrationAccumulator(constraints).snapshot
+    assert(calibration.serialLaunchNanosPerTask.isEmpty)
+    assert(calibration.serialLaunchSampleStages == 0L)
+  }
+
   test("direct task setup metric supplies a conservative fixed-cost lower bound") {
     val accumulator = new GpuFlowAqeCalibrationAccumulator(constraints)
     // The duration/byte regression is a zero-intercept boundary fit, but executor deserialize is

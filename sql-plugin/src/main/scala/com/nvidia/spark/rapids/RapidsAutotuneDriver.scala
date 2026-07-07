@@ -54,6 +54,13 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   // actually admits tasks against. The per-executor GPU admission quota is a different resource
   // and undercounts a multi-executor cluster.
   private val executorCores = new ConcurrentHashMap[String, Int]()
+  // Recent per-stage initial-burst launch spacing measurements (nanos per task launch). Their
+  // median estimates the serial driver dispatch work one extra reducer task adds to a stage.
+  // Stage overlap can only stretch a burst (busy slots delay launches), so a contaminated
+  // sample overestimates dispatch and errs against re-splitting.
+  private val launchSpacingSamples = mutable.ArrayBuffer.empty[Double]
+  private val maxLaunchSpacingSamples = 64
+  private var launchSpacingStages = 0L
   @volatile private var taskCpus = 1
   @volatile private var sparkContext: SparkContext = _
   @volatile private var enabled = false
@@ -73,6 +80,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     hints.clear()
     observations.clear()
     executorCores.clear()
+    launchSpacingSamples.clear()
+    launchSpacingStages = 0L
     taskCpus = if (sc == null) 1 else math.max(1, sc.getConf.getInt("spark.task.cpus", 1))
     nextHintVersion.set(1L)
     nextParallelismDecisionId.set(1L)
@@ -91,6 +100,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
     hints.clear()
     observations.clear()
     executorCores.clear()
+    launchSpacingSamples.clear()
+    launchSpacingStages = 0L
     taskCpus = 1
     nextHintVersion.set(1L)
     nextParallelismDecisionId.set(1L)
@@ -109,6 +120,45 @@ object RapidsAutotuneDriverEndpoint extends Logging {
   /** Measured cluster CPU task slots; zero until an executor has registered. */
   private[rapids] def clusterTaskSlots: Int =
     executorCores.values().asScala.map(_ / taskCpus).sum
+
+  /**
+   * Initial-burst dispatch spacing of one completed stage. The first min(tasks, slots) launches
+   * are dispatched back-to-back when the stage starts, so their mean gap measures the serial
+   * driver scheduler/launch response; predecessor overlap only stretches a burst, so a
+   * contaminated sample overestimates. Fewer than eight gaps cannot separate dispatch spacing
+   * from a single scheduling hiccup and yield no measurement.
+   */
+  private[rapids] def initialBurstLaunchSpacingNanos(
+      launchTimesMs: Seq[Long],
+      taskSlots: Int): Option[Double] = {
+    if (taskSlots <= 0) {
+      return None
+    }
+    val burst = launchTimesMs.sorted.take(math.min(launchTimesMs.size, taskSlots))
+    val gaps = burst.size - 1
+    if (gaps < 8) None else {
+      Some(math.max(0L, burst.last - burst.head).toDouble * 1e6 / gaps.toDouble)
+    }
+  }
+
+  /** Record one completed stage's measured initial-burst launch spacing. */
+  private[rapids] def recordStageLaunchSpacing(spacingNanos: Double): Unit = synchronized {
+    if (spacingNanos >= 0.0 && java.lang.Double.isFinite(spacingNanos)) {
+      launchSpacingSamples += spacingNanos
+      launchSpacingStages += 1L
+      if (launchSpacingSamples.size > maxLaunchSpacingSamples) {
+        launchSpacingSamples.remove(0)
+      }
+    }
+  }
+
+  /** Median measured launch spacing; None until a completed stage has been measured. */
+  private[rapids] def serialLaunchNanosPerTask: Option[Double] = synchronized {
+    if (launchSpacingSamples.isEmpty) None else {
+      val sorted = launchSpacingSamples.sorted
+      Some(sorted(sorted.size / 2))
+    }
+  }
 
   /** Test-only: inject a deterministic monotonic clock for optimizer update cadence. */
   private[rapids] def setNanoSourceForTest(source: () => Long): Unit = synchronized {
@@ -330,7 +380,10 @@ object RapidsAutotuneDriverEndpoint extends Logging {
       .flatMap(sc => Option(sc.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)))
       .flatMap(value => Try(value.toLong).toOption)
     executionId.flatMap(id => Option(optimizer).flatMap(_.aqeCalibrationSnapshot(id)))
-      .map(_.copy(clusterTaskSlots = clusterTaskSlots))
+      .map(_.copy(
+        clusterTaskSlots = clusterTaskSlots,
+        serialLaunchNanosPerTask = serialLaunchNanosPerTask,
+        serialLaunchSampleStages = launchSpacingStages))
   }
 
   private[rapids] def recordParallelismDecision(
@@ -355,6 +408,8 @@ object RapidsAutotuneDriverEndpoint extends Logging {
         fixedNanosPerTaskStandardError = decision.fixedNanosPerTaskStandardError,
         fixedTaskCostSampleWindows = decision.fixedTaskCostSampleWindows,
         fixedTaskCostSource = decision.fixedTaskCostSource,
+        serialLaunchNanosPerTask = decision.serialLaunchNanosPerTask,
+        serialLaunchSampleStages = decision.serialLaunchSampleStages,
         reason = decision.reason))
     }
   }
@@ -452,6 +507,14 @@ object StageObservationAgg {
  */
 class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener with Logging {
   private val stageKeys = mutable.HashMap.empty[(Int, Int), AutotuneStageKey]
+  // Successful-task launch times per running stage attempt, for the initial-burst dispatch
+  // spacing measurement at stage completion. Dispatch is a driver property, so every stage
+  // measures it, not only SQL stages with hints. Insertion-ordered so the bound evicts the
+  // stalest stage first.
+  private val stageLaunchTimes =
+    mutable.LinkedHashMap.empty[(Int, Int), mutable.ArrayBuffer[Long]]
+  private val maxTrackedLaunchStages = 256
+  private val maxTrackedLaunchesPerStage = 65536
 
   override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
     val executionId = executionIdFrom(jobStart.properties)
@@ -486,6 +549,11 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
 
   override def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit = synchronized {
     val info = stageCompleted.stageInfo
+    stageLaunchTimes.remove((info.stageId, info.attemptNumber())).foreach { launches =>
+      RapidsAutotuneDriverEndpoint.initialBurstLaunchSpacingNanos(
+        launches.toSeq, RapidsAutotuneDriverEndpoint.clusterTaskSlots)
+        .foreach(RapidsAutotuneDriverEndpoint.recordStageLaunchSpacing)
+    }
     stageKeys.get((info.stageId, info.attemptNumber())).foreach(
       RapidsAutotuneDriverEndpoint.stageCompleted)
   }
@@ -502,6 +570,18 @@ class RapidsAutotuneStageHintListener(conf: RapidsConf) extends SparkListener wi
   override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = synchronized {
     val metrics = taskEnd.taskMetrics
     val info = taskEnd.taskInfo
+    if (info != null && info.successful) {
+      val launches = stageLaunchTimes.getOrElseUpdate(
+        (taskEnd.stageId, taskEnd.stageAttemptId), {
+          while (stageLaunchTimes.size >= maxTrackedLaunchStages) {
+            stageLaunchTimes.remove(stageLaunchTimes.head._1)
+          }
+          mutable.ArrayBuffer.empty[Long]
+        })
+      if (launches.size < maxTrackedLaunchesPerStage) {
+        launches += info.launchTime
+      }
+    }
     if (metrics != null && info != null && info.successful) {
       stageKeys.get((taskEnd.stageId, taskEnd.stageAttemptId)).foreach { key =>
         val millis = math.max(0L, metrics.executorDeserializeTime)

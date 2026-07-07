@@ -113,7 +113,13 @@ private[rapids] case class GpuFlowAqeCalibration(
     // Cluster-wide CPU task slots from registered executors, stamped by the driver endpoint when
     // the snapshot is served. Zero means no executor census exists yet; consumers that need wave
     // arithmetic must freeze rather than substitute a per-executor quantity.
-    clusterTaskSlots: Int = 0)
+    clusterTaskSlots: Int = 0,
+    // Measured serial driver dispatch spacing per task launch, stamped by the driver endpoint
+    // when the snapshot is served (application-level evidence, like the task-slot census). None
+    // until a completed stage has supplied an initial-burst spacing measurement; consumers must
+    // freeze reducer re-splits rather than assume dispatch is free.
+    serialLaunchNanosPerTask: Option[Double] = None,
+    serialLaunchSampleStages: Long = 0L)
 
 private[rapids] object GpuFlowAqeCalibration {
   def empty(constraints: GraphOptimizerConstraints): GpuFlowAqeCalibration = {
