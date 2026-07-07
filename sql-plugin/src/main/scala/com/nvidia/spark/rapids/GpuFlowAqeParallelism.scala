@@ -80,17 +80,23 @@ private[rapids] object GpuFlowPartitionOptimizer {
       .distinct.sorted
     // The current (deployed) layout is always priced. A candidate layout is eligible only when
     // every range stays within `maxRangeBytes`, the byte region where the calibrated linear rate
-    // was actually measured: ranges beyond it have an unidentified, possibly superlinear response.
-    // A candidate finer than the current layout (a re-split) must additionally keep every range
-    // at or above `minSplitRangeBytes`; below one native GPU batch per task the response leaves
-    // the region where task cost is byte service plus the measured fixed and launch costs.
+    // was actually measured: ranges beyond it have an unidentified, possibly superlinear response
+    // (per-range, because size cliffs are per-task). A candidate finer than the current layout
+    // (a re-split) must additionally keep its mean range at or above `minSplitRangeBytes`: the
+    // floor keeps the layout's operating size inside the byte region where task cost is byte
+    // service plus the measured fixed and launch costs. The mean is the right scale for the
+    // floor — a balanced cut of uneven map partitions almost always leaves one small remainder
+    // range, and small ranges are not modeled as free because fixed and launch costs are
+    // charged per range; a per-range floor rejected real 1.2 GiB/task layouts over their
+    // remainder range (SF3K fineshuffle q17/q5/q18).
+    val totalPartitionBytes = saturatingSum(partitionBytes)
     Some(candidateCounts.foldLeft(current) { (best, count) =>
       val candidate = layoutForRanges(partitionBytes, balancedRanges(partitionBytes, count),
         taskSlots, variableNanosPerByte, fixedNanosPerTask, launchNanosPerTask)
       // balancedRanges may materialize fewer ranges than requested; the re-split floor applies
       // to layouts that are actually finer than the current one.
       val withinSplitFloor = candidate.ranges.size <= currentRanges.size ||
-        candidate.ranges.forall(_.bytes >= minSplitRangeBytes)
+        totalPartitionBytes / candidate.ranges.size >= minSplitRangeBytes
       if (candidate.ranges.forall(_.bytes <= maxRangeBytes) && withinSplitFloor &&
           candidate.objectiveNanos < best.objectiveNanos) {
         candidate

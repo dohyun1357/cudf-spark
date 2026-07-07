@@ -226,6 +226,21 @@ class GpuFlowAqeParallelismSuite extends AnyFunSuite {
       (range.startReducerIndex, range.endReducerIndex)) == current)
   }
 
+  test("re-split floor applies to the layout mean, not the balancing remainder range") {
+    // A balanced cut of uneven partitions leaves one small remainder range. The floor guards
+    // the layout's operating size: mean 18 bytes passes a 15-byte floor even though the
+    // remainder range holds only 12 bytes.
+    val bytes = Seq(10L, 10L, 10L, 10L, 10L, 10L, 10L, 2L)
+    val current = Seq((0, 8))
+    val selected = GpuFlowPartitionOptimizer.optimize(
+      bytes, current, taskSlots = 4, variableNanosPerByte = 1.0,
+      fixedNanosPerTask = 1.0, launchNanosPerTask = 0.0,
+      maxPartitions = 8, minSplitRangeBytes = 15L).get
+
+    assert(selected.ranges.size == 4)
+    assert(selected.ranges.map(_.bytes).min == 12L)
+  }
+
   test("serial dispatch cost is charged per task and can retain the current layout") {
     val bytes = Seq.fill(8)(10L)
     val current = Seq((0, 8))
