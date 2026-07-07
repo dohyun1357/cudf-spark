@@ -850,6 +850,18 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(true)
 
+  val ENABLE_DECIMAL128_DIRECT_SUM = conf("spark.rapids.sql.decimal128.directSum.enabled")
+      .doc("Sum decimal columns whose input precision fits in 18 digits directly as " +
+        "DECIMAL128 values in cudf instead of decomposing them into four 32-bit chunk " +
+        "sums. For such inputs a 128-bit accumulator cannot wrap undetected (batches are " +
+        "capped at 2^31 rows and merge inputs are bounds-checked to the result type), so " +
+        "the chunked overflow machinery is unnecessary and the direct sum does the same " +
+        "work with one aggregation target instead of four plus chunk extract/assemble " +
+        "kernels. Applies to SUM and the sum half of AVERAGE.")
+      .internal()
+      .booleanConf
+      .createWithDefault(true)
+
   val STABLE_SORT = conf("spark.rapids.sql.stableSort.enabled")
       .doc("Enable or disable stable sorting. Apache Spark's sorting is typically a stable " +
           "sort, but sort stability cannot be guaranteed in distributed work loads because the " +
@@ -3339,6 +3351,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val joinOuterMagnificationThreshold: Int = get(JOIN_OUTER_MAGNIFICATION_THRESHOLD)
 
   lazy val bucketJoinIoPrefetch: Boolean = get(BUCKET_JOIN_IO_PREFETCH)
+
+  lazy val isDecimal128DirectSumEnabled: Boolean = get(ENABLE_DECIMAL128_DIRECT_SUM)
 
   lazy val logJoinCardinality: Boolean = get(LOG_JOIN_CARDINALITY)
 

@@ -922,6 +922,23 @@ case class GpuDecimalSumHighDigits(
 }
 
 object GpuSum {
+  /**
+   * A decimal sum can use the direct DECIMAL128 cudf aggregation (a single sum target
+   * instead of four 32-bit chunk sums plus extract/assemble kernels) when the 128-bit
+   * accumulator provably cannot wrap undetected: for input precision of at most 18
+   * digits, an update batch is bounded by 2^31 rows * 10^18 < 2.2e27 and a merge batch
+   * by 2^31 values bounds-checked to the result type (at most 10^28), both far below
+   * the 1.7e38 capacity of a 128-bit value, so the existing per-batch/merge bounds
+   * checks retain full overflow detection.
+   */
+  private[aggregate] def canUseDirectDecimal128Sum(child: Expression): Boolean = {
+    child.dataType match {
+      case c: DecimalType => c.precision <= Decimal.MAX_LONG_DIGITS &&
+        new RapidsConf(SQLConf.get).isDecimal128DirectSumEnabled
+      case _ => false
+    }
+  }
+
   def apply(
       child: Expression,
       resultType: DataType,
@@ -929,7 +946,7 @@ object GpuSum {
       forceWindowSumToNotBeReplaced: Boolean = false): GpuSum = {
     resultType match {
       case dt: DecimalType =>
-        if (dt.precision > Decimal.MAX_LONG_DIGITS) {
+        if (dt.precision > Decimal.MAX_LONG_DIGITS && !canUseDirectDecimal128Sum(child)) {
           GpuDecimal128Sum(child, dt, failOnErrorOverride, forceWindowSumToNotBeReplaced)
         } else {
           GpuBasicDecimalSum(child, dt, failOnErrorOverride)
@@ -1197,7 +1214,12 @@ abstract class GpuDecimalSum(
   }
 }
 
-/** Sum aggregations for decimals up to and including DECIMAL64 */
+/**
+ * Direct sum aggregations for decimals: results up to and including DECIMAL64, and DECIMAL128
+ * results whose input precision fits in 18 digits (see GpuSum.canUseDirectDecimal128Sum).
+ * cudf supports DECIMAL128 sums in hash aggregations natively, so no chunking is needed when
+ * the 128-bit accumulator cannot wrap undetected.
+ */
 case class GpuBasicDecimalSum(
     child: Expression,
     dt: DecimalType,
@@ -1502,7 +1524,8 @@ object GpuAverage {
     child.dataType match {
       case DecimalType.Fixed(p, s) =>
         val sumDataType = DecimalType.bounded(p + 10, s)
-        if (sumDataType.precision > Decimal.MAX_LONG_DIGITS) {
+        if (sumDataType.precision > Decimal.MAX_LONG_DIGITS &&
+            !GpuSum.canUseDirectDecimal128Sum(child)) {
           GpuDecimal128Average(child, sumDataType, failOnError)
         } else {
           GpuBasicDecimalAverage(child, sumDataType, failOnError)
