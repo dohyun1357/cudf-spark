@@ -1368,6 +1368,36 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     val JAVA, NATIVE, AUTO = Value
   }
 
+  val PARQUET_FOOTER_CACHE_SIZE =
+    conf("spark.rapids.sql.format.parquet.footerCache.size")
+      .doc("Maximum total bytes of raw Parquet footers cached in host memory per executor. " +
+        "Every task reads and parses the footer of every file (or file split) it scans; on " +
+        "tables laid out as many small files — e.g. hive/iceberg/delta date-partitioned " +
+        "tables — the same footers are fetched and parsed thousands of times per query, and " +
+        "the filesystem round trips dominate scan time. The cache keeps the framed footer " +
+        "bytes keyed by (path, file size, modification time) with single-flight loading so " +
+        "concurrent tasks fetch each footer at most once. Set to 0 to disable.")
+      .internal()
+      .startupOnly()
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v >= 0, "The footer cache size must not be negative.")
+      .createWithDefault(128L * 1024 * 1024)
+
+  val PARQUET_FOOTER_CACHE_META_ENTRIES =
+    conf("spark.rapids.sql.format.parquet.footerCache.metadataEntries")
+      .doc("Maximum number of parsed-and-filtered per-split Parquet scan metadata entries " +
+        "cached per executor, keyed by (file identity, split, read schema, pushed filters). " +
+        "This caches the work done after the footer bytes are in memory: the footer parse, " +
+        "schema clipping, rebase-mode detection, and row-group filtering including " +
+        "dictionary-page reads for pushed predicates, which otherwise repeat for every " +
+        "stage and iteration that scans the same file. Lookups return defensive copies, so " +
+        "cached metadata is never shared mutable state. Set to 0 to disable.")
+      .internal()
+      .startupOnly()
+      .integerConf
+      .checkValue(v => v >= 0, "The footer cache metadata entry count must not be negative.")
+      .createWithDefault(32768)
+
   val PARQUET_READER_FOOTER_TYPE =
     conf("spark.rapids.sql.format.parquet.reader.footer.type")
       .doc("In some cases reading the footer of the file is very expensive. Typically this " +
@@ -3633,6 +3663,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val parquetWriterRowGroupSizeBytes: Option[Long] =
     get(PARQUET_WRITER_ROW_GROUP_SIZE_BYTES)
+
+  lazy val parquetFooterCacheSize: Long = get(PARQUET_FOOTER_CACHE_SIZE)
+
+  lazy val parquetFooterCacheMetaEntries: Int = get(PARQUET_FOOTER_CACHE_META_ENTRIES)
 
   lazy val parquetReaderFooterType: ParquetFooterReaderType.Value = {
     get(PARQUET_READER_FOOTER_TYPE) match {

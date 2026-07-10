@@ -508,6 +508,15 @@ protected case class GpuParquetFileFilterHandler(
   private val int96RebaseMode = SparkShimImpl.int96ParquetRebaseRead(sqlConf)
   private val readUseFieldId = ParquetSchemaClipShims.useFieldId(sqlConf)
   private val ignoreMissingParquetFieldId = ParquetSchemaClipShims.ignoreMissingIds(sqlConf)
+  private val footerCacheSize = new RapidsConf(sqlConf).parquetFooterCacheSize
+  private val footerCacheMetaEntries = new RapidsConf(sqlConf).parquetFooterCacheMetaEntries
+
+  // Every session-level setting that changes the outcome of filterBlocks must be part of the
+  // metadata cache key, because the cache is executor-global and outlives any one session.
+  private val filterFingerprint: String = Seq(
+    isCaseSensitive, enableParquetFilterPushDown, pushDownDate, pushDownTimestamp,
+    pushDownDecimal, pushDownStringPredicate, pushDownInFilterThreshold, datetimeRebaseMode,
+    int96RebaseMode, readUseFieldId, ignoreMissingParquetFieldId).mkString("|")
 
   private val PARQUET_ENCRYPTION_CONFS = Seq("parquet.encryption.kms.client.class",
     "parquet.encryption.kms.client.class", "parquet.crypto.factory.class")
@@ -552,14 +561,32 @@ protected case class GpuParquetFileFilterHandler(
 
   private def getFooterBuffer(
       fileIO: RapidsFileIO,
+      file: PartitionedFile,
       filePath: Path,
       conf: Configuration,
       metrics: Map[String, GpuMetric]): HostMemoryBuffer = {
-    val inputFile = fileIO.newInputFile(filePath)
-    withResource(ParquetFooterUtils.getFooterBuffer(inputFile, metrics,
-        readFooterBuffer(fileIO, filePath, conf))) { hmb =>
+    withResource(getFramedFooterBuffer(fileIO, file, filePath, conf, metrics)) { hmb =>
       // buffer includes header and trailing length and magic, stripped here
       hmb.slice(MAGIC.length, hmb.getLength - Integer.BYTES - MAGIC.length)
+    }
+  }
+
+  /**
+   * Framed (`MAGIC + footer + footerLen + MAGIC`) footer bytes for `file`, served from the
+   * executor-wide [[ParquetFooterCache]] when enabled. The cache key comes entirely from the
+   * `PartitionedFile`, so a hit costs no filesystem calls at all.
+   */
+  private def getFramedFooterBuffer(
+      fileIO: RapidsFileIO,
+      file: PartitionedFile,
+      filePath: Path,
+      conf: Configuration,
+      metrics: Map[String, GpuMetric]): HostMemoryBuffer = {
+    val key = ParquetFooterCache.Key(filePath.toString, file.fileSize, file.modificationTime)
+    ParquetFooterCache.getOrLoad(key, footerCacheSize) {
+      val inputFile = fileIO.newInputFile(filePath)
+      ParquetFooterUtils.getFooterBuffer(inputFile, metrics,
+        readFooterBuffer(fileIO, filePath, conf))
     }
   }
 
@@ -641,7 +668,7 @@ protected case class GpuParquetFileFilterHandler(
       readDataSchema: StructType,
       filePath: Path): ParquetFooter = {
     val footerSchema = convertToFooterSchema(readDataSchema)
-    val footerBuffer = getFooterBuffer(fileIO, filePath, conf, metrics)
+    val footerBuffer = getFooterBuffer(fileIO, file, filePath, conf, metrics)
     withResource(footerBuffer) { footerBuffer =>
       NvtxRegistry.PARQUET_PARSE_FILTER_FOOTER {
         // In the future, if we know we're going to read the entire file,
@@ -666,9 +693,7 @@ protected case class GpuParquetFileFilterHandler(
       filePath: Path): ParquetMetadata = {
     //noinspection ScalaDeprecation
     NvtxRegistry.PARQUET_READ_FOOTER {
-      val inputFile = fileIO.newInputFile(filePath)
-      withResource(ParquetFooterUtils.getFooterBuffer(inputFile, metrics,
-          readFooterBuffer(fileIO, filePath, conf))) { hmb =>
+      withResource(getFramedFooterBuffer(fileIO, file, filePath, conf, metrics)) { hmb =>
         ParquetFileReader.readFooter(new HMBInputFile(hmb),
           ParquetMetadataConverter.range(file.start, file.start + file.length))
       }
@@ -677,6 +702,33 @@ protected case class GpuParquetFileFilterHandler(
 
   @scala.annotation.nowarn
   def filterBlocks(
+      fileIO: RapidsFileIO,
+      footerReader: ParquetFooterReaderType.Value,
+      file: PartitionedFile,
+      conf: Configuration,
+      filters: Array[Filter],
+      readDataSchema: StructType): ParquetFileInfoWithBlockMeta = {
+    val key = ParquetFooterCache.MetaKey(
+      file.filePath.toString(), file.fileSize, file.modificationTime,
+      file.start, file.length,
+      readDataSchema.json,
+      filters.mkString(";"),
+      filterFingerprint)
+    ParquetFooterCache.getOrLoadMeta(key, footerCacheMetaEntries) {
+      filterBlocksUncached(fileIO, footerReader, file, conf, filters, readDataSchema)
+    } { cached =>
+      // Defensive copy: parquet-mr BlockMetaData is mutable, and partition values must come
+      // from the caller's PartitionedFile instance rather than whichever task loaded the entry.
+      cached.copy(
+        blocks = cached.blocks.map { b =>
+          GpuParquetUtilsShims.newBlockMeta(b, b.getColumns.asScala.toSeq)
+        },
+        partValues = file.partitionValues)
+    }
+  }
+
+  @scala.annotation.nowarn
+  private def filterBlocksUncached(
       fileIO: RapidsFileIO,
       footerReader: ParquetFooterReaderType.Value,
       file: PartitionedFile,
