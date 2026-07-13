@@ -18,7 +18,9 @@ package com.nvidia.spark.rapids
 
 import scala.collection.mutable.ArrayBuffer
 
-import ai.rapids.cudf.{ContiguousTable, Cuda, DeviceMemoryBuffer, HostMemoryBuffer, Table}
+import ai.rapids.cudf.{BaseDeviceMemoryBuffer, ContiguousTable, Cuda, DeviceMemoryBuffer,
+  HostMemoryBuffer, NvtxColor, NvtxRange, Table}
+import ai.rapids.cudf.nvcomp.{BatchedCompressor, BatchedLZ4Compressor, BatchedZstdCompressor}
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
@@ -30,21 +32,67 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.GpuShuffleEnv
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
+object GpuPartitioning {
+  /**
+   * KUDZ wraps records moved by the RapidsShuffleManager MULTITHREADED writer, the
+   * standard GPU deployment. The built-in Spark sort shuffle stays uncompressed, and
+   * UCX/CACHE_ONLY use the GPU shuffle transport and its native compression format.
+   */
+  private[rapids] def supportsKudoCompression(
+      useGpuShuffle: Boolean,
+      useMultiThreadedShuffle: Boolean): Boolean = {
+    require(!(useGpuShuffle && useMultiThreadedShuffle),
+      "GPU shuffle and MULTITHREADED shuffle cannot both be active")
+    useMultiThreadedShuffle
+  }
+}
+
 trait GpuPartitioning extends Partitioning {
   private[this] val (
     maxCpuBatchSize, maxCompressionBatchSize, _useGPUShuffle,
-        _useKudoGPUSlicing, _useMultiThreadedShuffle) = {
+        _useKudoGPUSlicing, _useMultiThreadedShuffle, _kudoCompressionCodec,
+        _kudoCompressionChunkSize, _kudoCompressionMinBatchSize) = {
     val rapidsConf = new RapidsConf(SQLConf.get)
+    val useGpuShuffle = GpuShuffleEnv.useGPUShuffle(rapidsConf)
+    val useMtShuffle = GpuShuffleEnv.useMultiThreadedShuffle(rapidsConf)
+    // Device-side payload compression is wired into the RapidsShuffleManager
+    // MULTITHREADED writer: records are opaque bytes to its limiter/spill/merge
+    // pipeline, and the read side dispatches per record on the KUD0/KUDZ magic.
+    // The UCX/CACHE_ONLY GPU-transport paths manage compression on their own, and the
+    // built-in Spark sort shuffle stays uncompressed.
+    val kudoCompression = if (rapidsConf.shuffleKudoCompressionRequested &&
+        rapidsConf.shuffleKudoCompressionMode != "never" &&
+        GpuPartitioning.supportsKudoCompression(useGpuShuffle, useMtShuffle)) {
+      rapidsConf.shuffleKudoCompressionCodec
+    } else {
+      "none"
+    }
     (rapidsConf.shuffleParitioningMaxCpuBatchSize,
       rapidsConf.shuffleCompressionMaxBatchMemory,
-      GpuShuffleEnv.useGPUShuffle(rapidsConf),
+      useGpuShuffle,
       rapidsConf.shuffleKudoGpuSerializerEnabled,
-      GpuShuffleEnv.useMultiThreadedShuffle(rapidsConf))
+      useMtShuffle,
+      kudoCompression,
+      rapidsConf.shuffleCompressionZstdChunkSize,
+      rapidsConf.shuffleKudoCompressionMinBatchSize)
   }
 
   // Lift once GPU shuffle supports long (64-bit) serialized-slice offsets.
   // protected[rapids] so tests can override it to exercise the guard below.
   protected[rapids] def maxGpuSerializedSliceBytes: Long = Int.MaxValue
+
+  // Set on the driver by the exchange when this exchange's estimated map-side scan
+  // input reaches the scan-size threshold. A large scan predicts a large shuffle,
+  // which is where device-side compression pays; small exchanges stay uncompressed
+  // so compute-bound workloads are never taxed. A plain var so it serializes to
+  // executors like the debug metrics; only set under adaptive mode by the exchange.
+  private var _kudoCompressionScanForced: Boolean = false
+
+  def setKudoCompressionScanForced(enabled: Boolean): Unit = {
+    _kudoCompressionScanForced = enabled
+  }
+
+  private def kudoCompressionEngaged: Boolean = _kudoCompressionScanForced
 
   final def columnarEval(batch: ColumnarBatch): GpuColumnVector = {
     throw new IllegalStateException(
@@ -54,6 +102,8 @@ trait GpuPartitioning extends Partitioning {
   def usesGPUShuffle: Boolean = _useGPUShuffle
 
   def usesKudoGPUSlicing: Boolean = _useKudoGPUSlicing
+
+  def usesKudoCompression: Boolean = _kudoCompressionCodec != "none"
 
   def usesMultiThreadedShuffle: Boolean = _useMultiThreadedShuffle
 
@@ -206,73 +256,210 @@ trait GpuPartitioning extends Partitioning {
     }
   }
 
-  private def sliceAndSerializeOnGpu(numRows: Int, partitionIndexes: Array[Int],
-      partitionColumns: Array[GpuColumnVector]): Array[(ColumnarBatch, Int)] = {
-    partitionColumns.foreach(_.getBase.getNullCount)
-    val (dataHost, offsetsHost) = withResource(partitionColumns) { _ =>
-      withResource(new Table(partitionColumns.map(_.getBase).toArray: _*)) { table =>
-        withResource(gpuSplitAndSerialize(table,
-          partitionIndexes.tail: _*)) { dmbs =>
-          val data = dmbs(0)
-          val offsets = dmbs(1)
-          // This bound keeps the later Long->Int narrowings lossless:
-          // offsetsHost.getLong(..).toInt and dataHost.getLength.toInt
-          // (dataHost is sized to data.getLength).
-          require(data.getLength <= maxGpuSerializedSliceBytes,
-            s"GPU-serialized shuffle batch is ${data.getLength} bytes, exceeding the " +
-            s"$maxGpuSerializedSliceBytes-byte (2GB) limit addressable by the Int " +
-            s"serialized-slice offsets; reduce spark.rapids.sql.batchSizeBytes")
-          closeOnExcept(Seq(HostMemoryBuffer.allocate(data.getLength),
-            HostMemoryBuffer.allocate(offsets.getLength))) { seq =>
-            val dataHost = seq(0)
-            val offsetsHost = seq(1)
-            NvtxRegistry.GPU_KUDO_COPY_TO_HOST {
-              dataHost.copyFromDeviceBufferAsync(data, Cuda.DEFAULT_STREAM)
-              offsetsHost.copyFromDeviceBufferAsync(offsets, Cuda.DEFAULT_STREAM)
-              Cuda.DEFAULT_STREAM.sync()
+  private type SerializedEntry = (Int, Long, Long, Int)
+
+  private def readSerializedOffsets(offsetsHost: HostMemoryBuffer,
+      numRegions: Int): Array[Long] = {
+    val numOffsets = numRegions + 1
+    require(offsetsHost.getLength % numOffsets == 0,
+      s"Invalid kudo offsets buffer length ${offsetsHost.getLength} for $numRegions regions")
+    val elemSize = offsetsHost.getLength / numOffsets
+    require(elemSize == java.lang.Long.BYTES,
+      s"Unsupported kudo offset width: $elemSize bytes")
+    Array.tabulate(numOffsets)(i => offsetsHost.getLong(i * elemSize))
+  }
+
+  private def serializedEntries(offsets: Array[Long],
+      rowsPerPartition: Array[Int]): Array[SerializedEntry] = {
+    rowsPerPartition.indices.collect {
+      case i if rowsPerPartition(i) > 0 =>
+        (i, offsets(i), offsets(i + 1), rowsPerPartition(i))
+    }.toArray
+  }
+
+  private def copySerializedPartitionsToHost(
+      dataDev: DeviceMemoryBuffer,
+      offsetsDev: DeviceMemoryBuffer,
+      rowsPerPartition: Array[Int]): (HostMemoryBuffer, Array[SerializedEntry]) = {
+    // This bound keeps the SlicedSerializedColumnVector Long-to-Int narrowing lossless.
+    require(dataDev.getLength <= maxGpuSerializedSliceBytes,
+      s"GPU-serialized shuffle batch is ${dataDev.getLength} bytes, exceeding the " +
+        s"$maxGpuSerializedSliceBytes-byte (2GB) limit addressable by the Int " +
+        s"serialized-slice offsets; reduce spark.rapids.sql.batchSizeBytes")
+    val dataHost = HostMemoryBuffer.allocate(dataDev.getLength)
+    closeOnExcept(dataHost) { _ =>
+      withResource(HostMemoryBuffer.allocate(offsetsDev.getLength)) { offsetsHost =>
+        NvtxRegistry.GPU_KUDO_COPY_TO_HOST {
+          dataHost.copyFromDeviceBufferAsync(dataDev, Cuda.DEFAULT_STREAM)
+          offsetsHost.copyFromDeviceBufferAsync(offsetsDev, Cuda.DEFAULT_STREAM)
+          Cuda.DEFAULT_STREAM.sync()
+        }
+        val offsets = readSerializedOffsets(offsetsHost, rowsPerPartition.length)
+        (dataHost, serializedEntries(offsets, rowsPerPartition))
+      }
+    }
+  }
+
+  /**
+   * Writes the KudoCompressedFrame header for one compressed record. All fields are
+   * big-endian to match the DataInput framing used on the read side.
+   */
+  private def writeCompressedFrameHeader(buf: HostMemoryBuffer, offset: Long, numRows: Int,
+      chunkSize: Int, uncompressedLen: Long, compressedLen: Int): Unit = {
+    buf.setInt(offset, Integer.reverseBytes(KudoCompressedFrame.magicFor(_kudoCompressionCodec)))
+    buf.setInt(offset + 4, Integer.reverseBytes(numRows))
+    buf.setInt(offset + 8, Integer.reverseBytes(chunkSize))
+    buf.setLong(offset + 12, java.lang.Long.reverseBytes(uncompressedLen))
+    buf.setInt(offset + 20, Integer.reverseBytes(compressedLen))
+  }
+
+  private def compressSerializedPartitionsToHost(
+      dataDev: DeviceMemoryBuffer,
+      offsetsDev: DeviceMemoryBuffer,
+      rowsPerPartition: Array[Int]): (HostMemoryBuffer, Array[SerializedEntry]) = {
+    val frameBytes = KudoCompressedFrame.FRAME_HEADER_BYTES
+    require(_kudoCompressionChunkSize > 0 && _kudoCompressionChunkSize <= Int.MaxValue,
+      s"invalid kudo compression chunk size ${_kudoCompressionChunkSize}")
+    val chunkSize = _kudoCompressionChunkSize.toInt
+    val offsets = withResource(HostMemoryBuffer.allocate(offsetsDev.getLength)) { offsetsHost =>
+      offsetsHost.copyFromDeviceBuffer(offsetsDev)
+      readSerializedOffsets(offsetsHost, rowsPerPartition.length)
+    }
+    val included = rowsPerPartition.indices.filter(rowsPerPartition(_) > 0).toArray
+    if (included.isEmpty) {
+      return (null, Array.empty)
+    }
+
+    // Compress all non-empty regions in one call. The compressor closes the input slices,
+    // which only drops their extra references on the underlying serialized buffer.
+    val compressed = withResource(new NvtxRange("gpuKudoCompress", NvtxColor.ORANGE)) { _ =>
+      val inputs: Array[BaseDeviceMemoryBuffer] = included.map { i =>
+        dataDev.slice(offsets(i), offsets(i + 1) - offsets(i))
+          .asInstanceOf[BaseDeviceMemoryBuffer]
+      }
+      val compressor: BatchedCompressor = _kudoCompressionCodec match {
+        case "lz4" => new BatchedLZ4Compressor(chunkSize, maxCompressionBatchSize)
+        case _ => new BatchedZstdCompressor(chunkSize, maxCompressionBatchSize)
+      }
+      compressor
+        .compress(inputs, Cuda.DEFAULT_STREAM)
+    }
+    withResource(compressed.toSeq) { _ =>
+      val outputLengths = included.indices.map { k =>
+        val rawLength = offsets(included(k) + 1) - offsets(included(k))
+        val compressedLength = compressed(k).getLength
+        if (compressedLength + frameBytes < rawLength) {
+          frameBytes + compressedLength
+        } else {
+          rawLength
+        }
+      }.toArray
+      val totalLength = outputLengths.foldLeft(0L) { (total, length) =>
+        Math.addExact(total, length)
+      }
+      require(totalLength <= Int.MaxValue,
+        s"Compressed shuffle batch is too large: $totalLength bytes")
+      val hostBuffer = withRetryNoSplit[HostMemoryBuffer] {
+        HostMemoryBuffer.allocate(totalLength)
+      }
+      closeOnExcept(hostBuffer) { _ =>
+        withResource(new NvtxRange("gpuKudoCompressD2H", NvtxColor.PURPLE)) { _ =>
+          var outputOffset = 0L
+          val entries = included.indices.map { k =>
+            val partitionId = included(k)
+            val rawLength = offsets(partitionId + 1) - offsets(partitionId)
+            val compressedLength = compressed(k).getLength
+            val start = outputOffset
+            if (compressedLength + frameBytes < rawLength) {
+              writeCompressedFrameHeader(hostBuffer, outputOffset,
+                rowsPerPartition(partitionId), chunkSize, rawLength, compressedLength.toInt)
+              hostBuffer.copyFromMemoryBufferAsync(outputOffset + frameBytes, compressed(k),
+                0, compressedLength, Cuda.DEFAULT_STREAM)
+            } else {
+              hostBuffer.copyFromMemoryBufferAsync(outputOffset, dataDev,
+                offsets(partitionId), rawLength, Cuda.DEFAULT_STREAM)
             }
-            (dataHost, offsetsHost)
+            outputOffset += outputLengths(k)
+            (partitionId, start, outputOffset, rowsPerPartition(partitionId))
+          }.toArray
+          Cuda.DEFAULT_STREAM.sync()
+          (hostBuffer, entries)
+        }
+      }
+    }
+  }
+
+  private def sliceSerializedHostBuffer(hostBuffer: HostMemoryBuffer,
+      entries: Array[SerializedEntry]): Array[(ColumnarBatch, Int)] = {
+    if (hostBuffer == null) {
+      Array.empty
+    } else {
+      NvtxRegistry.GPU_KUDO_SLICE_BUFFERS {
+        withResource(hostBuffer) { _ =>
+          entries.map { case (partitionId, start, end, numRows) =>
+            val batch = new ColumnarBatch(Array(
+              new SlicedSerializedColumnVector(hostBuffer, start.toInt, end.toInt)))
+            batch.setNumRows(numRows)
+            (batch, partitionId)
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Serializes each non-empty partition to Kudo on the GPU. KUDZ optionally compresses
+   * those same serialized regions before their single copy to host; all setup and slicing
+   * is shared with the existing raw KUD0 path. Batches whose serialized bytes fall below
+   * the minimum-batch-size gate skip compression entirely: the per-batch cost of the
+   * compression pass (kernel launch, device-to-host staging, stream sync, and a longer
+   * GPU-semaphore hold) is fixed, so on small batches it is pure overhead while the byte
+   * savings are too small to relieve any downstream bottleneck.
+   */
+  private def sliceAndSerializeOnGpu(numRows: Int, partitionIndexes: Array[Int],
+      partitionColumns: Array[GpuColumnVector],
+      compressBatch: Boolean): Array[(ColumnarBatch, Int)] = {
+    partitionColumns.foreach(_.getBase.getNullCount)
+    val numRegions = partitionIndexes.length
+    val rowsPerPartition = Array.tabulate(numRegions) { i =>
+      if (i + 1 < numRegions) {
+        partitionIndexes(i + 1) - partitionIndexes(i)
+      } else {
+        numRows - partitionIndexes(i)
+      }
+    }
+    val (hostBuffer, entries) = withResource(partitionColumns) { _ =>
+      withResource(new Table(partitionColumns.map(_.getBase).toArray: _*)) { table =>
+        withResource(gpuSplitAndSerialize(table, partitionIndexes.tail: _*)) { buffers =>
+          if (compressBatch && buffers(0).getLength >= _kudoCompressionMinBatchSize) {
+            compressSerializedPartitionsToHost(buffers(0), buffers(1), rowsPerPartition)
+          } else {
+            copySerializedPartitionsToHost(buffers(0), buffers(1), rowsPerPartition)
           }
         }
       }
     }
     GpuSemaphore.releaseIfNecessary(TaskContext.get())
-
-    NvtxRegistry.GPU_KUDO_SLICE_BUFFERS {
-      withResource(Seq(dataHost, offsetsHost)) { _ =>
-        val numSlices = numPartitions + 1
-        val elemSize = offsetsHost.getLength / numSlices
-
-        val res = new Array[ColumnarBatch](numPartitions)
-        var start = 0
-        var prevIndex: Int = 0
-        for (i <- 1 until numPartitions) {
-          val idx = offsetsHost.getLong((i) * elemSize).toInt
-          val partNumRows = partitionIndexes(i) - prevIndex
-          if (partNumRows > 0) {
-            res(i - 1) = new ColumnarBatch(Array(
-              new SlicedSerializedColumnVector(dataHost, start, idx)))
-            res(i - 1).setNumRows(partNumRows)
-          }
-          prevIndex = partitionIndexes(i)
-          start = idx
-        }
-        val partNumRows = numRows - prevIndex
-        if (partNumRows > 0) {
-          res(numPartitions - 1) = new ColumnarBatch(Array(
-            new SlicedSerializedColumnVector(dataHost, start, dataHost.getLength.toInt)))
-          res(numPartitions - 1).setNumRows(partNumRows)
-        }
-
-        res.zipWithIndex.filter(_._1 != null)
-      }
-    }
+    sliceSerializedHostBuffer(hostBuffer, entries)
   }
 
   def sliceInternalGpuOrCpuAndClose(numRows: Int, partitionIndexes: Array[Int],
       partitionColumns: Array[GpuColumnVector]): Array[(ColumnarBatch, Int)] = {
-    if (usesKudoGPUSlicing) {
-      sliceAndSerializeOnGpu(numRows, partitionIndexes, partitionColumns)
+    // Decide compression BEFORE committing to device-side serialization: when the
+    // gate declines (adaptive pressure low, or the batch is under the size floor),
+    // the batch must take the configured write path. Routing a batch onto the GPU
+    // serialize path without compressing it pays GPU time and semaphore holds for
+    // nothing -- measured at +20% on NDS SF3K when every batch did so.
+    val wantCompress = usesKudoCompression && kudoCompressionEngaged &&
+      numRows > 0 && partitionColumns.nonEmpty && {
+        val estimatedBytes = partitionColumns.map(_.getBase.getDeviceMemorySize).sum
+        estimatedBytes >= _kudoCompressionMinBatchSize
+      }
+    if (usesKudoCompression && numRows > 0 && partitionColumns.nonEmpty) {
+      (if (wantCompress) kudoCompressedBatches else kudoUncompressedBatches) += 1
+    }
+    if (wantCompress || usesKudoGPUSlicing) {
+      sliceAndSerializeOnGpu(numRows, partitionIndexes, partitionColumns, wantCompress)
     } else {
       val sliceOnGpu = usesGPUShuffle
       val nvtxId = if (sliceOnGpu) {
@@ -344,6 +531,8 @@ trait GpuPartitioning extends Partitioning {
   }
 
   private var memCopyTime: GpuMetric = NoopMetric
+  private var kudoCompressedBatches: GpuMetric = NoopMetric
+  private var kudoUncompressedBatches: GpuMetric = NoopMetric
 
   /**
    * Setup sub-metrics for the performance debugging of GpuPartition. This method is expected to
@@ -351,5 +540,7 @@ trait GpuPartitioning extends Partitioning {
    */
   def setupDebugMetrics(metrics: Map[String, GpuMetric]): Unit = {
     metrics.get(GpuMetric.COPY_TO_HOST_TIME).foreach(memCopyTime = _)
+    metrics.get(GpuMetric.KUDO_COMPRESSED_BATCHES).foreach(kudoCompressedBatches = _)
+    metrics.get(GpuMetric.KUDO_UNCOMPRESSED_BATCHES).foreach(kudoUncompressedBatches = _)
   }
 }

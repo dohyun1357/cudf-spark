@@ -136,6 +136,8 @@ object GpuMetric extends Logging {
   val CPU_BRIDGE_PROCESSING_TIME = "cpuBridgeProcessingTime"
   val CPU_BRIDGE_WAIT_TIME = "cpuBridgeWaitTime"
   val COPY_TO_HOST_TIME = "d2hMemCopyTime"
+  val KUDO_COMPRESSED_BATCHES = "rapidsKudoCompressedBatches"
+  val KUDO_UNCOMPRESSED_BATCHES = "rapidsKudoUncompressedBatches"
   val READ_THROTTLING_TIME = "readThrottlingTime"
   val SMALL_JOIN_COUNT = "sizedSmallJoin"
   val BIG_JOIN_COUNT = "sizedBigJoin"
@@ -193,6 +195,8 @@ object GpuMetric extends Logging {
   val DESCRIPTION_CPU_BRIDGE_PROCESSING_TIME = "CPU bridge processing time"
   val DESCRIPTION_CPU_BRIDGE_WAIT_TIME = "CPU bridge elapsed time"
   val DESCRIPTION_COPY_TO_HOST_TIME = "deviceToHost memory copy time"
+  val DESCRIPTION_KUDO_COMPRESSED_BATCHES = "kudo batches compressed on GPU"
+  val DESCRIPTION_KUDO_UNCOMPRESSED_BATCHES = "kudo batches not compressed"
   val DESCRIPTION_READ_THROTTLING_TIME = "read throttling time"
 
   val DESCRIPTION_SMALL_JOIN_COUNT = "small joins"

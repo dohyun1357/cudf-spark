@@ -34,11 +34,13 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.RoundRobinPartitioning
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.execution.ExecSubqueryExpression
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
 import org.apache.spark.sql.execution.exchange.{Exchange, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.metric._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.rapids.GpuFileSourceScanExec
 import org.apache.spark.sql.rapids.GpuShuffleDependency
 import org.apache.spark.sql.rapids.execution.GpuShuffleExchangeExecBase.createAdditionalExchangeMetrics
 import org.apache.spark.sql.rapids.shims.SparkSessionUtils
@@ -176,8 +178,18 @@ abstract class GpuShuffleExchangeExecBase(
     child: SparkPlan) extends Exchange with ShimUnaryExecNode with GpuExec {
   import GpuMetric._
 
-  private lazy val kudoMode = RapidsConf.ShuffleKudoMode.withName(
-    RapidsConf.SHUFFLE_KUDO_WRITE_MODE.get(child.conf))
+  private lazy val usesKudoCompression = gpuOutputPartitioning.usesKudoCompression
+  private lazy val kudoMode = {
+    val configured = RapidsConf.ShuffleKudoMode.withName(
+      RapidsConf.SHUFFLE_KUDO_WRITE_MODE.get(child.conf))
+    // GPU-compressed shuffle payloads arrive at the serializer as pre-serialized bytes
+    // (SlicedSerializedColumnVector), which the GPU-mode serializer writes verbatim.
+    if (usesKudoCompression) {
+      RapidsConf.ShuffleKudoMode.GPU
+    } else {
+      configured
+    }
+  }
   private lazy val useKudo = RapidsConf.SHUFFLE_KUDO_SERIALIZER_ENABLED.get(child.conf)
   private lazy val kudoBufferCopyMeasurementEnabled = RapidsConf
     .SHUFFLE_KUDO_SERIALIZER_MEASURE_BUFFER_COPY_ENABLED
@@ -223,7 +235,11 @@ abstract class GpuShuffleExchangeExecBase(
     NUM_PARTITIONS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_PARTITIONS),
     NUM_OUTPUT_ROWS -> createMetric(ESSENTIAL_LEVEL, DESCRIPTION_NUM_OUTPUT_ROWS),
     NUM_OUTPUT_BATCHES -> createMetric(MODERATE_LEVEL, DESCRIPTION_NUM_OUTPUT_BATCHES),
-    COPY_TO_HOST_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_COPY_TO_HOST_TIME)
+    COPY_TO_HOST_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_COPY_TO_HOST_TIME),
+    KUDO_COMPRESSED_BATCHES ->
+        createMetric(MODERATE_LEVEL, DESCRIPTION_KUDO_COMPRESSED_BATCHES),
+    KUDO_UNCOMPRESSED_BATCHES ->
+        createMetric(MODERATE_LEVEL, DESCRIPTION_KUDO_UNCOMPRESSED_BATCHES)
   ) ++ additionalMetrics
 
   override def getOpTimeNewMetric: Option[GpuMetric] = allMetrics.get(OP_TIME_NEW_SHUFFLE_READ)
@@ -252,7 +268,57 @@ abstract class GpuShuffleExchangeExecBase(
   lazy val shuffleDependencyColumnar : ShuffleDependency[Int, ColumnarBatch, ColumnarBatch] = {
     val descendantOpTimeMetrics = getDescendantOpTimeMetrics
     val opTimeNewShuffleWrite = allMetrics.get(OP_TIME_NEW_SHUFFLE_WRITE)
-    
+
+    // Map-input prior (adaptive mode): engage compression when this exchange's
+    // estimated map-side input is large, since a large input predicts a large
+    // shuffle. The input is summed over the child's leaves on the driver:
+    //  - scan-fed legs: post-partition-pruning parquet file bytes (selectedPartitions)
+    //    scaled by the projected-column fraction, since the scan reads only the
+    //    projected columns (the raw file size would over-count wide tables). Scans
+    //    with dynamic partition pruning are skipped: their post-DPP size is only
+    //    known at runtime and the pre-DPP listing over-estimates.
+    //  - shuffle-fed legs: the exact materialized upstream size from AQE's runtime
+    //    stats (logical-link sizeInBytes), ignoring the Long.MaxValue "no stats"
+    //    sentinel that some non-shuffle leaves report.
+    // Because the compression cost tracks shuffle-write bytes, a large-input /
+    // small-shuffle leg carries negligible cost. The flag is passed to
+    // prepareBatchShuffleDependency and set on the *bound* partitioner
+    // (getPartitioner rebinds into a new object).
+    val kudoScanForced = if (usesKudoCompression &&
+        RapidsConf.SHUFFLE_KUDO_COMPRESSION_MODE.get(child.conf) == "adaptive") {
+      val threshold = RapidsConf.SHUFFLE_KUDO_COMPRESSION_MAP_INPUT_BYTES.get(child.conf)
+      // Reject any absurd stat (e.g. a stale Long.MaxValue sentinel); real
+      // materialized sizes are far below this (~1PB).
+      val saneStatsCap = BigInt(1L << 50)
+      val estimatedInputBytes = try {
+        child.collectLeaves().map {
+          case scan: GpuFileSourceScanExec
+              if !scan.partitionFilters.exists(ExecSubqueryExpression.hasSubquery) =>
+            val fileBytes = scan.selectedPartitions.map(_.files.map(_.getLen).sum).sum
+            val fullSize = math.max(scan.relation.dataSchema.defaultSize, 1)
+            val projFraction =
+              math.min(scan.requiredSchema.defaultSize.toDouble / fullSize, 1.0)
+            (fileBytes.toDouble * projFraction).toLong
+          case qs: QueryStageExec =>
+            // Exact materialized upstream size from AQE runtime stats (not the
+            // optimizer's logical estimate, which can blow up on some operators).
+            val sz = qs.getRuntimeStatistics.sizeInBytes
+            if (sz < saneStatsCap) sz.toLong else 0L
+          case _ => 0L
+        }.sum
+      } catch {
+        case scala.util.control.NonFatal(_) => 0L
+      }
+      val forced = estimatedInputBytes >= threshold
+      if (forced) {
+        logDebug(s"Engaging kudo compression for exchange: estimated map-side input " +
+          s"${estimatedInputBytes / (1L << 30)}GB >= ${threshold / (1L << 30)}GB threshold")
+      }
+      forced
+    } else {
+      false
+    }
+
     GpuShuffleExchangeExecBase.prepareBatchShuffleDependency(
       inputBatchRDD,
       child.output,
@@ -266,7 +332,8 @@ abstract class GpuShuffleExchangeExecBase(
       additionalMetrics,
       opTimeNewShuffleWrite,
       descendantOpTimeMetrics,
-      enableOpTimeTrackingRdd)
+      enableOpTimeTrackingRdd,
+      kudoScanForced)
   }
 
   /**
@@ -396,7 +463,8 @@ object GpuShuffleExchangeExecBase {
       additionalMetrics: Map[String, GpuMetric],
       opTimeNewShuffleWrite: Option[GpuMetric] = None,
       descendantOpTimeMetrics: Seq[GpuMetric] = Seq.empty,
-      enableOpTimeTrackingRdd: Boolean = true)
+      enableOpTimeTrackingRdd: Boolean = true,
+      kudoScanForced: Boolean = false)
   : ShuffleDependency[Int, ColumnarBatch, ColumnarBatch] = {
     val isRoundRobin = newPartitioning match {
       case _: GpuRoundRobinPartitioning => true
@@ -427,9 +495,13 @@ object GpuShuffleExchangeExecBase {
     val partitioner: GpuExpression = getPartitioner(newRdd, outputAttributes,
       newPartitioning, metrics)
     // Inject debugging subMetrics, such as D2HTime before SliceOnCpu
-    // The injected metrics will be serialized as the members of GpuPartitioning
+    // The injected metrics will be serialized as the members of GpuPartitioning.
+    // The scan-size decision is likewise set on the bound partitioner (getPartitioner
+    // rebinds references into a new object, so it must be set here, not on the input).
     partitioner match {
-      case pt: GpuPartitioning => pt.setupDebugMetrics(metrics)
+      case pt: GpuPartitioning =>
+        pt.setupDebugMetrics(metrics)
+        pt.setKudoCompressionScanForced(kudoScanForced)
       case _ =>
     }
     val partitionTime: GpuMetric = metrics(METRIC_SHUFFLE_PARTITION_TIME)

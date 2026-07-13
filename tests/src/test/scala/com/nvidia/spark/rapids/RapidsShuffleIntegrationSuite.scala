@@ -24,6 +24,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.apache.spark.SparkConf
 import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions.col
 
 /**
  * Listener to capture SparkRapidsShuffleDiskSavingsEvent during tests.
@@ -78,7 +79,8 @@ class RapidsShuffleIntegrationSuite extends AnyFunSuite with BeforeAndAfterEach 
   private def createSessionWithConfig(
       maxBufferSize: String,
       compressionCodec: Option[String] = null,
-      batchSize: String = "5m"): Unit = {
+      batchSize: String = "5m",
+      kudoCompression: Boolean = false): Unit = {
     if (spark != null) {
       spark.stop()
     }
@@ -96,6 +98,7 @@ class RapidsShuffleIntegrationSuite extends AnyFunSuite with BeforeAndAfterEach 
       .set("spark.rapids.sql.enabled", "true")
       .set("spark.rapids.sql.test.enabled", "true")
       .set("spark.shuffle.manager", shuffleManagerClass)
+      .set("spark.rapids.shuffle.mode", "MULTITHREADED")
       .set("spark.shuffle.sort.io.plugin.class",
         "org.apache.spark.shuffle.sort.io.RapidsLocalDiskShuffleDataIO")
       // Enable skipMerge to use MultithreadedShuffleBufferCatalog, which emits
@@ -108,6 +111,22 @@ class RapidsShuffleIntegrationSuite extends AnyFunSuite with BeforeAndAfterEach 
       .set("spark.rapids.memory.host.partialFileBufferInitialSize", "1m")
       .set("spark.rapids.memory.host.partialFileBufferMaxSize", maxBufferSize)
       .set("spark.rapids.sql.batchSizeBytes", batchSize)
+
+    if (kudoCompression) {
+      conf
+        .set(RapidsConf.SHUFFLE_KUDO_SERIALIZER_ENABLED.key, "true")
+        .set(RapidsConf.SHUFFLE_KUDO_COMPRESSION_CODEC.key, "zstd")
+        // The 2m test batches are far below the default gate.
+        .set(RapidsConf.SHUFFLE_KUDO_COMPRESSION_MIN_BATCH_SIZE.key, "0")
+        // Adaptive mode with a zero map-input threshold engages compression on
+        // every exchange, giving deterministic engagement for this end-to-end test.
+        .set(RapidsConf.SHUFFLE_KUDO_COMPRESSION_MODE.key, "adaptive")
+        .set(RapidsConf.SHUFFLE_KUDO_COMPRESSION_MAP_INPUT_BYTES.key, "0")
+        // KUDZ selects the GPU serializer for its pre-serialized payload even when the
+        // configured write mode remains CPU.
+        .set(RapidsConf.SHUFFLE_KUDO_WRITE_MODE.key, "CPU")
+        .set(RapidsConf.SHUFFLE_KUDO_READ_MODE.key, "GPU")
+    }
 
     // Set compression configuration
     // null = use Spark default, Some(codec) = specific codec, None = disable compression
@@ -331,6 +350,35 @@ class RapidsShuffleIntegrationSuite extends AnyFunSuite with BeforeAndAfterEach 
 
   test("multi-segment shuffle with zstd compression") {
     runMultiSegmentShuffleTest(Some("zstd"))
+  }
+
+  test("GPU-compressed Kudo round trips through MULTITHREADED shuffle") {
+    createSessionWithConfig(
+      maxBufferSize = "6m",
+      compressionCodec = Some("lz4"),
+      batchSize = "2m",
+      kudoCompression = true)
+
+    val inputRows = 200000L
+    val input = spark.range(0, inputRows, 1, 4)
+      .selectExpr(
+        "id",
+        "cast(id % 64 as int) as bucket",
+        "concat('repeated-kudo-payload-', cast(id % 32 as string)) as payload")
+
+    // Preserve every column across the exchange so the writer sees a substantial,
+    // compressible Kudo payload and the reader must reconstruct it exactly.
+    val result = input.repartition(8, col("bucket"))
+      .sortWithinPartitions("id")
+      .collect()
+
+    assert(result.length == inputRows)
+    assert(result.iterator.map(_.getLong(0)).sum == inputRows * (inputRows - 1) / 2)
+    assert(result.forall { row =>
+      val id = row.getLong(0)
+      row.getInt(1) == id % 64 &&
+        row.getString(2) == s"repeated-kudo-payload-${id % 32}"
+    })
   }
 
 }

@@ -2493,6 +2493,68 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
     .stringConf
     .createWithDefault(ShuffleKudoMode.GPU.toString)
 
+  val SHUFFLE_KUDO_COMPRESSION_CODEC =
+    conf("spark.rapids.shuffle.kudo.serializer.compression.codec")
+    .doc("Codec used to compress the kudo-serialized shuffle payload on the GPU before it " +
+      "is copied to the host. \"zstd\": batched nvcomp ZSTD on the device " +
+      "(recommended; measured 0.66-0.71x bytes on NDS/NDS-H SF3K). \"lz4\": batched " +
+      "nvcomp LZ4; measured near-1.0x on the padded kudo layout, so nearly every " +
+      "partition falls back to the uncompressed record -- not recommended for this " +
+      "format. Partitions that do not shrink are written uncompressed. \"none\": " +
+      "disable device-side shuffle payload compression. Only " +
+      "applies when the Kudo serializer is enabled with GPU read mode and the " +
+      "MULTITHREADED RapidsShuffleManager is in use. The built-in Spark sort shuffle " +
+      "stays uncompressed; UCX and CACHE_ONLY use their own GPU transport compression.")
+    .internal()
+    .startupOnly()
+    .stringConf
+    .checkValues(Set("none", "zstd", "lz4"))
+    .createWithDefault("zstd")
+
+  val SHUFFLE_KUDO_COMPRESSION_MIN_BATCH_SIZE =
+    conf("spark.rapids.shuffle.kudo.serializer.compression.minBatchSize")
+    .doc("Minimum size in bytes of a kudo-serialized shuffle batch for device-side " +
+      "compression to engage. Batches below this size are written as plain kudo " +
+      "records: the per-batch cost of the compression pass (kernel launch, " +
+      "device-to-host staging, stream synchronization, and a longer GPU-semaphore " +
+      "hold) is fixed, so on small batches it is pure overhead while the byte " +
+      "savings are too small to relieve any downstream bottleneck.")
+    .internal()
+    .bytesConf(ByteUnit.BYTE)
+    .createWithDefault(32L * 1024 * 1024)
+
+  val SHUFFLE_KUDO_COMPRESSION_MODE =
+    conf("spark.rapids.shuffle.kudo.serializer.compression.mode")
+    .doc("How device-side kudo shuffle compression decides to engage. \"adaptive\": " +
+      "the driver engages compression per exchange at planning time when the " +
+      "exchange's estimated map-side input is large (see compression.mapInputBytes), " +
+      "which predicts a large shuffle where compression pays. \"never\": disable, " +
+      "same as codec \"none\". To compress unconditionally on a deployment known to " +
+      "be shuffle-bound, keep \"adaptive\" and lower compression.mapInputBytes " +
+      "toward zero.")
+    .internal()
+    .startupOnly()
+    .stringConf
+    .checkValues(Set("adaptive", "never"))
+    .createWithDefault("adaptive")
+
+  val SHUFFLE_KUDO_COMPRESSION_MAP_INPUT_BYTES =
+    conf("spark.rapids.shuffle.kudo.serializer.compression.mapInputBytes")
+    .doc("Estimated map-side input bytes of a shuffle exchange at or above which the " +
+      "exchange compresses under adaptive mode. The estimate sums the child's leaf " +
+      "sizes: for scan-fed legs, the post-partition-pruning parquet file bytes scaled " +
+      "by the projected-column fraction (scans read only projected columns; dynamic " +
+      "partition pruning scans are excluded, their runtime size being unknown at " +
+      "planning); for shuffle-fed legs, the exact materialized upstream size from AQE " +
+      "runtime stats. A large input predicts a large shuffle, which is where " +
+      "device-side compression pays. Because the compression cost tracks shuffle-write " +
+      "bytes, a large-input / small-shuffle exchange that trips this carries negligible " +
+      "cost, and small exchanges stay uncompressed so compute-bound workloads are never " +
+      "taxed. Lower toward zero to compress unconditionally on shuffle-bound deployments.")
+    .internal()
+    .bytesConf(ByteUnit.BYTE)
+    .createWithDefault(80L * 1024 * 1024 * 1024)
+
   val SHUFFLE_KUDO_SERIALIZER_MEASURE_BUFFER_COPY_ENABLED =
     conf("spark.rapids.shuffle.kudo.serializer.measure.buffer.copy.enabled")
     .doc("Enable or disable measuring buffer copy time when using Kudo serializer for the shuffle.")
@@ -3953,6 +4015,28 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   def shuffleKudoGpuSerializerReadEnabled: Boolean = shuffleKudoSerializerEnabled &&
     shuffleKudoReadMode == ShuffleKudoMode.GPU
+
+  lazy val shuffleKudoCompressionCodec: String = get(SHUFFLE_KUDO_COMPRESSION_CODEC)
+
+  lazy val shuffleKudoCompressionMinBatchSize: Long =
+    get(SHUFFLE_KUDO_COMPRESSION_MIN_BATCH_SIZE)
+
+  lazy val shuffleKudoCompressionMode: String = get(SHUFFLE_KUDO_COMPRESSION_MODE)
+
+  lazy val shuffleKudoCompressionMapInputBytes: Long =
+    get(SHUFFLE_KUDO_COMPRESSION_MAP_INPUT_BYTES)
+
+  /**
+   * Device-side compression of the kudo-serialized shuffle payload. Requires the kudo
+   * serializer with GPU read mode so the payload is decompressed on the device during
+   * shuffle read. GpuPartitioning limits it to the MULTITHREADED RapidsShuffleManager;
+   * the built-in Spark sort shuffle stays uncompressed, and UCX and CACHE_ONLY keep
+   * their transport-owned compression handling.
+   */
+  def shuffleKudoCompressionRequested: Boolean =
+    shuffleKudoCompressionCodec != "none" &&
+      shuffleKudoSerializerEnabled &&
+      shuffleKudoReadMode == ShuffleKudoMode.GPU
 
   lazy val shimsProviderOverride: Option[String] = get(SHIMS_PROVIDER_OVERRIDE)
 

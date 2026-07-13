@@ -1212,10 +1212,35 @@ class KudoSpillableHostConcatResult(kudoTableHeader: KudoTableHeader,
   override def getDataLen: Long = bufferLength
 }
 
+/**
+ * Spillable form of a GPU-compressed kudo record (see KudoCompressedFrame). Preserves the
+ * compressed payload metadata across spills so the record can be reconstructed and
+ * decompressed on the device later.
+ */
+class KudoCompressedSpillableHostConcatResult(meta: KudoCompressedMeta,
+    val hmb: HostMemoryBuffer
+) extends SpillableHostConcatResult {
+  require(hmb != null, "HostMemoryBuffer cannot be null")
+
+  override def toBatch: ColumnarBatch = closeOnExcept(spillableBuffer.getHostBuffer()) {
+    hostBuf => KudoSerializedTableColumn.fromCompressed(meta, hostBuf)
+  }
+
+  override def getNumRows: Long = meta.numRows
+
+  // Report the uncompressed length so join sizing decisions see GPU-relevant bytes.
+  override def getDataLen: Long = meta.uncompressedLength
+}
+
 object SpillableHostConcatResult {
   def from(batch: ColumnarBatch): SpillableHostConcatResult = {
     require(batch.numCols() == 1, "Batch must have exactly 1 column")
     batch.column(0) match {
+      case col: KudoSerializedTableColumn if col.isCompressed => {
+        // This will be closed
+        val buffer = col.spillableKudoTable.getHostBuffer()
+        new KudoCompressedSpillableHostConcatResult(col.compressedMeta.get, buffer)
+      }
       case col: KudoSerializedTableColumn => {
         // This will be closed
         val oldKudoTable = col.spillableKudoTable
